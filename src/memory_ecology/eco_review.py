@@ -24,7 +24,8 @@
         [--detail DIR] [--quarantine DIR] [--archive DIR]
         [--db PATH] [--logdir DIR]
 
-默认路径以本脚本上一级目录为 hermes 根目录：
+默认路径以 lib.config.hermes_root() 为 hermes 根目录（尊重 MEMORY_ECOLOGY_ROOT
+覆盖；未设置时为脚本上一级目录，与旧默认一致）：
     detail      = <hermes>/memories/detail/
     quarantine  = <hermes>/memories/quarantine/
     archive     = <hermes>/memories/archive/
@@ -43,6 +44,7 @@
 from lib.fs import atomic_write
 from lib.gatekit import acquire_lock_auto, release_lock, connect_db, write_ledger
 from lib.memstore import clean_value, parse_frontmatter_strict
+from lib.config import hermes_root
 from lib import similarity
 
 import argparse
@@ -428,8 +430,10 @@ def write_gate_log(logdir: Path, date_str: str, content: str) -> Path:
 
 
 def resolve_paths(args):
-    script_dir = Path(__file__).resolve().parent
-    root = script_dir.parent  # hermes 根目录
+    # P2（2026-10-11）：默认根改走 lib.config.hermes_root()，与门①②③对齐——
+    # 此前按脚本上一级目录解析、无视 MEMORY_ECOLOGY_ROOT，多宿主/沙盒场景下
+    # 会静默扫描错误目录（回归钉子见 tests/test_evo_review_paths.py）。
+    root = hermes_root()
     mem_override = args.detail or args.quarantine or args.archive
     if mem_override:
         d = Path(mem_override)

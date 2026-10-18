@@ -13,6 +13,12 @@
 
 v2.2.5：加进程内解析缓存（(mtime,size) 失效）——错误检索按关键词逐个调本模块，
 未缓存时同一批条目被重复解析 20 遍（真机实测 504ms/次），是 dsh 注入探针的主要开销。
+
+v2.3（2026-10-03 设计稿 O2/O7a）：检索打分升级——FTS5+BM25 派生索引优先
+（lib/sqlindex，score = BM25 相对质量 × 时间衰减 × importance/status 权重），
+排序由文件名字典序改为相关性降序；索引不可用 / 短词（<3 字符，trigram 下限）/
+零命中 → 自动回退旧子串路径（召回保护，行为与 v2.2.5 完全一致，无 score）。
+契约影响：ECO_CONTRACT v1.1.0——hits[] 增可选字段 score（降级路径无此键）。
 """
 from __future__ import annotations
 
@@ -23,6 +29,7 @@ from pathlib import Path
 
 from lib.config import hermes_root
 from lib.memstore import parse_experience  # §C：解析单源
+from lib import sqlindex  # O7a：派生索引（不可用时回退子串路径，见 search）
 
 try:  # v0.3：子进程/管道下 stdout 走 GBK 会导致中文乱码，显式固定 UTF-8
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -116,27 +123,83 @@ def _norm(s: str) -> str:
     return s.strip().lower()
 
 
+def _pos_int(v: str) -> int:
+    """argparse 校验：--top 须为正整数（负数会让切片语义反转，OCR 2026-10-03）。"""
+    n = int(v)
+    if n < 1:
+        raise argparse.ArgumentTypeError("--top 须为正整数")
+    return n
+
+
 def _episode_key(entry: dict) -> str:
     """同 episode 折叠键：source（session + 信号类型）。"""
     return entry["meta"].get("source", "")
 
 
-def search(keyword: str, top: int = 3, full: bool = False) -> list[dict]:
+def search(keyword: str, top: int = 3) -> list[dict]:
+    """关键词检索（v2.3：FTS5+BM25 打分优先，降级回退旧子串路径）。
+
+    索引路径命中时每 hit 附 score（契约 v1.1.0 可选字段）；降级路径行为
+    与 v2.2.5 逐字一致（无 score）。--full 的正文展开在 main() 层做，
+    本函数不接收 full（OCR 2026-10-03：删除沉默死参数）。"""
+    try:
+        # root 跟随 EXP_DIR.parent（而非 config 根）：生产两者等价（hermes 根），
+        # inject 测试沙盒（ECO_NOTE_INJECT_EXP_DIR）与 dev 树直跑时索引/数据同根，
+        # 不在仓库根长 eco.db（Q-污染教训：gui 兜底读到它误报 no such table）
+        rows = sqlindex.search(keyword, stores=("exp",), exp_dir=EXP_DIR,
+                               root=EXP_DIR.parent, top=max(top * 8, 24))
+    except Exception as e:
+        # fail-open 是设计意图，但降级必须留信号（走 stderr，不破坏 stdout JSON）
+        print(f"⚠️ 索引路径不可用，回退子串检索: {type(e).__name__}: {e}",
+              file=sys.stderr)
+        rows = None
+    if rows:
+        hits: list[dict] = []
+        for r in rows:
+            p = EXP_DIR / f"{r['slug']}.md"
+            entry = _cached_entry(p)
+            if entry is None:
+                continue  # 索引与文件短暂不一致（如刚删除）：跳过该条
+            hits.append({"path": p.stem, "entry": entry,
+                         "episode": _episode_key(entry), "score": r["score"]})
+        folded = _fold(hits)
+        if folded:
+            return folded[:top]
+        # 索引有行但对应文件全部读不到（异常态）→ 落回旧路径兜底
+    return _search_substring(keyword, top)
+
+
+def _fold(hits: list[dict]) -> list[dict]:
+    """同 episode 折叠：每 episode 保留首条（索引路径的调用方序 = 相关性降序）。
+
+    OCR 二审 2026-10-03（high）：无 source 字段的条目 episode=''——空串不视为
+    同一 episode（与 eco_note_error_query.rank 的折叠口径对齐），否则全部无源
+    条目只剩首条、静默丢召回。"""
+    seen: set[str] = set()
+    folded: list[dict] = []
+    for h in hits:
+        if h["episode"] and h["episode"] in seen:
+            continue
+        if h["episode"]:
+            seen.add(h["episode"])
+        folded.append(h)
+    return folded
+
+
+def _search_substring(keyword: str, top: int) -> list[dict]:
+    """v2.2.5 及之前的实现（降级路径，行为逐字保留——含文件名字典序）。"""
     kw = _norm(keyword)
+    # OCR 2026-10-03（high）：空/纯空白关键词归一后为空串，而 `"" in haystack`
+    # 恒真 → 会把全库前 top 条当命中返回。空关键词直接判无命中。
+    if not kw:
+        return []
     hits: list[dict] = []
     for path, entry, haystack, episode in _library():
         if kw not in haystack:
             continue
         hits.append({"path": path.stem, "entry": entry, "episode": episode})
     # 同 episode 折叠：保留每个 episode 的第一条（按文件名字典序，即 id 序）
-    seen: set[str] = set()
-    folded: list[dict] = []
-    for h in hits:
-        if h["episode"] in seen:
-            continue
-        seen.add(h["episode"])
-        folded.append(h)
-    return folded[:top]
+    return _fold(hits)[:top]
 
 
 def _summary(h: dict) -> str:
@@ -151,10 +214,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="经验笔记本关键词检索（只读）")
     ap.add_argument("keyword", help="检索关键词（子串匹配）")
     ap.add_argument("--full", action="store_true", help="输出完整正文")
-    ap.add_argument("--top", type=int, default=3, help="最多返回条数（默认 3，同 episode 折叠）")
+    ap.add_argument("--top", type=_pos_int, default=3, help="最多返回条数（默认 3，同 episode 折叠）")
     ap.add_argument("--format", choices=["text", "json"], default="text", help="输出格式（PORT_SPEC §4-C 类型化契约）")
     args = ap.parse_args()
-    results = search(args.keyword, top=args.top, full=args.full)
+    results = search(args.keyword, top=args.top)
     if args.format == "json":
         import json
         items = []
@@ -163,6 +226,7 @@ def main() -> int:
             items.append({
                 "id": h["path"], "type": m.get("type", "?"), "status": m.get("status", "?"),
                 "title": h["entry"]["fields"].get("title", ""), "evidence": h["entry"]["fields"].get("evidence", ""),
+                **({"score": h["score"]} if "score" in h else {}),  # 契约 v1.1.0：可选字段，降级路径无
                 **({"full": h["entry"]["full"]} if args.full else {}),
             })
         print(json.dumps({"ok": True, "query": args.keyword, "total": len(items), "hits": items}, ensure_ascii=False, indent=2))

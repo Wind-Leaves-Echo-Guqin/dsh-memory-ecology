@@ -9,7 +9,7 @@
  *
  * 纪律：
  *   - fail-open：Python 侧任何失败都返回 null（不注入），绝不阻塞宿主回合
- *   - 只读消费：不写任何经验内容（仅 experiences/.dsh_inject_state.<会话id>.json 按会话注入状态文件，v3）
+ *   - 只读消费：不写任何经验内容（仅 experiences/.dsh_inject_state.json 注入状态文件）
  *   - 超时：spawn 8s 上限（SDK 宿主另有每回合贡献超时兜底）
  *   - 单源：子进程语义（解释器解析/环境裁剪/参数分隔/退出码分档）复用
  *     ./lib/common.js —— 与官方桌面版 package-cordis 同一套，防两端漂移
@@ -27,10 +27,12 @@
  * 8s（官方桌面版 cordis 版走异步 execFile，无此约束）。宿主侧若出现卡顿，优先查这里。
  *
  * 环境变量：
- *   ECO_PYTHON        python 可执行文件（默认 "python"，v2.2.5 起解析为绝对路径）
+ *   ECO_PYTHON        python 可执行文件（默认 "python"，v2.2.5 起解析为绝对路径；
+ *                     解析失败时拒绝执行——OCR 2026-10-03：不再回退裸名下发 spawn）
  *   ECO_SCRIPTS_DIR   生态核心 scripts 目录（默认自动探测开发/发布布局）
  *   ECO_PYTHON_DIR    Python 侧脚本目录（默认同包 python/）
- *   ECO_KEEP_FULL_ENV=1 透传完整宿主环境给子进程（默认只透传系统+生态变量）
+ *   （OCR 2026-10-03：完整环境透传开关只认 config.keepFullEnv——环境变量
+ *     ECO_KEEP_FULL_ENV 不再被读取；EAC 版无 config 通道，恒为最小环境）
  */
 const path = require('path');
 const fs = require('fs');
@@ -63,6 +65,12 @@ function sessionArgs() {
 
 /** 统一的子进程调用（解释器绝对路径 + 最小环境 + 显式 ECO_SCRIPTS_DIR）。 */
 function run(scriptDir, script, args) {
+  // OCR 2026-10-03（security）：解释器解析失败时**拒绝执行**——原实现回退裸名 cmd，
+  // Windows 下 CreateProcess 按"当前目录优先"解析，子进程 cwd 是可写 scripts 目录，
+  // CWE-427 植入面并未真正关闭
+  if (!PY.resolved) {
+    return { out: '', err: '未解析到可用的 Python 解释器（拒绝以裸名执行）', code: null, failed: true };
+  }
   const scriptsDir = locateScriptsDir();
   return common.runPythonSync(PY.cmd, path.join(scriptDir, script), args, {
     cwd: scriptDir,
@@ -89,7 +97,9 @@ function runContext() {
 /** 原生工具：经验关键词检索（text 输出，agent 可读）。 */
 function toolQuery(args) {
   const kw = String((args && args.keyword) || '').trim();
-  if (!kw) return { error: 'keyword 必填' };
+  // OCR 2026-10-03：入参校验失败统一回 {result} 形状（与成功路径/同源 cordis 变体
+  // 一致）——原 {error} 形状在只认 result 的 SDK 上会被静默丢弃，agent 看到空输出
+  if (!kw) return { result: '（keyword 必填）' };
   // Q28 修复（2026-09-06）：检索 CLI 在核心 scripts 目录，不在本包 python/ 下——
   // 原实现拼 __dirname/python → spawnSync ENOENT → 工具恒返兜底文案
   const res = run(locateScriptsDir(), 'eco_note_query.py', common.buildScriptArgs(kw, args && args.top));
@@ -99,7 +109,8 @@ function toolQuery(args) {
 /** 原生工具：报错文本 → 根因分层经验检索。 */
 function toolErrorQuery(args) {
   const text = String((args && args.text) || '').trim();
-  if (!text) return { error: 'text 必填' };
+  // OCR 2026-10-03：同 toolQuery——错误形状统一为 {result}
+  if (!text) return { result: '（text 必填）' };
   const res = run(locateScriptsDir(), 'eco_note_error_query.py', common.buildScriptArgs(text, args && args.top));
   return { result: common.toolResultText(res) };
 }
@@ -143,7 +154,9 @@ module.exports.activate = function activate(ctx) {
         + ` n_errors=${r.n_errors ?? '-'} schema=${r.schema ?? '-'}`
         + ` session=${r.session ?? '-'} ms=${r.ms ?? '-'}`);
       return r.inject ?? null;
-    } catch (_) {
+    } catch (e) {
+      // OCR 2026-10-03：fail-open ≠ 零可观测——探针坏了每回合静默失败，须留痕
+      ctx.log('warn', `eco-note 探针异常（fail-open 已忽略）: ${e && e.message}`);
       return null;
     }
   });

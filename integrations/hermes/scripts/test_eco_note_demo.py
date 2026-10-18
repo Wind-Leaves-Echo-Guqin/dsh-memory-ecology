@@ -86,7 +86,9 @@ class T1Signals(unittest.TestCase):
 
     def test_watermark_advance(self):
         _, wm = ns.scan_signals(0.0)
-        self.assertGreater(wm, 1788300000.0)
+        # P1（2026-10-04）：水位线改 (ts, id) 复合键
+        self.assertGreater(wm[0], 1788300000.0)
+        self.assertIsInstance(wm[1], int)
         # 增量扫描：从 wm 之后无新信号
         sig2, wm2 = ns.scan_signals(wm)
         self.assertEqual(sig2, [])
@@ -121,35 +123,39 @@ class T3CandidateWrite(unittest.TestCase):
     def test_main_flow_writes_candidates(self):
         """mock LLM（不调 API）+ 临时目录 → pending 写入且水位线推进。"""
         self._orig = (en.DB, en.EXP_DIR, en.PENDING_DIR, en.WATERMARK, en.scan_signals, en.collect_fragments, en.read_key, en.llm_extract)
-        with tempfile.TemporaryDirectory() as td:
-            exp = Path(td) / "experiences"
-            en.EXP_DIR = exp
-            en.PENDING_DIR = exp / "pending"
-            en.WATERMARK = exp / ".watermark"
-            exp.mkdir(parents=True, exist_ok=True)
-            en.WATERMARK.write_text("1788300000.0")
-            # mock：1 个信号簇 + 1 条候选
-            sig = [{"type": "tool_error", "session_id": "s1", "ts": 1788300100.0, "tool_name": "t", "snippet": "x", "msg_id": 3}]
-            # 批次循环需要 side_effect：第一批返回信号，第二批返回空（结束循环）
-            # 且信号 ts 必须 > 水位线（生产不变式）；否则触发防御分支（2026-09-02 实测）
-            en.scan_signals = mock.Mock(side_effect=[(sig, 1788300100.0), ([], 1788300100.0)])
-            en.collect_fragments = mock.Mock(return_value=[{"signal": sig[0], "ctx": ["[tool结果] err"]}])
-            en.llm_extract = mock.Mock(return_value=[{
-                "type": "error", "trigger": "测试触发情境", "symptom": "测试报错",
-                "cause": "测试根因", "action": "测试做法", "evidence": "测试证据", "boundary": "测试边界"}])
-            en.read_key = mock.Mock(return_value="k")
-            with mock.patch.object(sys, "argv", ["eco_note.py"]):
-                rc = en.main()
-            self.assertEqual(rc, 0)
-            files = list((exp / "pending").glob("*.md"))
-            self.assertEqual(len(files), 1)
-            txt = files[0].read_text(encoding="utf-8")
-            self.assertIn("测试触发情境", txt)
-            self.assertIn("error", txt)
-            self.assertIn("来源信号", txt)
-            wm = float(en.WATERMARK.read_text())
-            self.assertEqual(wm, 1788300100.0, "水位线应推进到扫描窗口尾")
-        en.DB, en.EXP_DIR, en.PENDING_DIR, en.WATERMARK, en.scan_signals, en.collect_fragments, en.read_key, en.llm_extract = self._orig
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                exp = Path(td) / "experiences"
+                en.EXP_DIR = exp
+                en.PENDING_DIR = exp / "pending"
+                en.WATERMARK = exp / ".watermark"
+                exp.mkdir(parents=True, exist_ok=True)
+                en.WATERMARK.write_text("1788300000.0")
+                # mock：1 个信号簇 + 1 条候选
+                sig = [{"type": "tool_error", "session_id": "s1", "ts": 1788300100.0, "tool_name": "t", "snippet": "x", "msg_id": 3}]
+                # 批次循环需要 side_effect：第一批返回信号，第二批返回空（结束循环）
+                # 且信号 ts 必须 > 水位线（生产不变式）；否则触发防御分支（2026-09-02 实测）
+                en.scan_signals = mock.Mock(side_effect=[(sig, (1788300100.0, -1)), ([], (1788300100.0, -1))])
+                en.collect_fragments = mock.Mock(return_value=[{"signal": sig[0], "ctx": ["[tool结果] err"]}])
+                en.llm_extract = mock.Mock(return_value=[{
+                    "type": "error", "trigger": "测试触发情境", "symptom": "测试报错",
+                    "cause": "测试根因", "action": "测试做法", "evidence": "测试证据", "boundary": "测试边界"}])
+                en.read_key = mock.Mock(return_value="k")
+                with mock.patch.object(sys, "argv", ["eco_note.py"]):
+                    rc = en.main()
+                self.assertEqual(rc, 0)
+                files = list((exp / "pending").glob("*.md"))
+                self.assertEqual(len(files), 1)
+                txt = files[0].read_text(encoding="utf-8")
+                self.assertIn("测试触发情境", txt)
+                self.assertIn("error", txt)
+                self.assertIn("来源信号", txt)
+                # P1（2026-10-04）：水位线为 "ts|id" 复合格式
+                self.assertEqual(en.WATERMARK.read_text(), "1788300100.0|3",
+                                 "水位线应推进到本批末行（含 msg_id）")
+        finally:
+            # P2：restore 改异常安全——断言失败时也恢复模块状态，不再向下游测试泄漏 mock
+            en.DB, en.EXP_DIR, en.PENDING_DIR, en.WATERMARK, en.scan_signals, en.collect_fragments, en.read_key, en.llm_extract = self._orig
 
     def test_dry_run_no_write(self):
         self._orig = (en.EXP_DIR, en.PENDING_DIR, en.WATERMARK, en.scan_signals, en.collect_fragments)
@@ -161,7 +167,7 @@ class T3CandidateWrite(unittest.TestCase):
             exp.mkdir(parents=True, exist_ok=True)
             en.WATERMARK.write_text("1788300000.0")
             sig = [{"type": "tool_error", "session_id": "s1", "ts": 1788300200.0, "tool_name": "t", "snippet": "x", "msg_id": 3}]
-            en.scan_signals = mock.Mock(return_value=(sig, 1788300200.0))
+            en.scan_signals = mock.Mock(return_value=(sig, (1788300200.0, -1)))
             en.collect_fragments = mock.Mock(return_value=[{"signal": sig[0], "ctx": ["[tool结果] err"]}])
             with mock.patch.object(sys, "argv", ["eco_note.py", "--dry-run"]):
                 rc = en.main()
@@ -174,12 +180,18 @@ class T3CandidateWrite(unittest.TestCase):
 
 class T4Schema(unittest.TestCase):
     def test_type_template(self):
-        """按型模板化语义（A3 校准）：error 型必填 symptom/cause，pattern 型可无。"""
-        error_req = {"symptom", "cause", "action"}
-        pattern_req = {"trigger", "action"}
-        # 验证 schema 判断（从设计稿语义固化）
-        self.assertTrue({"symptom", "cause", "action"} >= error_req)
-        self.assertTrue({"trigger", "action"} >= pattern_req)
+        """R9（2026-10-04）：按型模板化语义落进真校验器（原为恒真断言）。
+        error 型必填 symptom/cause；pattern 型不要求 symptom。字段写在正文（生产约定）。"""
+        from lib import safeio
+        err_body = "title: t\nsymptom: 报错\ncause: 根因\n"
+        fm_err, body_err = safeio.parse_frontmatter("---\ntype: error\nstatus: draft\n---\n" + err_body)
+        self.assertEqual(safeio.validate_experience_fm(fm_err, body_err), [])
+        fm_bad, body_bad = safeio.parse_frontmatter("---\ntype: error\nstatus: draft\n---\ntitle: t\n")
+        errs = safeio.validate_experience_fm(fm_bad, body_bad)
+        self.assertTrue(any("symptom" in e for e in errs))
+        self.assertTrue(any("cause" in e for e in errs))
+        fm_pat, body_pat = safeio.parse_frontmatter("---\ntype: pattern\nstatus: draft\n---\ntitle: t\n")
+        self.assertEqual(safeio.validate_experience_fm(fm_pat, body_pat), [])
 
 
 class T5Hostile(unittest.TestCase):

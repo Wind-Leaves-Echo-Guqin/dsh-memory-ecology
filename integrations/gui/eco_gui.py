@@ -39,6 +39,8 @@ import runner      # noqa: E402
 
 STATIC = HERE / "static"
 V2_DIST = HERE.parent / "gui-v2" / "dist"  # gui-v2 构建产物（决策 28 预览版；dist 不入库，npm run build 重新生成）
+V22_DIST = HERE.parent / "gui-v2.2" / "dist"  # gui-v2.2（Sentri 设计系统版）构建产物；dist 不入库，npm run build 重新生成
+V23_DIST = HERE.parent / "gui-v2.3" / "dist"  # gui-v2.3（液态玻璃 / iOS 外壳版）构建产物；dist 不入库，npm run build 重新生成
 _MIME = {".html": "text/html", ".css": "text/css", ".js": "text/javascript",
          ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon",
          ".woff2": "font/woff2", ".json": "application/json"}
@@ -288,6 +290,14 @@ class Handler(BaseHTTPRequestHandler):
         """gui-v2 构建产物（决策 28 预览版）——与旧 static 同款越界防护。"""
         self._serve_file(V2_DIST, rel)
 
+    def _v22_static(self, rel: str):
+        """gui-v2.2（Sentri 版）构建产物——与旧 static 同款越界防护。"""
+        self._serve_file(V22_DIST, rel)
+
+    def _v23_static(self, rel: str):
+        """gui-v2.3（液态玻璃版）构建产物——与旧 static 同款越界防护。"""
+        self._serve_file(V23_DIST, rel)
+
     def do_GET(self):
         try:
             self._route()
@@ -327,6 +337,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._v2_static("index.html")
         if path.startswith("/v2/"):
             return self._v2_static(path[len("/v2/"):])
+        if path == "/v2.2" or path == "/v2.2/":
+            return self._v22_static("index.html")
+        if path.startswith("/v2.2/"):
+            return self._v22_static(path[len("/v2.2/"):])
+        if path == "/v2.3" or path == "/v2.3/":
+            return self._v23_static("index.html")
+        if path.startswith("/v2.3/"):
+            return self._v23_static(path[len("/v2.3/"):])
         if not path.startswith("/api/"):
             return self._json({"ok": False, "error": "not found"}, 404)
 

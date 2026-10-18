@@ -15,6 +15,7 @@
 > 1. **检索是词面级的，不是语义检索**：默认后端 difflib（字符级子串 + 词面打分），召回依赖关键词选择。
 >    v2.3.0 起带时间维（三档半连续衰减 + `--since/--until/--window` 发生时间过滤）与
 >    **零结果率观测**（`eco_retrieval_report.py` / GUI「检索质量」页签——换内核的在线证据）。
+>    v2.5.0 起**入口纪律统一**（编码/数据根/锁/目录，见 lib/cli_base.py） + 并发写入修复（同进程锁互斥、Windows 原子写重试）；
 >    v2.4.0 起多词查询有 **OR 召回兜底**（`--recall`：AND 全中之外补部分命中，RRF 融合排序；
 >    默认关闭）与**向量检索路**（`--semantic`：本地向量缓存 shadow index，余弦排序；默认关闭）。
 >    本地 embedding（`bge-small-zh-v1.5` + CLS pooling，golden 182 对 AUC 0.93 vs difflib 0.90）为
@@ -26,7 +27,7 @@
 >    已知问题与架构待办见 [ARCHITECTURE_TODO.md](ARCHITECTURE_TODO.md)。
 
 > 派生声明：本项目为原 memory-ecology（Hermes 单宿主版）的兼容衍生线，独立仓库、独立演进；
-> 自 v2.1.2 起**版本号同步**（当前 **v2.4.0**）；compat = 治理核心（四道门）＋检索消费端，
+> 自 v2.1.2 起**版本号同步**（当前 **v2.5.0**）；compat = 治理核心（四道门）＋检索消费端，
 > 捕获链（信号/提取/回填）为宿主树专属，移植路线见 ARCHITECTURE_TODO.md 第四节；
 > 本线只多出「多宿主化 + 观测舱 GUI」这一集成层。
 

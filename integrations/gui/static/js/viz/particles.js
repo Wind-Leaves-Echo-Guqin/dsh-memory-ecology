@@ -21,6 +21,9 @@ var Particles = {
     document.body.insertBefore(c, document.body.firstChild);
     this.canvas = c;
     this.ctx = c.getContext('2d');
+    // OCR 2026-10-03：2D 上下文可能创建失败（返回 null）——后续 resize 的 setTransform、
+    // step/stop 的 clearRect 都会空指针，直接放弃粒子层并跳过监听器注册
+    if (!this.ctx) { c.remove(); this.canvas = null; return; }
     this.resize();
     var self = this;
     window.addEventListener('resize', function () { self.resize(); });

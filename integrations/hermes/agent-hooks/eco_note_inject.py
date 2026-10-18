@@ -41,6 +41,8 @@ for _base in _here.parents:
     if (_base / "src" / "memory_ecology").is_dir():
         sys.path.insert(0, str(_base / "src" / "memory_ecology"))
         break
+# ↑ 从 __file__ 派生（dev 树=兼容版/scripts，live=hermes/scripts）——与旧硬编码
+#   "AppData\Local\hermes\scripts" 在 live 上等价，且 dev 树测试不再误吃 live lib
 
 import eco_note_signals as sig  # noqa: E402
 import eco_note_query as qy  # noqa: E402
@@ -48,6 +50,7 @@ import eco_note_error_query as eq_  # noqa: E402
 from lib import safeio  # noqa: E402  # v2.2.0：条目写走安全写路径
 from lib.inject_gate import decide as gate_decide  # noqa: E402  # 三态判定（影子模式）
 from lib.inject_gate import format_jsonl as gate_format_jsonl  # noqa: E402
+from lib import sqlindex  # noqa: E402  # O7b/O3/O7a：事件 SQL 账 + seen 影子 + 单条重索引
 
 HERMES_HOME = os.environ.get("HERMES_HOME", "") or os.path.expanduser(r"~\AppData\Local\hermes")
 
@@ -139,6 +142,7 @@ def recent_tool_error(session_id: str, now: datetime.datetime, window_sec: int =
     if not db.exists():
         return None
     import sqlite3
+    conn = None
     try:
         conn = sqlite3.connect(f"file:{urllib.parse.quote(str(db))}?mode=ro", uri=True)
         cur = conn.cursor()
@@ -148,9 +152,11 @@ def recent_tool_error(session_id: str, now: datetime.datetime, window_sec: int =
             (session_id,),
         )
         rows = cur.fetchall()
-        conn.close()
     except sqlite3.Error:
         return None
+    finally:
+        if conn is not None:
+            conn.close()  # OCR 2026-10-03：错误路径也释放连接
     cutoff = now.timestamp() - window_sec
     for rid, content, tool_name, ts in rows:
         if ts < cutoff:
@@ -196,6 +202,7 @@ def poll_injection_result(session_id: str) -> dict:
     if not db.exists():
         return {"verdict": "none"}
     import sqlite3
+    conn = None
     try:
         conn = sqlite3.connect(f"file:{urllib.parse.quote(str(db))}?mode=ro", uri=True)
         cur = conn.cursor()
@@ -205,9 +212,11 @@ def poll_injection_result(session_id: str) -> dict:
             (session_id, inj_ts),
         )
         rows = cur.fetchall()
-        conn.close()
     except sqlite3.Error:
         return {"verdict": "none"}
+    finally:
+        if conn is not None:
+            conn.close()  # OCR 2026-10-03：错误路径也释放连接
     tool_calls = 0
     related_calls = 0  # R5：与报错相关的工具调用数
     for rid, role, content, tool_calls_json, ts in rows:
@@ -228,8 +237,7 @@ def poll_injection_result(session_id: str) -> dict:
                 blob = (str(tc.get("name", "")) + " " + str(tc.get("arguments", ""))).lower()
                 if any(w in blob for w in ERROR_HINT_WORDS):
                     related_calls += 1
-    # R5：命中双条件——工具调用数达标 且 至少一次与报错相关（循环内已排除新错误/纠正，
-    # 故到达此处 = 这些相关调用未触发新错误）
+    # R5：命中双条件——工具调用数达标 且 至少一次与报错相关（循环内已排除新错误/纠正）
     if tool_calls >= HIT_NEED_TOOL_CALLS and related_calls >= 1:
         # Q15 修复（2026-09-06）：.injected.jsonl 写的是 entry_ids（复数列表），
         # 原读 entry_id（单数）恒 None → touch_last_hit 成死代码、last_hit 永不回写
@@ -303,7 +311,7 @@ def maybe_auto_verify(entry_id: str) -> bool:
                 continue
             if fence == 1 and stripped.startswith("status: draft"):
                 indent = ln[:len(ln) - len(ln.lstrip())]
-                ending = ln[len(ln.rstrip("\r\n")):] or "\n"
+                ending = ln[len(ln.rstrip(chr(13) + chr(10))):] or chr(10)
                 lines[i] = f"{indent}status: verified{ending}"
                 done = True
                 break
@@ -315,13 +323,10 @@ def maybe_auto_verify(entry_id: str) -> bool:
                                      "verdict": "auto-verified",
                                      "reason": f"confirmed-hits>={AUTO_VERIFY_HITS}"})
         return True
-    except Exception as e:
-        # R6：失败留痕（对齐 touch_last_hit 的 R11 做法），不再静默 False
-        try:
-            _log_line({"ts": _now().isoformat(), "warn": "auto-verify-failed",
-                       "entry_id": entry_id, "error": str(e)[:120]})
-        except Exception:
-            pass
+    except Exception as exc:
+        # 与 touch_last_hit 同纪律：失败留痕不静默（OCR 2026-10-03）
+        _log_line({"ts": _now().isoformat(), "warn": "auto-verify-failed",
+                   "entry_id": entry_id, "exc": repr(exc)[:200]})
         return False
 
 
@@ -405,18 +410,32 @@ def handle(payload: dict) -> str:
     already_judged = inj_ts is not None and judged.get(session_id) == inj_ts
     if verdict.get("verdict") == "hit" and not already_judged:
         entry_id = verdict.get("entry_id")
-        if entry_id:
-            touch_last_hit(entry_id)
-            maybe_auto_verify(entry_id)
+        # OCR 2026-10-03（medium）修复差一：先记本次 hit 事件再做 auto-verify——
+        # 原顺序下第 N 次命中只统计到 N-1 次，AUTO_VERIFY_HITS 阈值被实际推迟一次
         append_event(".hits.jsonl", {"ts": now.isoformat(), "session": session_id, "verdict": "hit",
                                      "entry_id": entry_id, "reason": "three-state-success",
                                      "tool_calls": verdict.get("tool_calls", 0)})
+        sqlindex.log_event("hit", session_id, {"entry_id": entry_id,
+                                               "reason": "three-state-success"},
+                           root=_exp_dir().parent)  # O7b：SQL 镜像账
+        if entry_id:
+            touched = touch_last_hit(entry_id)
+            verified = maybe_auto_verify(entry_id)
+            if touched or verified:
+                try:  # O7a：状态/last_hit 变更单条重索引（失败不影响主流程）
+                    sqlindex.sync_entry(safeio.safe_entry_path(_exp_dir(), entry_id),
+                                        "exp", root=_exp_dir().parent)
+                except Exception:
+                    pass
         _log_line({"ts": now.isoformat(), "session": session_id, "hit": True, "entry_id": entry_id})
         judged[session_id] = inj_ts
         _save_poll_state(judged)
     elif verdict.get("verdict") == "miss" and not already_judged:
         append_event(".hits.jsonl", {"ts": now.isoformat(), "session": session_id, "verdict": "miss",
                                      "reason": verdict.get("reason"), "entry_id": verdict.get("entry_id")})
+        sqlindex.log_event("miss", session_id, {"reason": verdict.get("reason"),
+                                                "entry_id": verdict.get("entry_id")},
+                           root=_exp_dir().parent)  # O7b
         judged[session_id] = inj_ts
         _save_poll_state(judged)
 
@@ -442,10 +461,27 @@ def handle(payload: dict) -> str:
     text = build_injection_text(hits)
     entry_ids = [h["path"] for h in hits]
     _shadow_decide(hits, session_id, now)  # 影子三态判定：只记账，注入行为不变
+    # O3 影子（seen 账，设计稿 §O3）：本会话历史已注入条目 → 标记「若启用已见过滤
+    # 将跳过」的重复候选。只记账不改行为（记分卡达标才启用过滤）；seen 数据直接取自
+    # .injected.jsonl 同一事实源，不再单开 .seen.jsonl 文件（比设计稿少一个文件）。
+    seen: set[str] = set()
+    for ev in read_events(".injected.jsonl"):
+        if ev.get("session") == session_id:
+            seen.update(ev.get("entry_ids") or [])
+    would_skip = sorted(i for i in entry_ids if i in seen)
     # v2.2.0：新增 chars（注入文本长度，INJ 判定线数据源）与 error（报错摘要，GOLD 重放查询）
+    # v2.3：would_skip（O3 影子记账，additive 键——既有消费者按键读取不受影响）
     append_event(".injected.jsonl", {"ts": now.isoformat(), "session": session_id,
                                      "msg_id": err["msg_id"], "entry_ids": entry_ids,
-                                     "chars": len(text), "error": err_text[:200]})
+                                     "chars": len(text), "error": err_text[:200],
+                                     "would_skip": would_skip})
+    if not sqlindex.log_event("inject", session_id,
+                              {"entry_ids": entry_ids, "chars": len(text),
+                               "would_skip": would_skip,
+                               "error": err_text[:200]},
+                              root=_exp_dir().parent):
+        _log_line({"ts": now.isoformat(), "warn": "sql-log-failed",
+                   "kind": "inject"})  # O7b：SQL 镜像账（jsonl 仍是主账；fail-open 可观测）
     _log_line({"ts": now.isoformat(), "session": session_id, "injected": True,
                "entry_ids": entry_ids})
     return json.dumps({"context": text}, ensure_ascii=True)

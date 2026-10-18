@@ -22,6 +22,9 @@ const SPAWN_TIMEOUT_MS = 8000;
 const MAX_BUFFER = 1 << 20; // 1MB：检索输出量级远小于此，超了就是异常
 
 // 系统/解释器必需变量（大小写不敏感比较）。刻意不含任何凭据类变量。
+// OCR 2026-10-03（security）：剔除 PYTHONHOME/PYTHONPATH/PYTHONSTARTUP——三者可改写
+// 解释器的模块搜索路径与启动行为，是子进程侧 Python 模块劫持/代码注入面
+//（CWE-427 同族），与最小环境意图冲突；确需自定义时走 extra 显式声明。
 const ENV_ALLOW = new Set([
   'PATH', 'PATHEXT', 'COMSPEC', 'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR',
   'TEMP', 'TMP', 'TMPDIR', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'HOME',
@@ -29,14 +32,15 @@ const ENV_ALLOW = new Set([
   'COMMONPROGRAMFILES', 'COMMONPROGRAMFILES(X86)', 'PROGRAMW6432',
   'OS', 'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE', 'PROCESSOR_IDENTIFIER',
   'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'PYTHONUTF8', 'PYTHONIOENCODING',
-  'PYTHONHOME', 'PYTHONPATH', 'PYTHONSTARTUP',
 ]);
 
 // 宿主/生态自有命名空间整段透传（DSH_SESSIONS_ROOT、DSH_HOME、ECO_* 等）
 const ENV_PREFIXES = ['DSH_', 'ECO_', 'MEMORY_ECOLOGY_'];
 
+// OCR 2026-10-03（security）：总开关只认显式 config——原实现可被环境变量
+// ECO_KEEP_FULL_ENV 打开，等于把"关闭安全策略"交给任何能影响进程环境的上游
 function keepFullEnvEnabled(config) {
-  const v = config?.keepFullEnv ?? process.env.ECO_KEEP_FULL_ENV;
+  const v = config?.keepFullEnv;
   return v === true || v === '1' || v === 'true';
 }
 
@@ -63,8 +67,11 @@ function pathDirs() {
  * 恰是可写的生态 scripts 目录，"当前目录优先"的植入面原样复活。
  */
 function findOnPath(name) {
+  // OCR 2026-10-03：注释与行为对齐——只认 .exe（execFile 无法直接跑 .cmd/.bat）。
+  // 原实现命中 .cmd/.bat 时原样返回（exts=['']），resolvePythonInterpreter 收到
+  // `python.cmd` 这类裸名配置会真的返回一个 execFile 无法启动的命令
   const exts = process.platform === 'win32'
-    ? (/\.(exe|cmd|bat)$/i.test(name) ? [''] : ['.exe'])
+    ? (/\.exe$/i.test(name) ? [''] : ['.exe'])
     : [''];
   for (const dir of pathDirs()) {
     if (!path.isAbsolute(dir)) continue; // 跳过相对 PATH 项（安全优先）
@@ -82,7 +89,9 @@ function findOnPath(name) {
  * 解析 Python 解释器为**绝对路径**。
  * 裸名交给 CreateProcess/execvp 会按"当前目录优先"搜索——插件的子进程 cwd 正是
  * 生态 scripts 目录（可写仓库），等于把任意代码执行面敞给任何能往该目录落文件的进程。
- * 解析不到时退回原值（保持 fail-open：让 spawn 自己报可读错误），并在 how 里说明。
+ * OCR 2026-10-03（security）：解析失败**拒绝执行**——不再把裸名/相对 cmd 回退给调用方
+ * （原 `resolved:false` 仍返回原值，调用方拿去 spawn 等于重开 CWE-427 植入面）。
+ * 调用侧契约：`resolved === false` 时必须当失败处理，不得把 cmd 下发给 spawn。
  * 配置值若"含分隔符/盘符却不是绝对路径"（如 `sub\python.exe`、`C:tools\python.exe`），
  * 会被子进程按自己的 cwd 解析 → 同一条植入面：此类配置**忽略并回落 PATH**（how 里说明）。
  */
@@ -93,7 +102,7 @@ function resolvePythonInterpreter(configured) {
   if (looksPathed) {
     const fallback = findOnPath('python');
     if (fallback) return { cmd: fallback, resolved: true, how: 'ignored-relative-config' };
-    return { cmd: cand, resolved: false, how: 'unresolved-relative' };
+    return { cmd: '', resolved: false, how: 'unresolved-relative' };
   }
   const direct = findOnPath(cand);
   if (direct) return { cmd: direct, resolved: true, how: 'PATH' };
@@ -103,7 +112,7 @@ function resolvePythonInterpreter(configured) {
       if (hit) return { cmd: hit, resolved: true, how: 'PATH-alias' };
     }
   }
-  return { cmd: cand, resolved: false, how: 'unresolved' };
+  return { cmd: '', resolved: false, how: 'unresolved' };
 }
 
 /** top 归一：非数字/非正数/超大 → 保守默认（原实现会把 "-1" 原样传给 argparse）。 */
@@ -154,7 +163,12 @@ function runPython(python, scriptPath, args, opts = {}) {
 /** 同步执行（EAC 版用；该 SDK 的 provideContext 契约是同步返回）。 */
 function runPythonSync(python, scriptPath, args, opts = {}) {
   const r = spawnSync(python, [scriptPath, ...args], spawnOptions(opts));
-  return shapeResult(r.error || null, r.stdout, r.stderr, typeof r.status === 'number' ? r.status : null);
+  // OCR 2026-10-03：被信号终止（OOM/外部 kill）时 r.error 通常 undefined、r.status 为
+  // null——原实现会得到 {code:0, failed:false}，"被杀"被误判为成功
+  const err = r.error || (r.signal
+    ? Object.assign(new Error(`killed by ${r.signal}`), { code: r.signal, signal: r.signal })
+    : null);
+  return shapeResult(err, r.stdout, r.stderr, typeof r.status === 'number' ? r.status : null);
 }
 
 /**
@@ -165,8 +179,10 @@ function runPythonSync(python, scriptPath, args, opts = {}) {
  */
 function toolResultText(res) {
   if (!res) return '（检索不可用：内部错误）';
-  if (res.out) return res.out; // CLI 的 stdout 即权威（含"未命中：xxx"）
+  // OCR 2026-10-03：failed 判定前置——被杀/失败的子进程可能已写出部分 stdout，
+  // 残缺输出不能当正常检索结果返回（exit 1/2 是业务结论、failed=false，不受影响）
   if (res.failed) return `（检索不可用：${res.err || '子进程启动失败'}）`;
+  if (res.out) return res.out; // CLI 的 stdout 即权威（含"未命中：xxx"）
   if (res.code === 1) return '（未命中：经验库暂无相关条目）';
   if (res.code === 2) return `（未提取到关键词：${firstLine(res.err) || '文本太短或无有效 token'}）`;
   if (res.code === 0) return '（无输出）';

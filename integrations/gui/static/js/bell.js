@@ -11,11 +11,12 @@ var Bell = {
 
   init: function () {
     var self = this;
+    // OCR 2026-10-03：DOM 缺失判空——模板变更/脚本早于 DOM 执行时不再整体抛 TypeError
     var btn = document.getElementById('bell-btn');
-    btn.onclick = function () { self.toggle(); };
+    if (btn) btn.onclick = function () { self.toggle(); };
     document.addEventListener('click', function (e) {
       var p = document.getElementById('bell-panel');
-      if (!p.classList.contains('hidden') &&
+      if (p && !p.classList.contains('hidden') &&
           !e.target.closest('#bell-panel') && !e.target.closest('#bell-btn')) {
         p.classList.add('hidden');
       }
@@ -69,18 +70,20 @@ var Bell = {
     self._dangling(items);
     self.items = items;
     var badge = document.getElementById('bell-badge');
-    if (items.length) {
-      badge.textContent = items.length > 99 ? '99+' : items.length;
-      badge.classList.remove('hidden');
-    } else {
-      badge.classList.add('hidden');
+    if (badge) {  // OCR 2026-10-03：DOM 判空
+      if (items.length) {
+        badge.textContent = items.length > 99 ? '99+' : items.length;
+        badge.classList.remove('hidden');
+      } else {
+        badge.classList.add('hidden');
+      }
     }
   },
 
   _p0: function (items) {
     EcoApi.get('/api/health').then(function (h) {
       var body = (h.report || {}).body || '';
-      var lines = body.split('\n').filter(function (L) { return /\| P0 \||P0\s|/.test(L) && /\bP0\b/.test(L) && L.trim().length > 12; }).slice(0, 3);
+      var lines = body.split('\n').filter(function (L) { return /\| P0 \||P0\s/.test(L) && /\bP0\b/.test(L) && L.trim().length > 12; }).slice(0, 3);
       lines.forEach(function (L) {
         var t = L.trim().replace(/^[|#*\-\s]+/, '').slice(0, 120);
         items.push({ sev: 'bad', src: 'report', text: '体检 P0：' + t,
@@ -92,10 +95,13 @@ var Bell = {
 
   _dangling: function (items) {
     EcoApi.get('/api/skills').then(function (d) {
+      // OCR 2026-10-03：d.skills 判空——接口异常结构时不再抛错（外层 catch 静默
+      // 会把这个告警源永久打死且无提示）
+      var skills = (d && d.skills) || [];
       var names = {};
-      d.skills.forEach(function (s) { names[s.name] = 1; });
+      skills.forEach(function (s) { names[s.name] = 1; });
       var dang = {};
-      d.skills.forEach(function (s) {
+      skills.forEach(function (s) {
         (s.dangling || []).forEach(function (r) { if (!names[r]) dang[r] = 1; });
       });
       var n = Object.keys(dang).length;
@@ -111,16 +117,18 @@ var Bell = {
   _renderBadge: function (items) {
     // 异步补源（P0/悬空）到达后重算徽标；面板开着则同步重渲染
     var badge = document.getElementById('bell-badge');
-    if (items.length) {
-      badge.textContent = items.length > 99 ? '99+' : items.length;
-      badge.classList.remove('hidden');
-    } else {
-      badge.classList.add('hidden');
+    if (badge) {  // OCR 2026-10-03：DOM 判空
+      if (items.length) {
+        badge.textContent = items.length > 99 ? '99+' : items.length;
+        badge.classList.remove('hidden');
+      } else {
+        badge.classList.add('hidden');
+      }
     }
     Bell.items = items;
     Bell._notify(items);
     var panel = document.getElementById('bell-panel');
-    if (!panel.classList.contains('hidden')) Bell.renderPanel();
+    if (panel && !panel.classList.contains('hidden')) Bell.renderPanel();
   },
 
   /* ── 桌面通知（T7/B2，仅浏览器端；后台标签页才推送，前台不打扰） ── */
@@ -162,12 +170,14 @@ var Bell = {
 
   toggle: function () {
     var p = document.getElementById('bell-panel');
+    if (!p) return;  // OCR 2026-10-03：DOM 判空
     if (p.classList.contains('hidden')) { this.renderPanel(); p.classList.remove('hidden'); }
     else p.classList.add('hidden');
   },
 
   renderPanel: function () {
     var p = document.getElementById('bell-panel');
+    if (!p) return;  // OCR 2026-10-03：DOM 判空
     if (!this.items.length) {
       p.innerHTML = '<div class="bell-head">全局告警</div><div class="bell-empty">✅ 暂无告警——cron / 水位 / 悬空引用 / 报告 P0 / 候选均正常。</div>';
       return;

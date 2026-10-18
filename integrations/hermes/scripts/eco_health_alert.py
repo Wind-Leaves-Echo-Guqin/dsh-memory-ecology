@@ -26,18 +26,32 @@ def check_extract_output() -> list[str]:
     2026-08-29 修复 eco_extract 分批逻辑后新增本探针。"""
     alerts = []
     try:
+        # OCR 2026-10-03: pending 目录缺失单独报——Path.glob 对不存在目录静默产出空，
+        # 原先「目录没了」与「管道空转」混为同一条告警
+        if not PENDING.is_dir():
+            alerts.append(f"⚠️ pending 目录不存在: {PENDING}——数据目录缺失（非管道空转），请检查挂载/迁移")
+            return alerts
         now = datetime.datetime.now().timestamp()
-        cands = [p for p in PENDING.glob("*.md")
-                 if not p.name.endswith((".done.md", ".rejected.md"))  # Q22 配套：已消费不算候选
-                 and (now - p.stat().st_mtime) <= 7 * 86400]
+        cands = []
+        for p in PENDING.glob("*.md"):
+            if p.name.endswith((".done.md", ".rejected.md")):  # Q22 配套：已消费不算候选
+                continue
+            try:
+                if (now - p.stat().st_mtime) <= 7 * 86400:
+                    cands.append(p)
+            except OSError:
+                continue  # 单个文件 stat 失败不拖垮整轮扫描
         if not cands:
             wm = ""
+            wm_err = ""
             try:
                 wm = (PENDING / ".watermark").read_text().strip()
-            except Exception:
-                pass
+            except OSError as e:
+                # OCR 2026-10-03: 水位线读取失败不再与「无水位线」混同
+                wm_err = str(e)
+            wm_disp = wm[:16] if wm else (f"读取失败: {wm_err[:60]}" if wm_err else "无")
             alerts.append(
-                f"⚠️ eco_extract 近 7 天零候选（水位线 {wm[:16] if wm else '无'}）"
+                f"⚠️ eco_extract 近 7 天零候选（水位线 {wm_disp}）"
                 "——管道可能空转，检查 state.db 消息源与 LLM 调用"
             )
     except Exception as e:
@@ -70,6 +84,8 @@ def check_memory_watermark() -> list[str]:
 
 
 def main() -> int:
+    from lib.cli_base import bootstrap as _bootstrap  # v2.5.0：编码兜底
+    _bootstrap()
     # 产出探针最先执行（不依赖 cron DB，DB 异常也不影响探针生效）
     alerts = []
     alerts.extend(check_extract_output())
@@ -80,9 +96,20 @@ def main() -> int:
         conn = sqlite3.connect(f"file:{EXEC_DB}?mode=ro", uri=True, timeout=10)
         try:
             cur = conn.cursor()
-            cur.execute(
-                "SELECT job_id, status, error, started_at FROM executions "
-                "ORDER BY started_at DESC")
+            try:
+                # OCR 2026-10-03: 「每 job 最近 2 次」下推 SQL（窗口函数）——原先全表
+                # 读取+Python 分组，executions 随小时级 cron 无限增长
+                cur.execute(
+                    "SELECT job_id, status, error, started_at FROM ("
+                    "  SELECT job_id, status, error, started_at,"
+                    "         ROW_NUMBER() OVER (PARTITION BY job_id ORDER BY started_at DESC) AS rn"
+                    "  FROM executions"
+                    ") WHERE rn <= 2 ORDER BY started_at DESC")
+            except sqlite3.OperationalError:
+                # 老版本 SQLite 无窗口函数 → 退化为有界最近 500 行
+                cur.execute(
+                    "SELECT job_id, status, error, started_at FROM executions "
+                    "ORDER BY started_at DESC LIMIT 500")
             rows = cur.fetchall()
         finally:
             conn.close()
@@ -102,17 +129,19 @@ def main() -> int:
         data = json.loads(JOBS.read_text(encoding="utf-8"))
         for j in data.get("jobs", []):
             names[j["id"]] = j.get("name", j["id"])
-    except Exception:
-        pass
+    except Exception as e:
+        # OCR 2026-10-03: jobs.json 损坏不再静默降级——至少留下诊断告警
+        alerts.append(f"⚠️ jobs.json 不可读: {e}（job 名称映射降级为原始 id）")
 
     # Q14 修复（2026-09-06）：此处原为无条件 `alerts = []`，把上面产出探针的结果
     # 清空——探针永远无法告警（8-29 事故盲区修复自身失效）。改为保留探针结果。
     for jid, execs in by_job.items():
         recent = execs[:2]  # started_at DESC 排序下取最近 2 次
-        if len(recent) >= 2 and all(e[0] == "failed" for e in recent):
-            t2 = (recent[1][2] or "")[:16]
+        # OCR 2026-10-03: 状态白名单加 "error"（jobs.json 同词表），时间取最近一次失败
+        if len(recent) >= 2 and all(e[0] in ("failed", "error") for e in recent):
+            t0 = (recent[0][2] or "")[:16]
             err = (recent[0][1] or "")[:150]
-            alerts.append(f"⚠️ cron 连续失败×2: {names.get(jid, jid)}（最近 {t2}）\n    {err}")
+            alerts.append(f"⚠️ cron 连续失败×2: {names.get(jid, jid)}（最近 {t0}）\n    {err}")
 
     if alerts:
         print("## 生态健康告警")

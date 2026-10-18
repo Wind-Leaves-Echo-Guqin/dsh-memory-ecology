@@ -95,6 +95,8 @@ def verify_entry(path: Path, evidence: str | None = None, dry: bool = False) -> 
 
 
 def main() -> int:
+    from lib.cli_base import bootstrap as _bootstrap  # v2.5.0：编码兜底
+    _bootstrap()
     ap = argparse.ArgumentParser(description="经验条目证据登记（draft→verified）")
     ap.add_argument("ident", help="条目 id（全名或唯一短尾）")
     ap.add_argument("--evidence", default=None, help="权威证据文本（可选）")

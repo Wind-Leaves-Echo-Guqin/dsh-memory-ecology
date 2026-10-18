@@ -1,0 +1,31 @@
+[
+ {
+  "arm": "full-context",
+  "questions": 60,
+  "accuracy": 1.0,
+  "stale_rate": 0.0,
+  "avg_context_chars": 9159
+ },
+ {
+  "arm": "rag-tfidf",
+  "questions": 60,
+  "accuracy": 0.9167,
+  "stale_rate": 0.0833,
+  "avg_context_chars": 149
+ },
+ {
+  "arm": "governed",
+  "questions": 60,
+  "accuracy": 0.8,
+  "stale_rate": 0.2,
+  "avg_context_chars": 856
+ },
+ {
+  "arm": "mem0",
+  "questions": 60,
+  "accuracy": 0.9833,
+  "stale_rate": 0.0167,
+  "avg_context_chars": 584,
+  "mem0_build_s": 230.7
+ }
+]

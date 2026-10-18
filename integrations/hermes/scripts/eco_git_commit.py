@@ -30,6 +30,12 @@ def sync_tree(src: Path, dst: Path, skip: set[str] | None = None) -> bool:
     changed = False
     if not src.exists():
         return changed
+    entries = list(src.iterdir())
+    if not entries:
+        # OCR 2026-10-03: 源目录存在但为空（部分挂载/瞬时为空）→ 跳过镜像删除，
+        # 防止把已跟踪内容全部清掉再 commit 一场空快照
+        print(f"⚠️ 源目录为空，跳过本轮镜像（防误删目标内容）: {src}", file=sys.stderr)
+        return changed
     dst.mkdir(parents=True, exist_ok=True)
     # 删除目标里源已不存在的条目（保持镜像）——**绝不碰 .git**
     for item in dst.iterdir():
@@ -42,18 +48,25 @@ def sync_tree(src: Path, dst: Path, skip: set[str] | None = None) -> bool:
                 item.unlink()
             changed = True
     # 增量复制
-    for item in src.iterdir():
+    for item in entries:
         if item.name in skip:
             continue
         target = dst / item.name
         if item.is_dir():
-            if sync_tree(item, target):
+            if sync_tree(item, target, skip):  # OCR: skip 递归转发——嵌套的 .hub 也得排除
                 changed = True
         else:
             try:
-                src_m = item.stat().st_mtime_ns
-                dst_m = target.stat().st_mtime_ns if target.exists() else -1
-                if src_m != dst_m:
+                st = item.stat()
+                src_m, src_s = st.st_mtime_ns, st.st_size
+                if target.exists():
+                    dst_st = target.stat()
+                    dst_m, dst_s = dst_st.st_mtime_ns, dst_st.st_size
+                else:
+                    dst_m, dst_s = -1, -1
+                # OCR: 除 mtime 外加比 size——copy2 保源 mtime，仅靠 mtime 会漏掉
+                # 内容变了但 mtime 未动（或恰好与目标相同）的文件
+                if src_m != dst_m or src_s != dst_s:
                     shutil.copy2(item, target)
                     changed = True
             except OSError:
@@ -63,22 +76,21 @@ def sync_tree(src: Path, dst: Path, skip: set[str] | None = None) -> bool:
 
 
 def main() -> int:
+    from lib.cli_base import bootstrap as _bootstrap  # v2.5.0：编码兜底
+    _bootstrap()
     if not (REPO / ".git").exists():
         print("ecosystem.git 不存在，跳过")
         return 1
 
-    changed = False
-    # 1) memories / skills / scripts
+    # 1) memories / skills / scripts（OCR: changed 原为死变量——提交与否由 git status 决定）
     for name in ("memories", "skills", "scripts"):
-        if sync_tree(HERMES / name, REPO / name, SKIP_SKILLS if name == "skills" else None):
-            changed = True
+        sync_tree(HERMES / name, REPO / name, SKIP_SKILLS if name == "skills" else None)
 
     # 2) designs/workflows 每日只读快照（保留历史）
     snap = REPO / "archive" / TODAY
     for name in ("designs", "workflows"):
         if (AGENT_INDEX / name).exists():
-            if sync_tree(AGENT_INDEX / name, snap / name):
-                changed = True
+            sync_tree(AGENT_INDEX / name, snap / name)
 
     # 3) protected.md/json（单文件复制，绝不用 sync_tree 扫源父目录）
     for f in ("protected.md", "protected.json"):
@@ -88,14 +100,15 @@ def main() -> int:
             try:
                 if not dst.exists() or src.stat().st_mtime_ns != dst.stat().st_mtime_ns:
                     shutil.copy2(src, dst)
-                    changed = True
             except OSError:
                 shutil.copy2(src, dst)
-                changed = True
 
-    # 4) commit（无变化跳过）
+    # 4) commit（无变化跳过；OCR: git status 失败不再被误读为「无变化」静默跳过）
     r = subprocess.run(["git", "-C", str(REPO), "status", "--porcelain"],
                        capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        print(f"❌ git status 失败（rc={r.returncode}）: {(r.stderr or '').strip()[:200]}")
+        return 1
     if r.stdout.strip():
         subprocess.run(["git", "-C", str(REPO), "add", "-A"], check=True)
         msg = f"eco snapshot {TODAY}: {len(r.stdout.strip().splitlines())} changes"

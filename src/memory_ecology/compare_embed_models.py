@@ -93,6 +93,8 @@ def make_embed_fn(model_name, pooling):
 
 
 def main() -> int:
+    from lib.cli_base import bootstrap as _bootstrap  # v2.5.0：编码兜底
+    _bootstrap()
     ap = argparse.ArgumentParser()
     ap.add_argument("--models", nargs="*", default=None)
     ap.add_argument("--golden", type=Path, default=GOLDEN)

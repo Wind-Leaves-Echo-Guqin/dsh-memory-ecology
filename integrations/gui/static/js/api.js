@@ -50,7 +50,13 @@ var EcoApi = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body || {})
     }).then(function (r) {
+      // OCR 2026-10-03：对齐 _attempt——校验 r.ok 与 j.ok，HTTP 错误/业务失败
+      // 不再被调用方当成成功，服务端错误信息也得以保留
+      if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json().catch(function () { throw new Error('HTTP ' + r.status); });
+    }).then(function (j) {
+      if (!j.ok) throw new Error(j.error || '请求失败');
+      return j;
     });
   },
 
@@ -107,6 +113,8 @@ function _fallbackCopy(text) {
 function _manualCopyDialog(text, okMsg) {
   var m = document.getElementById('gate-modal');
   var mask = document.getElementById('gate-mask');
+  // OCR 2026-10-03：组件缺失时判空降级，不再抛 TypeError 打断"一定能复制"兜底
+  if (!m || !mask) return;
   m.innerHTML = '<div class="gate-box"><h3>📋 请手动复制</h3>' +
     '<div class="empty-ok">窗口剪贴板不可用（旧内核常见）。下面的文本已全选：<br>' +
     '按 <b>Ctrl+C</b> 复制，或右键→复制。</div>' +

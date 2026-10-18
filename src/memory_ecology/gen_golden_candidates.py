@@ -74,6 +74,8 @@ def load_experiences(limit: int | None = None) -> list[dict]:
 
 
 def main() -> int:
+    from lib.cli_base import bootstrap as _bootstrap  # v2.5.0：编码兜底
+    _bootstrap()
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=150, help="目标候选对数")
     ap.add_argument("--out", type=Path, default=Path(__file__).parent / "golden" / "_candidates.json")

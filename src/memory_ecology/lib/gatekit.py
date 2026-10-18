@@ -20,17 +20,35 @@ def acquire_lock(lock_path: Path) -> bool:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.write(fd, str(os.getpid()).encode())
-        os.close(fd)
-        return True
     except FileExistsError:
         return False
+    # v2.5.0：其余 OSError（EACCES/ENOSPC/EMFILE）不再伪装成"已有实例在运行"，
+    # 否则磁盘满会被误报成并发跳过，门静默失效。
+    try:
+        os.write(fd, str(os.getpid()).encode())
     except OSError:
-        return False
+        try:
+            lock_path.unlink(missing_ok=True)   # 回滚半成品锁
+        except OSError:
+            pass
+        raise
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    return True
 
 
 def release_lock(lock_path: Path) -> None:
-    """释放锁（幂等——不存在时不报错）。"""
+    """释放锁（幂等——不存在时不报错）。
+
+    ★ v2.5.0：只删**属于本进程**的锁。若运行期间锁已被别的实例重抢，
+      无条件 unlink 会删掉对方正在持有的锁 → 两个写者同时进临界区。
+    """
+    pid = read_lock_pid(lock_path)
+    if pid is not None and pid != os.getpid():
+        return
     lock_path.unlink(missing_ok=True)
 
 
@@ -89,7 +107,10 @@ def acquire_lock_auto(lock_path: Path) -> tuple[bool, str]:
     if acquire_lock(lock_path):
         return True, "fresh"
     pid = read_lock_pid(lock_path)
-    if pid is None or (pid != os.getpid() and _pid_alive(pid)):
+    # v2.5.0：本进程已持有 → 判 held（旧实现会当残留回收，导致同进程重入不再互斥）
+    if pid == os.getpid():
+        return False, "held"
+    if pid is None or _pid_alive(pid):
         return False, "held"
     # 死锁残留（或本进程残留）：清理重抢
     try:
@@ -106,13 +127,16 @@ class LockContext:
     def __init__(self, lock_path: Path):
         self._path = lock_path
         self.locked = False
+        self.how = "held"       # v2.5.0：Enter 前也要有值
 
     def __enter__(self):
         self.locked, self.how = acquire_lock_auto(self._path)
         return self.locked
 
     def __exit__(self, *exc):
-        release_lock(self._path)
+        # v2.5.0：只在确实持有时释放（原来无条件 unlink 会删掉别人的锁）
+        if self.locked:
+            release_lock(self._path)
 
 
 # ── 数据库连接 ────────────────────────────────────────────────────────

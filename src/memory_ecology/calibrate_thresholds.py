@@ -44,6 +44,8 @@ def norm(s):
 
 
 def main() -> int:
+    from lib.cli_base import bootstrap as _bootstrap  # v2.5.0：编码兜底
+    _bootstrap()
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="bge-small-zh-v1.5")
     ap.add_argument("--pooling", default="cls")

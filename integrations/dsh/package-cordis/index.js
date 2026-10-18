@@ -38,7 +38,8 @@
  *   ECO_PYTHON_DIR       Python 侧脚本目录（默认 ../package/python/，单源复用）
  *   DSH_ECO_HOST_MODULES 宿主 node_modules 根（默认探测 DSH_HOME 与 ~/.dsh）
  *   ECO_JS_THROTTLE_MS   JS 兜底节流（默认 60000ms，0=每步都探）
- *   ECO_KEEP_FULL_ENV=1  透传完整宿主环境给子进程（默认只透传系统+生态变量）
+ *   （OCR 2026-10-03：完整环境透传开关只认 config.keepFullEnv——环境变量
+ *     ECO_KEEP_FULL_ENV 不再被读取）
  * 以上均可被 patch config 同名字段覆盖（camelCase：ecoPython / ecoScriptsDir /
  * memoryEcologyRoot / pythonDir / hostModulesDir / jsThrottleMs / keepFullEnv）。
  */
@@ -58,8 +59,9 @@ const inject = ['tools', 'agents'];
 const PKG_DIR = path.dirname(fileURLToPath(import.meta.url));
 // JS 侧兜底节流（默认 60s）；patch config jsThrottleMs / env ECO_JS_THROTTLE_MS 可调，
 // 0 = 每步都探（验证用）。权威窗口/冷却（10min/15min）仍在 Python 状态机。
+// OCR 2026-10-03：节流值改为 apply() 局部传参——原模块级可变单例在多宿主实例
+// （同进程两次 apply，各自不同 config）下互相覆盖对方的节流设置
 const JS_THROTTLE_MS_DEFAULT = 60_000;
-let jsThrottleMs = JS_THROTTLE_MS_DEFAULT;
 
 /** 宿主 node_modules 根候选（有 dsh-tools 的那个胜出）。 */
 function hostModulesRoots(config) {
@@ -110,7 +112,14 @@ async function importHostModule(config, spec) {
   for (const root of hostModulesRoots(config)) {
     if (!existsSync(path.join(root, '@deepseek-ai', 'dsh-tools'))) continue;
     const req = createRequire(path.join(root, '_resolve_.js'));
-    const entry = req.resolve(spec);
+    let entry;
+    try {
+      entry = req.resolve(spec);
+    } catch (_) {
+      // OCR 2026-10-03：该候选树解析不到此包时换下一个根——原实现任一根抛错
+      // 就炸掉整个 apply()，多候选根机制形同虚设
+      continue;
+    }
     const mod = await import(pathToFileURL(entry).href);
     return { mod, entry, root, version: pkgVersionOf(entry) };
   }
@@ -203,9 +212,9 @@ async function toolErrorQuery(spawnScripts, args) {
 const lastProbe = new Map();
 const MAX_THROTTLE_KEYS = 64;
 
-function throttleAllows(key, now) {
+function throttleAllows(key, now, limitMs) {
   const prev = lastProbe.get(key);
-  if (prev !== undefined && now - prev < jsThrottleMs) return false;
+  if (prev !== undefined && now - prev < limitMs) return false;
   lastProbe.set(key, now);
   if (lastProbe.size > MAX_THROTTLE_KEYS) {
     // 丢最旧的一半，避免长驻进程无界增长
@@ -236,8 +245,11 @@ export async function apply(ctx, config = {}) {
   const { defineTool } = tools.mod;
   const { createUserMessage } = llm.mod;
 
-  jsThrottleMs = Number(config?.jsThrottleMs ?? process.env.ECO_JS_THROTTLE_MS ?? JS_THROTTLE_MS_DEFAULT);
-  if (!Number.isFinite(jsThrottleMs) || jsThrottleMs < 0) jsThrottleMs = JS_THROTTLE_MS_DEFAULT;
+  // OCR 2026-10-03：节流值为本次 apply 的局部量（不再写模块级单例），随 handler 闭包传递
+  const jsThrottleMs = Number(config?.jsThrottleMs ?? process.env.ECO_JS_THROTTLE_MS ?? JS_THROTTLE_MS_DEFAULT);
+  const throttleLimitMs = Number.isFinite(jsThrottleMs) && jsThrottleMs >= 0
+    ? jsThrottleMs
+    : JS_THROTTLE_MS_DEFAULT;
 
   const pythonDir = locatePythonDir(config);
   const py = common.resolvePythonInterpreter(process.env.ECO_PYTHON || config?.ecoPython);
@@ -247,10 +259,20 @@ export async function apply(ctx, config = {}) {
   ctx.logger.info(`eco-note: python=${py.cmd}（${py.how}）`
     + ` | host=${tools.version || tools.entry} | scripts=${scriptsDir} | root=${root}`);
 
-  const spawnWith = (cwd) => (script, args) => common.runPython(py.cmd, path.join(cwd, script), args, {
-    cwd,
-    env: common.curatedEnv({ ECO_SCRIPTS_DIR: scriptsDir, MEMORY_ECOLOGY_ROOT: root }, config),
-  });
+  const spawnWith = (cwd) => (script, args) => {
+    // OCR 2026-10-03（security）：解释器解析失败时**拒绝执行**——不再把裸名 cmd 交给
+    // spawn（Windows CreateProcess 按"当前目录优先"解析，cwd 是可写 scripts 目录，
+    // CWE-427 植入面未真正关闭）；保持 fail-open 返回失败形状
+    if (!py.resolved) {
+      return Promise.resolve({
+        out: '', err: '未解析到可用的 Python 解释器（拒绝以裸名执行）', code: null, failed: true,
+      });
+    }
+    return common.runPython(py.cmd, path.join(cwd, script), args, {
+      cwd,
+      env: common.curatedEnv({ ECO_SCRIPTS_DIR: scriptsDir, MEMORY_ECOLOGY_ROOT: root }, config),
+    });
+  };
   const spawn = spawnWith(pythonDir);        // 会话扫描脚本在包内 python/
   const spawnScripts = spawnWith(scriptsDir); // 检索类脚本在核心 scripts 目录
 
@@ -311,7 +333,7 @@ export async function apply(ctx, config = {}) {
     const sessionId = String(agent?.id ?? process.env.DSH_SESSION_ID ?? '');
     const throttleKey = sessionId || '__anonymous__';
     try {
-      if (!throttleAllows(throttleKey, Date.now())) return decision;
+      if (!throttleAllows(throttleKey, Date.now(), throttleLimitMs)) return decision;
       const { text, reason, info } = await contextProbe(spawn, sessionId);
       if (!text) {
         // 原实现把 reason 全丢了：装错目录/缺 zstandard/超时/无命中看起来一模一样

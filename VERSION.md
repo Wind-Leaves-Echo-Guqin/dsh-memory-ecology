@@ -1,5 +1,24 @@
 # Memory Ecology Compat · 版本
 
+- **v2.5.0**（2026-10-18）—— 入口纪律统一 · 并发写入修复 · 第一公里补齐（用户模拟测试驱动）
+  - **`lib/cli_base.py` 新增**：统一 CLI 入口基座（编码兜底 / 数据根 / 目录 / 互斥 / 失败出口）。
+    26 个 CLI 脚本接入，解决"四道门四项纪律没有一项齐"的结构性问题。
+  - **编码**：22 个脚本缺 stdout 兜底 → 中文 Windows（GBK）下 print emoji 崩；`write_gate`
+    崩在收尾位置造成"数据已落盘却 exit 1"的假失败；异常处理里的 print 也会崩，把真正的
+    FileNotFoundError 掩盖成编码错误。现全部走 `bootstrap()`（`errors="replace"`）。
+  - **数据根**：门④ `eco_review` 自算 `__file__` 无视 `MEMORY_ECOLOGY_ROOT`（本线 2026-10-11
+    已修，本版同步进发布物）；门② `eco_quota` 锁文件不建父目录 → 自定义根必崩，改走
+    `gatekit.acquire_lock_auto()`。
+  - **并发**：`gatekit` 把"本进程持有"当残留锁回收 → 同进程重入不再互斥（多 agent 同进程会踩）；
+    `lib/fs.atomic_write` 在 Windows 上 `os.replace` 遇读者占用会抛 WinError 5/32
+    （POSIX 允许 rename 覆盖已打开文件，Windows 不允许）→ 三级重试 + 可回滚兜底。
+  - **静默丢数**：`eco_note_adopt` 用 `utf-8` 读 pending 会把 BOM 留成 `﻿`，
+    正则匹配不到首行 → 第一条候选静默丢失；改 `utf-8-sig`。
+  - **报错改进**：`lib/safeio` 的 type 枚举校验报错现在列出合法值。
+  - **第一公里**：README 新增「0) 先存一条记忆」与「如何迁移已有记忆」；
+    `eco_health_check` 新增 `--no-write`（原来忽略 `--help` 直接执行并写 3 处），空库不再给健康分。
+  - **测试**：新增 `test_concurrent_writes.py`（C1–C5）+ `test_mutation.py`（6 变异体，全抓到）。
+  - **CI 门禁**：`check_entry_discipline.py`（D1 编码 / D2 数据根 / D3 建目录 / D4 锁成对）。
 - **v2.4.0**（2026-10-07）——向量缓存（灰度）· OR 召回 + RRF 融合（外部调研落地第二期）
   - S6 向量缓存 shadow index：条目级 content-hash 增量/换模型整库失效/prune 镜像；
     缓存一律可丢弃（坏=无损）；`--semantic` 向量路 + 自动回退；灰度不切默认

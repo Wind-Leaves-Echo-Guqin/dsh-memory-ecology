@@ -38,6 +38,8 @@ def norm(s):
 
 
 def main() -> int:
+    from lib.cli_base import bootstrap as _bootstrap  # v2.5.0：编码兜底
+    _bootstrap()
     g = json.loads(GOLDEN.read_text(encoding="utf-8"))
     pairs = g["pairs"]
     # 预计算 difflib 用于分层

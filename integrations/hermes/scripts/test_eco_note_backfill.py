@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """eco_note_backfill 测试（2026-09-03）：dry-run 不写 / 候选落 backfill 子目录 / 上限生效。"""
 from __future__ import annotations
+# publish bridge: 集成层测试定位核心模块（src/memory_ecology）
+import sys as _sys, pathlib as _plib
+_sys.path.insert(0, str(_plib.Path(__file__).resolve().parents[3] / 'src' / 'memory_ecology'))
 
 import sys
 import tempfile
@@ -83,6 +86,3 @@ class BackfillTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
-# publish bridge: 集成层测试定位核心模块（src/memory_ecology）
-import sys as _sys, pathlib as _plib
-_sys.path.insert(0, str(_plib.Path(__file__).resolve().parents[3] / 'src' / 'memory_ecology'))

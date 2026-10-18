@@ -225,7 +225,14 @@ def diagnose(fix: bool = False) -> dict:
         add("locks", "锁文件", True, "无陈旧锁（2h 内锁=写入方正常活动）")
 
     # 8. 体检报告存在性
-    rep = Path.home() / ".memory-ecology" / "designs" / "生态体检报告-v1.1.md"
+    # 产出路径随 v1.1 迁移到 ~/.memory-ecology/designs（daily 归档为最新鲜信号）；
+    # ~/.agent-index/designs 是 2026-10-03 前的旧路径，只作兜底，避免假报"距上次体检 234h"。
+    eco_designs = Path.home() / ".memory-ecology" / "designs"
+    rep = eco_designs / "体检报告存档" / f"{datetime.now():%Y-%m-%d}.md"
+    if not rep.is_file():
+        rep = eco_designs / "生态体检报告-v1.1.md"
+    if not rep.is_file():
+        rep = Path.home() / ".memory-ecology" / "designs" / "生态体检报告-v1.1.md"
     if rep.is_file():
         age_h = (time.time() - rep.stat().st_mtime) / 3600
         add("report", "体检报告", True, f"距上次体检 {age_h:.0f}h")

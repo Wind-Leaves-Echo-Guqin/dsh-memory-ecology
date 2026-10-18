@@ -42,7 +42,7 @@ def safe_entry_path(root, stem: str):
 def _check_enums(fm: dict, types: set, statuses: set, errs: list) -> None:
     t = fm.get("type")
     if t and t not in types:
-        errs.append(f"type 非法: {t!r}")
+        errs.append(f"type 非法: {t!r}（合法值: {sorted(types)}）")   # v2.5.0：说明合法值
     s = fm.get("status")
     if s and s not in statuses:
         errs.append(f"status 非法: {s!r}")

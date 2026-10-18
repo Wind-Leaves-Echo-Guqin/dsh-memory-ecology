@@ -27,7 +27,10 @@ import sqlite3
 import sys
 from pathlib import Path
 
-HERMES = Path(__file__).resolve().parent.parent.parent
+# v2.5.0：原写法 parent.parent.parent 会越过仓库根（指到用户主目录）。
+# 统一走 lib.config.hermes_root()，与其余脚本一致（认 MEMORY_ECOLOGY_ROOT）。
+from lib.config import hermes_root as _hermes_root
+HERMES = _hermes_root()
 # 生产 state.db 位置（demo 只读；不写任何东西）
 DB = HERMES / "state.db"
 if not DB.exists():
@@ -176,29 +179,30 @@ def parse_tool_calls(tool_calls_json: str | None) -> list[dict]:
     return out
 
 
-def scan_signals(watermark: float, limit: int = 5000) -> tuple[list[dict], float]:
-    """扫描 state.db（只读），返回 (信号列表, 新水位线)。
+def scan_signals(watermark, limit: int = 5000) -> tuple[list[dict], tuple[float, int]]:
+    """扫描 state.db（只读），返回 (信号列表, 新水位线 (ts, id))。
 
-    信号 dict: {type, session_id, ts, tool_name, snippet}
-    水位线推进 = 扫描窗口的最大 timestamp（本批 max，吸取 eco_extract LIMIT30 教训：
-    不推进全表 MAX，避免跳窗；此处整窗单批扫描，失败即整体不推进）。
+    信号 dict: {type, session_id, ts, tool_name, snippet, msg_id}
+    P1（2026-10-04）：水位线改 (timestamp, id) 复合键——旧版推进到本批 max timestamp，
+    LIMIT 截断落在同 timestamp 消息中间时，下轮 `timestamp > max` 跳过剩余同 ts 消息
+    （水位线跳窗）。旧标量水位线兼容读取（同 ts 从头重扫，消费端幂等兜底）。
     """
+    from lib import watermark as _wm
     if not DB.exists():
         raise FileNotFoundError(f"state.db 不存在: {DB}")
     conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
     try:
         cur = conn.cursor()
         # 一次取窗口内全部消息（demo 期保守 limit，正式版分批）
+        wc, wparams = _wm.where_clause(watermark)
         cur.execute(
             "SELECT id, session_id, role, content, tool_name, tool_calls, timestamp "
-            "FROM messages WHERE timestamp > ? ORDER BY timestamp ASC LIMIT ?",
-            (watermark, limit),
+            f"FROM messages WHERE ({wc}) ORDER BY timestamp ASC, id ASC LIMIT ?",
+            [*wparams, limit],
         )
         rows = cur.fetchall()
         signals: list[dict] = []
-        max_ts = watermark
         for rid, sid, role, content, tool_name, tool_calls, ts in rows:
-            max_ts = max(max_ts, ts)
             if role == "tool":
                 d = parse_tool_content(content)
                 if is_tool_error(d):
@@ -238,7 +242,7 @@ def scan_signals(watermark: float, limit: int = 5000) -> tuple[list[dict], float
                             "snippet": args_txt[:80],
                             "msg_id": rid,
                         })
-        return signals, max_ts
+        return signals, _wm.next_watermark(rows, 6, 0)  # ts_idx=6, id_idx=0
     finally:
         conn.close()
 
@@ -299,12 +303,27 @@ def test() -> int:
 
 
 def main() -> int:
+    from lib.cli_base import bootstrap as _bootstrap  # v2.5.0：编码兜底
+    _bootstrap()
     if "--test" in sys.argv:
         return test()
-    since = float(sys.argv[sys.argv.index("--since") + 1]) if "--since" in sys.argv else 0.0
-    limit = int(
-        sys.argv[sys.argv.index("--limit") + 1] if "--limit" in sys.argv else 5000
-    )
+    # OCR 2026-10-03（low）：flag 位于末尾时 index()+1 越界；数值非法时 float/int
+    # 抛未捕获异常——统一给友好错误。
+    def _arg_num(flag: str, default, cast):
+        if flag not in sys.argv:
+            return default
+        i = sys.argv.index(flag)
+        if i + 1 >= len(sys.argv):
+            print(f"参数错误：{flag} 缺少取值", file=sys.stderr)
+            raise SystemExit(2)
+        try:
+            return cast(sys.argv[i + 1])
+        except ValueError:
+            print(f"参数错误：{flag} 取值非法：{sys.argv[i + 1]!r}", file=sys.stderr)
+            raise SystemExit(2)
+
+    since = _arg_num("--since", 0.0, float)
+    limit = _arg_num("--limit", 5000, int)
     signals, new_wm = scan_signals(since, limit)
     print(f"信号统计: {brief(signals)} | 新水位线: {new_wm}")
     for s in signals[:30]:

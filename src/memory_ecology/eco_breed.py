@@ -50,6 +50,8 @@ def find_skill(name: str) -> Path | None:
 
 
 def main() -> int:
+    from lib.cli_base import bootstrap as _bootstrap  # v2.5.0：编码兜底
+    _bootstrap()
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", required=True)
     ap.add_argument("--sources", required=True, help="逗号分隔的亲代技能名")

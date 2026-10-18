@@ -3,6 +3,45 @@
 > 目的：让债可见。这是"从个人可用到开源可维护"最重要的一步——不是修完所有债，而是不再隐藏。
 > 产出背景：2026-10-04 两轮 AI 评审 + 人工核对 + 三路深扫，全部发现已修复或登记于此。
 
+## 〇-ter、v2.5.0 更新销账（2026-10-18，用户模拟测试驱动）
+
+驱动：三轮用户模拟测试（P1 纯新手 / P2 英文老手 / P3 大库用户）+ 独立终审。
+产出报告见 `Desktop/Agent记忆实验数据/` 同源的群目录（本仓不含）。
+
+### 已销账（4 个 Blocker + 3 个并发/静默缺陷）
+
+| 原问题 | 根因 | 修法 |
+|---|---|---|
+| `write_gate` 数据已落盘却 exit 1 | 22 个脚本缺 stdout 编码兜底，崩在收尾 print | `lib/cli_base.bootstrap()`，26 脚本接入 |
+| 真错被编码错掩盖 | 异常处理里的 print 自身崩 | `errors="replace"` 保证异常路径不二次崩 |
+| 门④ 无视 `MEMORY_ECOLOGY_ROOT` | 用 `Path(__file__).parent.parent` 自算 | `cli_base.resolve_root()` |
+| 门② 自定义数据根必崩 | `os.open(O_CREAT)` 不建父目录 | `gatekit.acquire_lock_auto()` |
+| 同进程锁重入不再互斥 | `pid == getpid()` 被当残留回收 | 显式判 `held`（`gatekit.py`） |
+| Windows `os.replace` 遇读者占用失败 | POSIX rename 语义在 Windows 不成立 | 指数退避重试 + 长退避兜底（`fs.py`） |
+| BOM 致首条候选静默丢失 | `utf-8` 读取保留 `\ufeff` | `utf-8-sig`（`eco_note_adopt.py`） |
+
+### 新增防线
+
+- `tools/check_entry_discipline.py`：D1 编码 / D2 自算数据根 / D3 写前建目录 / D4 锁成对。
+  **29 个脚本 0 违规**，建议接入 CI。
+- `test_concurrent_writes.py`：C1–C5，覆盖同门/跨门并发、stale 锁、原子写可见性、同进程重入。
+- `test_mutation.py`：6 个变异体，验证上述测试的有效性（全部被抓到）。
+
+### 仍然登记在案的债（本轮未动）
+
+- §一 的 D（`eco_state.VALID` vs `eco_health_check.LEGAL_MATRIX` 双源）与
+  E（5+ 套 frontmatter 解析）仍待收敛 —— **本轮只统一了"入口纪律"，没统一"解析口径"**。
+- §二 的 `inject_gate` 遥测字段补全、`eco_note_backfill` 并行化、`lib/similarity` simhash 仍待办。
+- §三 的 FTS5（>1000 条规模化路径）仍登记未实现；`--semantic`/`--recall` 仍为灰度默认关闭。
+- §四 双树漂移 14–16 处待人工核对。
+
+### 一条方法教训（写给未来的自己）
+
+本轮最大的坑是"**把工作区当成发布产物**"：源仓库工作区有 25 删 + 45 改 + 10 未跟踪，
+而 `HEAD` 才是完整版本。同一根因在一次任务里犯了三次（判文件存在性 / 判代码行为 / 判优点陈述）。
+**任何"用户会看到什么"的结论，必须在 `git clone` 副本上复现，不能在工作区观察。**
+
+---
 ## 〇-bis、v2.4.0 更新销账（2026-10-07，外部调研落地第二期）
 
 1. **已落地**：S6 向量缓存 shadow index（lib/vector_cache.py，条目级 content-hash 增量 + 换模型整库失效 +

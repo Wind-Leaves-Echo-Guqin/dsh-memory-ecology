@@ -46,7 +46,7 @@ def parse_pending_md(path: Path) -> list[dict]:
     """
     cands: list[dict] = []
     cur: dict | None = None
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():   # v2.5.0：吃 BOM
         m = re.match(r"^-\s*\[(\w+)\]\s*\*\*(.+?)\*\*", line)
         if m:
             cur = {"type": m.group(1), "trigger": m.group(2), "fields": {}}
@@ -117,7 +117,7 @@ def build_entry(c: dict, eid: str) -> str:
 
 def mark_accepted(pending_path: Path, trigger: str) -> None:
     """在 pending 文件的行首标 *.accepted*（不删除源行）。"""
-    text = pending_path.read_text(encoding="utf-8")
+    text = pending_path.read_text(encoding="utf-8-sig")   # v2.5.0：吃 BOM
     out_lines = []
     for line in text.splitlines():
         if line.startswith(f"- [") and f"**{trigger}**" in line:
@@ -129,6 +129,8 @@ def mark_accepted(pending_path: Path, trigger: str) -> None:
 
 
 def main() -> int:
+    from lib.cli_base import bootstrap as _bootstrap  # v2.5.0：编码兜底
+    _bootstrap()
     dry = "--dry-run" in sys.argv
     existing = {p.stem for p in EXP_DIR.glob("exp-*.md")}
     date = _date.today().isoformat()
@@ -205,7 +207,7 @@ def _is_accepted_line(pending_path: Path, trigger: str) -> bool:
     if not trigger:
         return False
     try:
-        for line in pending_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        for line in pending_path.read_text(encoding="utf-8-sig", errors="replace").splitlines():   # v2.5.0：吃 BOM
             if trigger in line and line.lstrip().startswith("<!--"):
                 return True
     except OSError:

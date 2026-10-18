@@ -43,11 +43,12 @@ mod._internals.runContext = () => { throw new Error('boom'); };
 check('Python 侧异常 fail-open 不抛出', ctx._ctxFn() === null);
 mod._internals.runContext = origRun;
 
-// 工具 handler：空参返回 error 字段（不抛异常）
+// 工具 handler：空参统一回 {result} 形状（不抛异常）——OCR 2026-10-03：与成功路径
+// 及 cordis 变体形状统一，原 {error} 在只认 result 的 SDK 上会被静默丢弃
 const bad = mod._internals.toolQuery({});
-check('toolQuery 空参返回 error 字段', !!(bad && bad.error));
+check('toolQuery 空参返回 result 形状（统一形状）', !!(bad && typeof bad.result === 'string'));
 const bad2 = mod._internals.toolErrorQuery({});
-check('toolErrorQuery 空参返回 error 字段', !!(bad2 && bad2.error));
+check('toolErrorQuery 空参返回 result 形状（统一形状）', !!(bad2 && typeof bad2.result === 'string'));
 
 console.log(failures === 0 ? '\n全部通过' : `\n失败 ${failures} 项`);
 process.exit(failures === 0 ? 0 : 1);

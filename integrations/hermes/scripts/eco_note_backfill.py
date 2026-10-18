@@ -155,6 +155,8 @@ def load_seen_triggers() -> set[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from lib.cli_base import bootstrap as _bootstrap  # v2.5.0：编码兜底
+    _bootstrap()
     ap = argparse.ArgumentParser(description="经验库存量会话回扫（一次性）")
     ap.add_argument("--sessions", default="", help="逗号分隔会话 id（或 --top）")
     ap.add_argument("--top", type=int, default=0, help="自动取信号密度 TOP N 会话")
@@ -222,18 +224,22 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             got = 0
             for it in items:
-                # OCR 2026-10-03: 先截断到落盘长度再做去重键——内存键与持久化键保持一致，
+                # OCR 2026-10-03: 先截断到落盘长度再做去重键——内存键与持久化键
+                #（load_seen_triggers 从候选文件读回的 60 字符形式）保持一致，
                 # 否则 >60 字符的 trigger 断点续跑时必然重复落盘
                 t = (it.get("trigger") or "").replace("\n", " ").replace("**", "∗∗")[:60]
                 if not t or t in seen_triggers:
                     continue
                 seen_triggers.add(t)
-                line = (f"- [{it.get('type','?')}] **{t[:60]}**\n"
-                        f"    - symptom: {it.get('symptom','')}\n"
-                        f"    - cause: {it.get('cause','')}\n"
-                        f"    - action: {it.get('action','')}\n"
-                        f"    - evidence: {it.get('evidence','')}\n"
-                        f"    - boundary: {it.get('boundary','')}\n"
+                # 字段消毒（同 eco_note P2）：换行/星号可伪造候选条目行
+                def _sf(k: str) -> str:
+                    return str(it.get(k) or "").replace("\n", " ").replace("\r", " ").replace("**", "∗∗")
+                line = (f"- [{_sf('type') or '?'}] **{t}**\n"
+                        f"    - symptom: {_sf('symptom')}\n"
+                        f"    - cause: {_sf('cause')}\n"
+                        f"    - action: {_sf('action')}\n"
+                        f"    - evidence: {_sf('evidence')}\n"
+                        f"    - boundary: {_sf('boundary')}\n"
                         f"    - 来源信号: backfill / session {sid}\n")
                 with open(out, "a", encoding="utf-8") as fh:
                     fh.write(line)
@@ -241,6 +247,10 @@ def main(argv: list[str] | None = None) -> int:
                 session_cands += 1
                 total_cands += 1
             print(f"    ✓ 簇 {c['signal_msg_id']} → {got} 条候选")
+            # OCR 复核 2026-10-03（high）：成功提取的簇也必须登记已处理——原实现
+            # 只在「空 ctx」「提取异常」两条分支 mark_processed，成功簇从未登记，
+            # 重跑时同一簇被反复提取、候选重复膨胀。
+            mark_processed(sid, c["signal_msg_id"])
     print(f"🏁 完成：{'dry-run 预览' if args.dry_run else '回扫写入'} {total_cands} 条候选 → {out}")
     return 0
 

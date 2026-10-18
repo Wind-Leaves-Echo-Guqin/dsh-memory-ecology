@@ -8,8 +8,16 @@
 const S = {
   view: 'dashboard',
   palette: localStorage.getItem('eco_palette') || 'a',
-  fontStep: +(localStorage.getItem('eco_font_step') || 1),   // 0/1/2/3 → 12/13/14/15
-  starred: JSON.parse(localStorage.getItem('eco_star') || '[]'),
+  fontStep: (() => {   // OCR 2026-10-03：裸 +(x) 对脏数据得 NaN → FONT_SIZES[NaN] undefined
+    const n = parseInt(localStorage.getItem('eco_font_step') || '1', 10);
+    return [0, 1, 2, 3].indexOf(n) >= 0 ? n : 1;   // 0/1/2/3 → 12/13/14/15
+  })(),
+  starred: (() => {    // OCR 2026-10-03（critical）：顶层 JSON.parse 无防护——localStorage
+    try {              // 里的 eco_star 一旦损坏，整个 SPA 启动即抛错（路由/错误 UI 全不跑）
+      const v = JSON.parse(localStorage.getItem('eco_star') || '[]');
+      return Array.isArray(v) ? v : [];
+    } catch (e) { return []; }
+  })(),
   searchMode: 'note',
   animLevel: localStorage.getItem('eco_anim_level') || 'full',   // low | medium | full
   pollInterval: +(localStorage.getItem('eco_poll_interval') || 30), // 秒；0=关
@@ -139,6 +147,9 @@ async function gotoExp(id) {
 async function openExpDrawer(id) {
   try {
     const it = (await EcoApi.get(`/api/experiences/detail?id=${encodeURIComponent(id)}`)).item;
+    // OCR 2026-10-03：item 判空对齐 openDetailDrawer——原样解引用会抛
+    // "reading 'title'" 并被 catch 误报成「读取失败」
+    if (!it) { toast('未找到该条目'); return; }
     const tc = { error: 'var(--exp-error)', pattern: 'var(--exp-pattern)', negative: 'var(--exp-negative)',
       success: 'var(--exp-success)', link: 'var(--exp-link)' };
     const zh = localStorage.getItem('exp_zh') !== '0';
@@ -479,7 +490,9 @@ async function pollOnce() {
     if (dot) { dot.classList.add('live'); setTimeout(() => dot.classList.remove('live'), 2600); }
     S.cache = {};                                            // 数据变了才失效缓存
     Bell.refresh();                                           // 后台也推送告警/通知
-    if (!uiBusy() && !Cruise.active) { loadStatus(); route(); }
+    // OCR 2026-10-03：Cruise 引用与其他处一致加 typeof 守卫（cruise.js 未加载时
+    // 原写法抛 ReferenceError 被 fail-open 吞掉，自动重渲染分支永久失效）
+    if (!uiBusy() && !(typeof Cruise !== 'undefined' && Cruise.active)) { loadStatus(); route(); }
     else loadStatus();
   } catch (e) { /* fail-open：轮询失败不影响使用 */ }
 }

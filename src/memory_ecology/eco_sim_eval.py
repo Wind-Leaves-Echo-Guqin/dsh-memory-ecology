@@ -36,6 +36,8 @@ BACKENDS = ["difflib", "ngram"]  # embedding 有依赖时自动追加
 
 
 def main() -> int:
+    from lib.cli_base import bootstrap as _bootstrap  # v2.5.0：编码兜底
+    _bootstrap()
     ap = argparse.ArgumentParser(description="相似度后端 golden set 评测")
     ap.add_argument("--backend", choices=BACKENDS + ["embedding", "all"], default="all")
     ap.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)

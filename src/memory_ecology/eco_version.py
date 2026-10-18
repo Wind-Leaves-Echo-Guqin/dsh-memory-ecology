@@ -25,6 +25,8 @@ EXEC_DB = HERMES / "cron" / "executions.db"
 
 
 def main() -> int:
+    from lib.cli_base import bootstrap as _bootstrap  # v2.5.0：编码兜底
+    _bootstrap()
     today = datetime.date.today().isoformat()
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
@@ -95,7 +97,8 @@ def main() -> int:
                 if sep is not None:
                     lines = lines[:sep + 2] + list(seen.values()) + lines[sep + 2:]
 
-    OUT.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    from lib.cli_base import ensure_parent  # v2.5.0：写前确保父目录
+    ensure_parent(OUT).write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"✅ VERSION.md 已更新: {line}")
     return 0
 

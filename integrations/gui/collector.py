@@ -14,6 +14,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -95,15 +96,18 @@ def parse_fm(text: str) -> tuple[dict, str]:
 
 # ── 缓存（短 TTL，配合巡检） ────────────────────────────────────────────
 _CACHE: dict = {}
+_CACHE_LOCK = threading.Lock()  # OCR 二审 2026-10-03：ThreadingHTTPServer 下防 check-then-set 交错
 
 
 def _cached(key: str, ttl: float, fn):
     now = time.time()
-    hit = _CACHE.get(key)
-    if hit and now - hit[0] < ttl:
-        return hit[1]
-    data = fn()
-    _CACHE[key] = (now, data)
+    with _CACHE_LOCK:
+        hit = _CACHE.get(key)
+        if hit and now - hit[0] < ttl:
+            return hit[1]
+    data = fn()  # IO 在锁外执行；并发首查可能重复计算一次，可接受
+    with _CACHE_LOCK:
+        _CACHE[key] = (now, data)
     return data
 
 
@@ -325,8 +329,12 @@ def scan_experiences() -> dict:
 def _ro_db(p: Path) -> sqlite3.Connection | None:
     if not p.is_file():
         return None
+    # URI 特殊字符转义（OCR 二审 2026-10-03：数据根含 ?/#/% 时路径被截断）
+    pos = p.as_posix()
+    for ch_from, ch_to in (("%", "%25"), ("?", "%3F"), ("#", "%23")):
+        pos = pos.replace(ch_from, ch_to)
     try:
-        return sqlite3.connect(f"file:{p.as_posix()}?mode=ro", uri=True, timeout=2)
+        return sqlite3.connect(f"file:{pos}?mode=ro", uri=True, timeout=2)
     except sqlite3.Error:
         return None
 
@@ -336,21 +344,32 @@ def eco_logs(limit: int = 200) -> dict:
     out: dict = {"rows": [], "counts": {}}
     if not con:
         return out
+
+    def _q(sql: str):
+        """表级容错：eco.db 可能仅含派生索引 mem_fts（O7 首次检索即建库，
+        四张日志表尚未由各门创建）——缺表按空处理，不炸 overview。
+        捕 DatabaseError（OperationalError 的父类）：损坏/非 SQLite 库同样降级。"""
+        try:
+            return con.execute(sql).fetchall()
+        except sqlite3.DatabaseError:
+            return []
+
     try:
         for t in ("gate_log", "quota_log", "distill_log", "review_log"):
-            out["counts"][t] = con.execute(f"select count(*) from {t}").fetchone()[0]
+            rows_t = _q(f"select count(*) from {t}")
+            out["counts"][t] = rows_t[0][0] if rows_t else 0
         rows = []
         rows += [("gate", ts, act, tgt or "", note or "") for ts, act, tgt, note in
-                 con.execute("select ts,action,target,note from gate_log")]
+                 _q("select ts,action,target,note from gate_log")]
         rows += [("quota", ts, act, slug or "", f"{(prev or '')} → {(reason or '')}".strip(" →"))
                  for ts, act, slug, prev, reason in
-                 con.execute("select ts,action,slug,l1_preview,reason from quota_log")]
+                 _q("select ts,action,slug,l1_preview,reason from quota_log")]
         rows += [("distill", ts, act, tgt or "", note or "") for ts, act, tgt, note in
-                 con.execute("select ts,action,target,note from distill_log")]
+                 _q("select ts,action,target,note from distill_log")]
         rows += [("review", ts, act, slug or "", reason or "") for ts, act, slug, reason in
-                 con.execute("select ts,action,slug,reason from review_log")]
-        rows.sort(key=lambda r: r[1], reverse=True)
-        out["rows"] = [{"table": t, "ts": ts, "action": act, "target": tgt, "note": note}
+                 _q("select ts,action,slug,reason from review_log")]
+        rows.sort(key=lambda r: str(r[1] or ""), reverse=True)  # ts NULL 防护（OCR 2026-10-03）
+        out["rows"] = [{"table": t, "ts": ts or "", "action": act, "target": tgt, "note": note}
                        for t, ts, act, tgt, note in rows[:limit]]
         latest = {}
         for t, ts, act, tgt, note in rows:
@@ -374,14 +393,18 @@ def cron_info() -> dict:
     if p.is_file():
         try:
             raw = json.loads(_read(p))
-            jobs_raw = raw if isinstance(raw, list) else raw.get("jobs", [])
+            jobs_raw = raw if isinstance(raw, list) else (
+                raw.get("jobs", []) if isinstance(raw, dict) else [])  # 非 dict/list 不炸（OCR 2026-10-03）
         except json.JSONDecodeError:
             jobs_raw = []
+        jobs_raw = [j for j in jobs_raw if isinstance(j, dict)]
         for j in jobs_raw:
             name = str(j.get("name", ""))
             jobs.append({"id": j.get("id", ""), "name": name,
                          "eco": any(k in name for k in _ECO_JOB_KW),
-                         "display": j.get("schedule_display") or (j.get("schedule") or {}).get("display", "?"),
+                         "display": j.get("schedule_display")
+                                    or ((j.get("schedule") or {}).get("display", "?")
+                                        if isinstance(j.get("schedule"), dict) else "?"),
                          "enabled": j.get("enabled", True),
                          "last_status": j.get("last_status"),
                          "last_run_at": (j.get("last_run_at") or "")[:16].replace("T", " "),
@@ -503,7 +526,11 @@ def scan_skills() -> dict:
 
 def skill_md(rel_path: str) -> dict | None:
     root = data_root() / "skills"
-    if ".." in rel_path or rel_path.startswith(("/", "\\")):
+    # OCR 二审 2026-10-03（high）：补 Windows 盘符/反斜杠——分类子目录的
+    # 正斜杠相对路径（如 research/llm-wiki）合法，保留
+    if (not rel_path or rel_path in (".", "..") or ".." in rel_path
+            or "\\" in rel_path or rel_path.startswith("/")
+            or re.match(r"^[A-Za-z]:", rel_path)):
         return None
     p = root / rel_path / "SKILL.md"
     if not p.is_file():
@@ -641,7 +668,14 @@ def scan_candidates() -> dict:
 
 
 def candidate_detail(kind: str, name: str) -> dict | None:
-    """v0.3.1：单个候选的全文详情（孵化台决策用）。"""
+    """v0.3.1：单个候选的全文详情（孵化台决策用）。
+
+    v2.3 安全加固（OCR 2026-10-03 critical）：name 来自 HTTP 查询参数——
+    只允许纯文件名/目录名成分，禁止路径分隔符、盘符、.. 等，堵任意文件读取。"""
+    if not name or name in (".", ".."):
+        return None
+    if any(ch in name for ch in '\\/:*?"<>|') or ".." in name:
+        return None
     root = data_root()
     paths = {
         "skill": [root / "skills" / ".candidates" / name / "SKILL.md",

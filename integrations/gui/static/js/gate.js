@@ -31,12 +31,15 @@ var Gate = {
   ask: function (action, spec, params, onConfirm) {
     var self = this;
     params = params || {};
-    // "不再提醒"已勾选 → 直接执行（轻/强一致语义：跳过弹窗）
-    if (self.isMuted(action)) { onConfirm(params); return; }
+    // OCR 2026-10-03（high security）：静音只对 light 生效——strong 必须始终走红字+勾选，
+    // 否则勾过一次「不再提醒」的高危写操作将永久无确认直达后端（数据完整性回退）
+    if (spec.risk !== 'strong' && self.isMuted(action)) { onConfirm(params); return; }
     self._pending = { action: action, params: params, onConfirm: onConfirm };
     var strong = (spec.risk === 'strong');
     var m = document.getElementById('gate-modal');
     var mask = document.getElementById('gate-mask');
+    // OCR 2026-10-03：DOM 缺失时安全降级并拦截动作——绝不绕过闸门直执行（红线）
+    if (!m || !mask) { if (window.toast) toast('确认闸门组件缺失，动作已拦截', false); return; }
     m.innerHTML =
       '<div class="gate-box' + (strong ? ' strong' : '') + '">' +
       '<h3>' + (strong ? '⛔ ' : '') + esc(spec.name || action) + '</h3>' +
@@ -66,16 +69,22 @@ var Gate = {
       if ($('#gate-mute').checked) {
         try { localStorage.setItem(self.muteKey(action), '1'); } catch (e) {}
       }
-      var fn = self._pending.onConfirm;
-      var p = self._pending.params;
+      // OCR 2026-10-03：_pending 取局部快照并判空——close() 会置 null、
+      // 二次 ask() 会覆盖共享状态，避免 TypeError / 执行到错误回调
+      var pending = self._pending;
+      if (!pending) { self.close(); return; }
+      var fn = pending.onConfirm;
+      var p = pending.params;
       self.close();
       if (fn) fn(p);
     };
   },
 
   close: function () {
-    document.getElementById('gate-modal').classList.add('hidden');
-    document.getElementById('gate-mask').classList.add('hidden');
+    var m = document.getElementById('gate-modal');
+    var mask = document.getElementById('gate-mask');
+    if (m) m.classList.add('hidden');
+    if (mask) mask.classList.add('hidden');
     this._pending = null;
   }
 };

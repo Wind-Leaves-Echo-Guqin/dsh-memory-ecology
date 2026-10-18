@@ -15,19 +15,26 @@ var Charts = {
     if (!rows.length) return '<div class="empty">暂无事件</div>';
     var gates = ['gate', 'quota', 'distill', 'review'];
     var min = rows[rows.length - 1].ts, max = rows[0].ts;   // rows 已按 ts 降序
-    var t0 = new Date(min).getTime() || 0, t1 = new Date(max).getTime() || t0 + 1;
+    var t0 = new Date(min).getTime(), t1 = new Date(max).getTime();
+    // OCR 2026-10-03（high）：非法时间戳原经 `|| 0` 掉到纪元 0，按天网格从 1970 年
+    // 循环画到当下（约 2 万个 SVG 节点）卡死页面——非法输入直接空渲染
+    if (!isFinite(t0) || !isFinite(t1)) return '<div class="empty">暂无事件（时间戳异常）</div>';
     if (t1 - t0 < 60000) t1 = t0 + 60000;
     var W = 1000, laneH = 46, padL = 96, padR = 16, top = 18;
     var H = top + gates.length * laneH + 26;
     var X = function (ts) { return padL + (new Date(ts).getTime() - t0) / (t1 - t0) * (W - padL - padR); };
     var svg = '<svg class="swim" viewBox="0 0 ' + W + ' ' + H + '" style="width:100%">';
-    // 网格（每天一条）
+    // 网格（每天一条）；OCR 2026-10-03：日期标签用本地时区格式化——原 toISOString()
+    // 在 UTC 以东时区（UTC+8 本地午夜对应前一日 UTC）会整体偏前一天
+    var locLabel = function (dt) {
+      return dt.getFullYear() + '-' + ('0' + (dt.getMonth() + 1)).slice(-2) + '-' + ('0' + dt.getDate()).slice(-2);
+    };
     var dayCursor = new Date(t0); dayCursor.setHours(0, 0, 0, 0);
     while (dayCursor.getTime() <= t1) {
       var gx = X(dayCursor.toISOString());
       if (gx >= padL) svg += '<line x1="' + gx + '" y1="' + top + '" x2="' + gx + '" y2="' + (H - 22) +
         '" stroke="var(--line)" stroke-dasharray="2 4"/>' +
-        '<text x="' + (gx + 3) + '" y="' + (H - 8) + '" font-size="9">' + dayCursor.toISOString().slice(5, 10) + '</text>';
+        '<text x="' + (gx + 3) + '" y="' + (H - 8) + '" font-size="9">' + locLabel(dayCursor) + '</text>';
       dayCursor.setDate(dayCursor.getDate() + 1);
     }
     gates.forEach(function (g, i) {
@@ -95,7 +102,8 @@ var Charts = {
       var s = days[d].gate + days[d].quota + days[d].distill + days[d].review;
       if (s > maxN) maxN = s;
     });
-    var bw = Math.min(34, (W - padL - 10) / order.length - 4);
+    // OCR 2026-10-03：条宽设下限 1——日期数 >~237 时原式为负，负 width 产出错乱 SVG
+    var bw = Math.max(1, Math.min(34, (W - padL - 10) / order.length - 4));
     var svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%">';
     svg += '<line x1="' + padL + '" y1="' + (H - padB) + '" x2="' + (W - 8) + '" y2="' + (H - padB) + '" stroke="var(--line)"/>';
     order.forEach(function (d, i) {

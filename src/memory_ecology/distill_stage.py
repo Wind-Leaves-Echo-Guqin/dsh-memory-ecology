@@ -27,7 +27,9 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from lib.config import hermes_root, cfg
+from lib.config import hermes_root
+from lib.cli_base import bootstrap as _bootstrap   # v2.5.0：统一编码兜底
+from lib.config import cfg
 from lib.fs import atomic_write, norm, slug_of
 from lib import llm as _llm
 from lib import similarity
@@ -221,6 +223,7 @@ def _stamp_distilled_at(d: dict, day: str) -> None:
 
 
 def main() -> int:
+    _bootstrap()   # v2.5.0：编码兜底先于一切
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--detail", type=Path, default=DETAIL_DIR)

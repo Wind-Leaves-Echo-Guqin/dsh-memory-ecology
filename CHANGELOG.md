@@ -1,5 +1,35 @@
 # Changelog
 
+## v2.5.0（2026-10-18）——入口纪律统一 · 并发写入修复 · 第一公里补齐
+
+> 驱动：三轮用户模拟测试（纯新手 / 英文老手 / 大库用户）+ 独立终审 + OCR 规则审查。
+> 主题不是加功能，是把散落在 26 个 CLI 里的公共纪律收敛为一个强制入口，并做成 CI 门禁。
+
+### 新增
+- `lib/cli_base.py`：`bootstrap()` / `resolve_root()` / `ensure_dirs()` / `ensure_parent()` /
+  `locked()` / `fail()`。零依赖，POSIX 上编码修复是 no-op。
+- `test_concurrent_writes.py`：C1 同门并发 / C2 跨门并发 / C3 stale 锁回收 /
+  C4 原子写可见性（13 万次并发读）/ C5 同进程锁重入。
+- `test_mutation.py`：6 个变异体验证上述测试的有效性。
+- `check_entry_discipline.py`：CI 门禁（D1 编码 / D2 数据根 / D3 建目录 / D4 锁成对）。
+
+### 修复
+| 现象 | 级 |
+|---|---|
+| `write_gate` 数据已落盘却 exit 1（崩在收尾 print 的 emoji） | Blocker |
+| 异常处理里的 print 自身崩，真错被编码错掩盖 | Blocker |
+| 门④ 自算数据根，无视 `MEMORY_ECOLOGY_ROOT` | Blocker |
+| 门② 锁文件不建父目录，自定义数据根必崩 | Blocker |
+| `gatekit` 锁把本进程持有当残留回收 → 同进程重入不互斥 | 并发 |
+| `atomic_write` 在 Windows 上遇读者占用失败 | 并发 |
+| pending 带 BOM 时第一条候选静默丢失 | 静默丢数 |
+| type 枚举报错不说合法值 | 可用性 |
+| `eco_health_check` 忽略 `--help`、无开关写 3 处、空库给健康分 | 可用性 |
+
+### 测试
+新增 5 并发用例 + 6 变异体；回归 150 个既有测试全绿；门禁 39 个脚本 0 违规。
+代码换行统一为 LF。
+
 ## v2.4.0（2026-10-07）——向量缓存（灰度）· OR 召回 + RRF 融合
 
 > 外部调研落地第二期。纪律不变：**新能力全部默认关闭**，观察期后另行决定默认化。

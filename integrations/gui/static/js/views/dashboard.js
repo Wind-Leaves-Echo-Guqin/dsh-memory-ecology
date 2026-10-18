@@ -10,13 +10,16 @@
 RENDER.dashboard = async function (v) {
   const d = await cached('overview', 8000, () => EcoApi.get('/api/overview'));
   const h = await cached('health-mini', 30000, () => EcoApi.get('/api/health'));
-  const c = d.counts;
+  // OCR 2026-10-03：overview 缺字段时逐项兜底（counts/watermark/cron/gates），
+  // 单项缺失不再中断整个驾驶舱渲染
+  const c = d.counts || {};
   const score = d.score ? d.score.score : null;
   const ringCls = score == null ? '' : score >= 80 ? 'ok' : score >= 60 ? 'warn' : 'bad';
   const ringColor = { ok: 'var(--ok)', warn: 'var(--warn)', bad: 'var(--bad)' }[ringCls] || 'var(--ink3)';
-  const over = d.watermark.chars > d.watermark.quota;
-  const pct = Math.min(100, d.watermark.chars / d.watermark.quota * 100);
-  const overW = Math.max(0, (d.watermark.chars - d.watermark.quota) / d.watermark.quota * 100);
+  const wm = d.watermark || { chars: 0, quota: 0 };
+  const over = wm.quota > 0 && wm.chars > wm.quota;
+  const pct = wm.quota ? Math.min(100, wm.chars / wm.quota * 100) : 0;  // quota 0/缺失防除零（原 NaN%）
+  const overW = Math.max(0, (wm.chars - wm.quota) / (wm.quota || 1) * 100);
   const gateMeta = {
     gate: ['门① 写入整合', 'var(--gate1)', 'gate_integrate'],
     quota: ['门② 巩固/配额', 'var(--gate2)', 'quota_extrude'],
@@ -27,11 +30,12 @@ RENDER.dashboard = async function (v) {
   const hist = d.history || [];
   const tsvg = trendSvg(hist);
   const p0 = extractP0((h.report || {}).body);
-  // cron 双口径（T2）+ 失败任务卡（v0.3.1 可操作修复）
-  const e7 = d.cron.executions_7d || {};
-  const snap = d.cron.jobs_snapshot || {};
-  const fails = d.cron.recent_fails || [];
-  const failDetails = d.cron.fail_details || [];
+  // cron 双口径（T2）+ 失败任务卡（v0.3.1 可操作修复）；OCR 2026-10-03：d.cron 整体兜底
+  const cron = d.cron || {};
+  const e7 = cron.executions_7d || {};
+  const snap = cron.jobs_snapshot || {};
+  const fails = cron.recent_fails || [];
+  const failDetails = cron.fail_details || [];
   const failFull = '近 7 天 cron 失败（口径 executions.db，截至 ' + (e7.ts || '').replace('T', ' ') + '）：\n' +
     failDetails.map(f => `【${f.job_name}】${f.finished_at}\n${f.error}`).join('\n\n') || '无失败';
   // 下次配额门倒计时（每小时 25 分）
@@ -41,13 +45,13 @@ RENDER.dashboard = async function (v) {
   const nCand = (ck.skill || 0) + (ck.profile || 0) + (ck.experience || 0);
 
   v.innerHTML = `
-    ${fails.length ? `<div class="card fail-card"><h3>cron 失败任务 <small>近 7 天 ${e7.n_fails || fails.length} 次（口径 executions.db · 截至 ${(e7.ts || '').slice(11, 16)}）——每条可直接修复</small></h3>
+    ${fails.length ? `<div class="card fail-card"><h3>cron 失败任务 <small>近 7 天 ${e7.n_fails || fails.length} 次（口径 executions.db · 截至 ${esc((e7.ts || '').slice(11, 16))}）——每条可直接修复</small></h3>
       ${failDetails.map((f, i) => {
         const drift = /drift_skip|config drifted/.test(f.error || '');
         const pinCmd = f.provider ? `hermes cron edit ${f.job} --provider ${f.provider} --model ${f.model || '<model>'}` : '';
         return `<div class="fail-item">
         <div class="fail-head"><span class="dot bad"></span><b>${esc(f.job_name)}</b>
-          <span class="faint">${esc(f.finished_at.replace('T', ' '))}</span>
+          <span class="faint">${esc((f.finished_at || '').replace('T', ' '))}</span>
           <span class="fail-ops">
             <a data-cron-rerun="${esc(f.job)}" data-rerun-name="${esc(f.job_name)}">重跑</a> ·
             <a data-cron-copy="hermes cron run ${esc(f.job)}">复制重跑命令</a>
@@ -60,7 +64,7 @@ RENDER.dashboard = async function (v) {
       }).join('')}
     </div>` : ''}
     ${over ? `<div class="alarm" style="border-color:var(--bad);background:rgba(208,83,83,.08);color:var(--bad)">
-      🔴 <b>L1 记忆已越线</b>：${d.watermark.chars} / 管理线 ${d.watermark.quota} 字符（超 ${d.watermark.chars - d.watermark.quota}）
+      🔴 <b>L1 记忆已越线</b>：${wm.chars} / 管理线 ${wm.quota} 字符（超 ${wm.chars - wm.quota}）
       · 下次配额门 <b>${nextQuotaMs}</b> 后自动运行（每小时 25 分）
       <button class="ghost-btn act-btn" data-act="quota_extrude" style="margin-left:10px;border-color:var(--bad);color:var(--bad)">立即挤出</button>
       <span class="red-note">会挤出沉淀到 L2 详情层（写前自动备份）</span></div>` : ''}
@@ -91,8 +95,8 @@ RENDER.dashboard = async function (v) {
         ${over ? `<div class="over" style="left:${100 - overW}%; width:${overW}%"></div><div class="ql" style="left:${100 - overW}%"></div>` : ''}
       </div>
       <div class="legend">
-        <span>L1 常驻记忆 <b class="num">${d.watermark.chars}</b> 字 / 管理线 ${d.watermark.quota}（去空白口径）</span>
-        <span class="${over ? 'alert' : 'faint'}" style="${over ? 'color:var(--bad);font-weight:600' : ''}">${over ? `已越线 +${d.watermark.chars - d.watermark.quota} · 红色段呼吸=真实状态` : '未越线'}</span>
+        <span>L1 常驻记忆 <b class="num">${wm.chars}</b> 字 / 管理线 ${wm.quota}（去空白口径）</span>
+        <span class="${over ? 'alert' : 'faint'}" style="${over ? 'color:var(--bad);font-weight:600' : ''}">${over ? `已越线 +${wm.chars - wm.quota} · 红色段呼吸=真实状态` : '未越线'}</span>
       </div>
     </div></div>
     ${nCand > 0 ? `<div class="card" style="border-color:var(--warn)"><h3>待处理候选 <small>${nCand} 项——出现即有对应门/孵化台可消费</small></h3>
@@ -113,9 +117,10 @@ RENDER.dashboard = async function (v) {
     <div class="card"><h3>四道门 <small>账本 = eco.db 机读记录 · 运行证据 = cron 计划最近执行</small></h3>
       <div class="row" style="align-items:stretch">
         ${Object.entries(gateMeta).map(([k, [nm, col, act]]) => {
-          const g = d.gates[k];
-          const cnt = d.gate_counts[k] || 0;
-          const job = (d.cron.eco_jobs || []).find(j =>
+          // OCR 2026-10-03：gates/gate_counts/cron.eco_jobs 缺字段兜底
+          const g = (d.gates || {})[k];
+          const cnt = (d.gate_counts || {})[k] || 0;
+          const job = (cron.eco_jobs || []).find(j =>
             (k === 'gate' && j.name.indexOf('写入') >= 0) || (k === 'quota' && j.name.indexOf('配额') >= 0) ||
             (k === 'distill' && j.name.indexOf('蒸馏') >= 0) || (k === 'review' && j.name.indexOf('复核') >= 0));
           const ev = job ? `<br><span class="faint">运行证据：cron ${esc(job.display)} · 最近 ${esc(job.last_run_at || '—')} · <span class="tag ${job.last_status === 'ok' ? 'ok' : 'bad'}">${esc(job.last_status || '—')}</span></span>`
@@ -137,8 +142,8 @@ RENDER.dashboard = async function (v) {
         <span>记忆占用 ${esc(d.health_row.mem)}</span></div>`
         : '<div class="empty">VERSION.md 无健康行</div>'}
       <div class="healthline" style="border:none;margin:10px 0 0;padding:0">
-        <span class="tag">瞬时口径（jobs.json）：${snap.ok || 0} ok / ${snap.err || 0} err · 采集 ${(snap.ts || '').slice(11, 16)}</span>
-        <span class="tag ${e7.n_fails ? 'warn' : 'ok'}">近 7 天口径（executions.db）：${e7.n_exec || 0} 次执行 · ${e7.n_fails || 0} 次失败 · 采集 ${(e7.ts || '').slice(11, 16)}</span>
+        <span class="tag">瞬时口径（jobs.json）：${snap.ok || 0} ok / ${snap.err || 0} err · 采集 ${esc((snap.ts || '').slice(11, 16))}</span>
+        <span class="tag ${e7.n_fails ? 'warn' : 'ok'}">近 7 天口径（executions.db）：${e7.n_exec || 0} 次执行 · ${e7.n_fails || 0} 次失败 · 采集 ${esc((e7.ts || '').slice(11, 16))}</span>
       </div>
       ${d.gene && d.gene.length ? `<div class="healthline" style="border:none;margin:10px 0 0;padding:0">
         <span class="faint">基因库近提交：</span>${d.gene.slice(0, 3).map(g => `<span class="faint mono">${esc(g)}</span>`).join('')}</div>` : ''}

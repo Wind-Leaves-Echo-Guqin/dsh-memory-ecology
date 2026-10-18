@@ -26,6 +26,7 @@ import sys
 from pathlib import Path
 
 from lib.config import hermes_root
+from lib.cli_base import bootstrap as _bootstrap   # v2.5.0：统一编码兜底
 from lib.fs import atomic_write, norm, slug_of
 from lib import safeio
 from lib import llm as _llm
@@ -46,7 +47,19 @@ SIM_NEAR = 0.80      # 近似重复（UPDATE/NOOP 候选）——difflib 口径�
 SIM_SUSPECT = 0.50   # 疑似冲突窗口下界——difflib 口径默认值
 # 注：实际取值经 similarity.gate_threshold() 按生效后端解析（换 embedding 时自动迁移，
 # 见 lib/similarity.py::GATE_THRESHOLDS）；上面两常量仅为文档化的 difflib 基准。
-MAX_BODY = 200       # detail 正文上限
+# v2 修复（论文 8.4 缺口一，2026-10-11）：合并区间 [near, noop) 的高相似非精确更新
+# 默认计数吸收（v1 行为）；置 1 后改为独立入库（ADD），新值保留在库，版本裁决交给检索与语义层。
+SPLIT_UPDATES = os.environ.get("MEMORY_ECOLOGY_GATE1_SPLIT_UPDATES", "") == "1"
+
+# L2 detail 正文上限。MEMORY_ECOLOGY_GATE_MAX_BODY 可覆盖（默认 200 行为不变）；
+# 论文 5.7 归因消融用：检验 200 字符截断对对话型语料的伤害（放宽上限是否修复 LME 失分）。
+# 上限只影响新写入的截断，不改相似度内核与既有条目。
+try:
+    MAX_BODY = int(os.environ.get("MEMORY_ECOLOGY_GATE_MAX_BODY", "") or "200")
+except ValueError:
+    MAX_BODY = 200
+if MAX_BODY < 1:
+    MAX_BODY = 200
 MAX_OUTPUT = 8       # 单次最多处理候选条数
 ACTIONS = ("ADD", "UPDATE", "NOOP", "CONFLICT")
 
@@ -238,6 +251,7 @@ def consumable_files(by_file: dict[str, list[dict]], terminal: set[str],
 
 
 def main(argv=None) -> int:
+    _bootstrap()   # v2.5.0：编码兜底先于一切
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--pending", type=Path, default=PENDING_DIR)
@@ -324,9 +338,12 @@ def _run(args) -> int:
             ctype = rule_type(text)
             if sims and sims[0]["ratio"] >= sim_near:
                 action = "UPDATE" if sims[0]["ratio"] < sim_noop else "NOOP"
+                if (SPLIT_UPDATES and action == "UPDATE"
+                        and norm(text) != norm(sims[0]["detail"]["body"])):
+                    action = "ADD"  # v2：非精确更新独立入库，不吸收新值
             else:
                 action = "ADD"
-            decision = {"type": ctype, "action": action, "target": sims[0]["detail"]["name"] if sims else "", "note": "规则兜底"}
+            decision = {"type": ctype, "action": action, "target": sims[0]["detail"]["name"] if sims else "", "note": "规则兜底" + ("（v2 拆分入库）" if action == "ADD" and sims else "")}
 
         action = decision.get("action", "ADD")
         if action not in ACTIONS:
@@ -334,6 +351,8 @@ def _run(args) -> int:
             ctype = rule_type(text)
             if sims and sims[0]["ratio"] >= sim_near:
                 action = "NOOP" if sims[0]["ratio"] >= sim_noop else "UPDATE"
+                if SPLIT_UPDATES and action == "UPDATE" and norm(text) != norm(sims[0]["detail"]["body"]):
+                    action = "ADD"  # v2：同主路径
             else:
                 action = "ADD"
             decision = {"type": ctype, "action": action,

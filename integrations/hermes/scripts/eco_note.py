@@ -21,16 +21,16 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import re
 import sys
-import urllib.request
-from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from eco_note_signals import scan_signals, parse_tool_content, parse_tool_calls, ECHO_MARK
 
 from lib.config import hermes_root
+from lib import llm as _llm  # P1 单源收编（2026-10-04）：传输/重试/sentinel/usage 统一走 lib/llm
 
 HERMES = hermes_root()
 DB = HERMES / "state.db"
@@ -39,15 +39,11 @@ PENDING_DIR = EXP_DIR / "pending"
 WATERMARK = EXP_DIR / ".watermark"
 USAGE_LOG = EXP_DIR / ".usage.jsonl"   # v1.1-7a：LLM usage 日账（每成功请求一行 JSON）
 
-MAX_SIGNALS = 32          # 单次最多处理信号簇（token 熔断；2026-10-05 由 8 上调：冻结期积压需清淤）
+MAX_SIGNALS = 8           # 单次最多处理信号簇（token 熔断，demo 保守）
 CTX_BEFORE = 6            # 信号前取多少条消息
 CTX_AFTER = 3             # 信号后取多少条消息
 CTX_MSG_CAP = 400         # 单条消息截断长度
-MAX_OUTPUT = 12           # 单次最多产出的候选条数（2026-10-05 由 6 上调：清淤期配合库级去重）
-DUP_THRESHOLD = 0.30      # 库级去重阈值（2026-10-05 移植自 live）：候选(trigger+action) 与
-                          # 既有条目(title+action) 的 bigram 余弦 ≥ 该值 → 同一课跳过。
-                          # 实测校准：换序重复对 0.39~0.77、不同课 ≤0.19；difflib 对
-                          # 换序只有 0.19~0.57 不可用，故内联 stdlib bigram 余弦（零依赖）。
+MAX_OUTPUT = 6            # 单次最多产出的候选条数
 
 PROMPT = """你是经验提取器。以下是 AI agent 最近一次会话中的片段（围绕报错/用户纠正/验证动作）。
 从中提取「以后还会遇到的 agent 做事经验」——已验证链路、已知坑、被证伪的尝试、通用做法。
@@ -126,159 +122,23 @@ def log_usage(resp: dict) -> None:
         print(f"⚠️ usage 记账失败（不影响提取）: {e}")
 
 
-def _norm(s: str) -> str:
-    """与 src/memory_ecology/lib/similarity.py 同口径：仅保留字母数字并转小写。"""
-    if not s:
-        return ""
-    return "".join(ch.lower() for ch in s if ch.isalnum())
-
-
-def _ngram(s: str, n: int = 2):
-    """字符 n-gram 计数（超短串退化为单字符）。stdlib Counter，零宿主依赖。"""
-    s = _norm(s)
-    if not s:
-        return Counter()
-    if len(s) < n:
-        return Counter(s)
-    return Counter(s[i:i + n] for i in range(len(s) - n + 1))
-
-
-def _cosine(c1, c2) -> float:
-    if not c1 or not c2:
-        return 0.0
-    common = set(c1) & set(c2)
-    num = sum(c1[t] * c2[t] for t in common)
-    den = (sum(v * v for v in c1.values()) ** 0.5) * (sum(v * v for v in c2.values()) ** 0.5)
-    return num / den if den else 0.0
-
-
-def load_existing_lessons() -> list[str]:
-    """库级去重语料（2026-10-05 移植自 live）：正式库每条的 title+action，加上
-    pending/ 全部候选行的 trigger（含已被 adopt 标记 accepted 的行）。
-
-    根因背景：水位线冻结重扫 + LLM 对同一课的换序改写，会让同一经验每日再产候选；
-    旧版 seen_global 只读当天 pending 文件，跨日/对库都拦不住。本语料在写出前做
-    最后一道去重。
-    """
-    texts: list[str] = []
-    for p in sorted(EXP_DIR.glob("exp-*.md")):
-        try:
-            t = p.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        m_title = re.search(r"^title:\s*(.+)$", t, re.M)
-        if not m_title:
-            continue
-        m_act = re.search(r"^action:\s*(.+)$", t, re.M)
-        texts.append(m_title.group(1).strip() + " " + (m_act.group(1).strip() if m_act else ""))
-    if PENDING_DIR.exists():
-        for p in sorted(PENDING_DIR.glob("*.md")):
-            try:
-                lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
-            except OSError:
-                continue
-            for line in lines:
-                m = re.match(r"^(?:<!--[^>]*-->)?\s*-\s*\[\w+\]\s*\*\*(.+?)\*\*", line)
-                if m:
-                    texts.append(m.group(1))
-    return texts
-
-
-def find_library_dup(trigger: str, action: str, corpus: list[str]) -> str | None:
-    """候选是否与既有课重复：返回最相似的既有文本（≥DUP_THRESHOLD）或 None。
-
-    口径：候选侧 trigger+action，库侧 title+action（pending 行只有 trigger），
-    bigram 余弦对 LLM 换序改写不敏感（实测换序重复 0.39~0.77、不同课 ≤0.19）。
-    """
-    if not corpus:
-        return None
-    q = _ngram(f"{trigger} {action or ''}")
-    best, best_s = None, 0.0
-    for t in corpus:
-        s = _cosine(q, _ngram(t))
-        if s > best_s:
-            best, best_s = t, s
-    return best if best_s >= DUP_THRESHOLD else None
-
-
 def llm_extract(fragments: list[str], max_tokens: int = 2000, retries: int = 2) -> list[dict]:
-    key = read_key()
-    body = json.dumps({
-        "model": "deepseek-v4-flash",
-        "messages": [
-            {"role": "system", "content": PROMPT},
-            {"role": "user", "content": "\n".join(f"- {f}" for f in fragments)},
-        ],
-        "max_tokens": max_tokens,
-        "temperature": 0.1,
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        "https://api.deepseek.com/v1/chat/completions",
-        data=body,
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=90) as r:
-        raw = r.read()
+    """P1 单源收编（2026-10-04）：传输/重试/sentinel/三级 JSON 提取/usage 记账
+    上收 lib/llm.complete_json（抗压实测语义逐项保留）。本函数保留经验线本地语义：
+    去重再截断（抗压场景 2）；MalformedResponseError/TruncatedResponseError 映射为
+    'malformed-response:'/'truncated-response:' 前缀——main 捕获后停批头、不推进水位线。"""
     try:
-        d = json.loads(raw)
-    except Exception:
-        # HTTP 200 但 body 非 JSON（抗压测试场景 3：<html>502</html>）→ 视为空返回
-        # 注意：返回 [] 会被 main 当成功空提取、水位线照常推进 → 信号无痕丢弃（dsh 评审）。
-        # 用 sentinel 信号让调用方停批头（不推进），v1.0 语义：异常响应≠无经验。
-        print(f"⚠️ llm_extract: HTTP 200 但 body 非 JSON（{raw[:60]!r}），抛 sentinel 停批头")
-        raise RuntimeError("malformed-response: body 非 JSON（疑似网关/代理异常响应）")
-    if not d.get("choices"):
-        print(f"⚠️ llm_extract: HTTP 200 但 choices 为空（{str(d)[:60]}），抛 sentinel 停批头")
-        raise RuntimeError("malformed-response: choices 为空")
-    log_usage(d)  # v1.1-7a：成功请求即记账（每轮含重试；无 usage 字段自动跳过）
-    msg = d["choices"][0].get("message") or {}
-    content = msg.get("content") or ""
-    if not isinstance(content, str):
-        # 恶意 envelope：content 为 dict/list（抗压测试场景 2）→ 返回 []（main 兜底）
-        print(f"⚠️ llm_extract: content 非字符串（{type(content)}），抛 sentinel 停批头")
-        raise RuntimeError("malformed-response: content 非字符串")
-    # finish_reason=length：reasoning 吃掉 max_tokens 后被截断（2026-09-02 实测：
-    # v4-flash 是 reasoning 模型，1200 常被 reasoning 挤满、content 为空/截断）
-    if d["choices"][0].get("finish_reason") == "length" and retries > 0:
-        print(f"  ↻ finish_reason=length（reasoning 截断），重试 max_tokens={max_tokens * 2}")
-        return llm_extract(fragments, max_tokens * 2, retries - 1)
-    def _extract_items(content: str) -> list | None:
-        """B3-①（2026-09-03 核验修复）：替换贪婪 `[.*]` 匹配为三级提取
-        （整体 JSON → 剥 ```json 围栏 → 平衡括号扫描），防跨数组吞并/截断。"""
-        def _try(cand: str) -> list | None:
-            try:
-                d = json.loads(cand)
-                return d if isinstance(d, list) else None
-            except Exception:
-                return None
-        r = _try(content)
-        if r is not None:
-            return r
-        m2 = re.search(r"```(?:json)?\s*(.*?)```", content, re.S)
-        r = _try(m2.group(1)) if m2 else None
-        if r is not None:
-            return r
-        cand = content
-        for start, ch in enumerate(cand):
-            if ch != "[":
-                continue
-            depth = 0
-            for pos in range(start, len(cand)):
-                if cand[pos] == "[":
-                    depth += 1
-                elif cand[pos] == "]":
-                    depth -= 1
-                    if depth == 0:
-                        r = _try(cand[start:pos + 1])
-                        if r is not None:
-                            return r
-                        break
-        return None
-
-    items = _extract_items(content)
-    if not items:
-        return []
+        key = os.environ.get("MEMORY_ECOLOGY_API_KEY") or read_key()
+        items = _llm.complete_json(
+            "\n".join(f"- {f}" for f in fragments),
+            system=PROMPT, max_tokens=max_tokens, temperature=0.1, retries=retries,
+            require=list, on_usage=log_usage, api_key=key)
+    except _llm.MalformedResponseError as e:
+        print(f"⚠️ llm_extract: {e}，抛 sentinel 停批头")
+        raise RuntimeError(f"malformed-response: {e}") from e
+    except _llm.TruncatedResponseError as e:
+        print(f"⚠️ llm_extract: {e}，抛 sentinel 停批头")
+        raise RuntimeError(f"truncated-response: {e}") from e
     # 先去重再截断（抗压测试场景 2：重复项集中在头部时唯一候选会被截丢）
     seen: set[str] = set()
     out: list[dict] = []
@@ -321,17 +181,21 @@ def collect_fragments(signals: list[dict]) -> list[dict]:
 
 
 def main() -> int:
+    from lib.cli_base import bootstrap as _bootstrap  # v2.5.0：编码兜底
+    _bootstrap()
     EXP_DIR.mkdir(parents=True, exist_ok=True)
     PENDING_DIR.mkdir(parents=True, exist_ok=True)
     wm = WATERMARK.read_text().strip() if WATERMARK.exists() else ""
     try:
-        watermark = float(wm) if wm else (datetime.datetime.now().timestamp() - 86400)
+        from lib import watermark as _wm
+        watermark = _wm.parse_watermark(wm) if wm else (
+            (datetime.datetime.now().timestamp() - 86400, -1))  # 旧标量兼容 → (ts, id)
     except ValueError:
         # 水位线文件损坏（2026-09-02 抗压测试发现：'abc' 裸崩溃）→ 回退默认窗口，
         # 并把损坏文件保留为 .watermark.bad-<ts> 备查，不静默覆盖
         print(f"⚠️ 水位线文件损坏（{wm[:40]!r}），回退默认窗口；损坏文件已备份")
         WATERMARK.replace(WATERMARK.with_name(f".watermark.bad-{int(datetime.datetime.now().timestamp())}"))
-        watermark = datetime.datetime.now().timestamp() - 86400
+        watermark = (datetime.datetime.now().timestamp() - 86400, -1)
 
     dry = "--dry-run" in sys.argv
     date = datetime.date.today().isoformat()
@@ -354,37 +218,40 @@ def main() -> int:
     batch_no = 0
     total_written = 0  # 跨批累计（2026-09-02 抗压测试发现：每批独立计数+break 会静默丢候选）
     batch_failed = False
-    # 库级去重语料（2026-10-05 移植）：正式库 + 全部 pending 候选，整轮载入一次。
-    # 背景：水位线冻结重扫 + LLM 换序改写让同一课每日再产候选（实测同两课连采 7 天）。
-    corpus = load_existing_lessons()
+    # OCR 2026-10-03: seen_cands 提到批循环外——原先每批从静态 seen_global 重建，
+    # 同轮内前批已写入的 trigger 不进后批去重集，同 trigger 会跨批重复追加
+    seen_cands: set[str] = set(seen_global)
     while True:
         batch_no += 1
         signals, _full_max_ts = scan_signals(watermark)
         if not signals:
             # 全窗扫描完毕
-            print(f"ℹ️ 窗口处理完毕（共 {batch_no - 1} 批；水位线 {datetime.datetime.fromtimestamp(watermark).isoformat()}）")
+            print(f"ℹ️ 窗口处理完毕（共 {batch_no - 1} 批；水位线 {datetime.datetime.fromtimestamp(watermark[0]).isoformat()}）")
             break
         if total_written >= MAX_OUTPUT:
             # 总候选已达单次上限：停止处理剩余信号（不浪费 LLM 调用），
             # 剩余信号留在水位线之后，下次 cron 续扫（不丢）
-            print(f"ℹ️ 单次候选已达上限 {MAX_OUTPUT}，剩余 {len(signals)} 个信号留给下次续扫（水位线 {datetime.datetime.fromtimestamp(watermark).isoformat()}）")
+            print(f"ℹ️ 单次候选已达上限 {MAX_OUTPUT}，剩余 {len(signals)} 个信号留给下次续扫（水位线 {datetime.datetime.fromtimestamp(watermark[0]).isoformat()}）")
             break
         # 信号也分批：本批只取最早 MAX_SIGNALS 个（按时间序），水位线推进到本批末尾，
         # 剩余信号下一批继续处理（不丢信号，保持 token 熔断）。
         batch_signals = signals[:MAX_SIGNALS]
         batch_max_ts = max(s["ts"] for s in batch_signals)
-        if batch_max_ts <= watermark:
+        # P1（2026-10-04）：水位线改 (ts, id) 复合键——同 timestamp 批边界不再跳窗
+        batch_wm = (batch_max_ts, int(batch_signals[-1]["msg_id"]))
+        if batch_max_ts < watermark[0] or (
+                batch_max_ts == watermark[0] and batch_wm[1] <= watermark[1]):
             # 防御：水位线不前进 = 永活循环（2026-09-02 实测）。生产上 scan_signals
-            # 用 timestamp > watermark 过滤，信号 ts 恒 > watermark；此分支只在
+            # 用复合键过滤，信号恒 > watermark；此分支只在
             # 数据污染（时间戳 1970/回拨）时触发——报警退出，人工介入，绝不全速空转。
             raise RuntimeError(
-                f"信号时间戳异常: batch_max_ts={batch_max_ts} <= watermark={watermark}；"
+                f"信号时间戳异常: batch_wm={batch_wm} <= watermark={watermark}；"
                 "疑似时间戳污染（1970/回拨），需人工检查 state.db 消息时间戳"
             )
         print(f"📡 第 {batch_no} 批：信号 {len(batch_signals)}/{len(signals)} 个（窗口 → {datetime.datetime.fromtimestamp(batch_max_ts).isoformat()}）…")
         frags = collect_fragments(batch_signals)
         if not frags:
-            watermark = batch_max_ts
+            watermark = batch_wm
             continue
 
         if dry:
@@ -397,12 +264,13 @@ def main() -> int:
 
         batch_failed = False
         total_in_batch = 0
-        header = f"# 经验候选 {date}（eco_note demo）\n\n" if not out_exists and batch_no == 1 else ""
-        seen_cands: set[str] = set(seen_global)  # 继承跨轮种子（防重追加）
-        for f in frags:
+        # OCR 2026-10-03: 只以文件是否已存在为准——第 1 批若空转（无片段）会在下批补写，
+        # 原先的 batch_no == 1 约束会让文件缺标题头
+        header = f"# 经验候选 {date}（eco_note demo）\n\n" if not out_exists else ""
+        for _fi, f in enumerate(frags):
             if total_written >= MAX_OUTPUT:
                 # 本批内也不继续调 LLM（防浪费）；剩余信号水位线已推，下次续扫
-                print(f"  ↔ 本批候选已达上限 {MAX_OUTPUT}，停止提取本批剩余 {len(frags) - frags.index(f)} 簇（下次续扫）")
+                print(f"  ↔ 本批候选已达上限 {MAX_OUTPUT}，停止提取本批剩余 {len(frags) - _fi} 簇（下次续扫）")
                 break
             try:
                 items = llm_extract(f["ctx"])
@@ -422,23 +290,25 @@ def main() -> int:
                 if t in seen_cands:
                     continue
                 seen_cands.add(t)
-                # 库级去重（2026-10-05 移植自 live）：与既有课换序等价 → 不写出，不占候选额度
-                act = str(it.get('action') or '').replace("\n", " ").replace("\r", " ")
-                dup = find_library_dup(t, act, corpus)
-                if dup is not None:
-                    print(f"  ↷ 跳过库级重复候选: {t[:40]}（≈ {dup[:36]}…）")
-                    continue
+                if total_written >= MAX_OUTPUT:
+                    # OCR 2026-10-03: 达上限即停（不落盘也不计数）——原先先自增再判断，
+                    # 超限那条没写文件却被计入 total_written，统计虚高
+                    break
                 total_in_batch += 1
                 total_written += 1
-                if total_written > MAX_OUTPUT:
-                    # 超上限即停写（防超出），已累积的照常落盘
-                    break
-                line = (f"- [{it.get('type','?')}] **{t[:60]}**\n"
-                        f"    - symptom: {it.get('symptom','')}\n"
-                        f"    - cause: {it.get('cause','')}\n"
-                        f"    - action: {it.get('action','')}\n"
-                        f"    - evidence: {it.get('evidence','')}\n"
-                        f"    - boundary: {it.get('boundary','')}\n"
+
+                def _sf(key: str, it=it) -> str:
+                    # OCR 2026-10-03: 全字段消毒——symptom 等字段含「换行+伪条目行」
+                    # 可注入伪造顶层候选（原先只消毒 trigger）
+                    v = it.get(key, "")
+                    return (str(v) if v is not None else "").replace("\n", " ").replace("\r", " ").replace("**", "∗∗")
+
+                line = (f"- [{_sf('type') or '?'}] **{t[:60]}**\n"
+                        f"    - symptom: {_sf('symptom')}\n"
+                        f"    - cause: {_sf('cause')}\n"
+                        f"    - action: {_sf('action')}\n"
+                        f"    - evidence: {_sf('evidence')}\n"
+                        f"    - boundary: {_sf('boundary')}\n"
                         f"    - 来源信号: {f['signal']['type']} / session {f['signal']['session_id']}\n")
                 with open(out, "a", encoding="utf-8") as fh:
                     if header:
@@ -450,10 +320,10 @@ def main() -> int:
             # batch_failed：LLM 异常 → 水位线停在批头，下轮重扫
             # total_written 达上限：本批可能还有簇未处理 → 同样停在批头，
             # 下轮从批头重扫（重复提取已处理簇，但绝不丢信号；单次上限是保护性截断）
-            print(f"⚠️ 本批结束状态: batch_failed={batch_failed} | 累计候选={total_written}；水位线停在 {datetime.datetime.fromtimestamp(watermark).isoformat()}，下轮续扫")
+            print(f"⚠️ 本批结束状态: batch_failed={batch_failed} | 累计候选={total_written}；水位线停在 {datetime.datetime.fromtimestamp(watermark[0]).isoformat()}，下轮续扫")
             break
         print(f"  ✅ 第 {batch_no} 批：写入 {total_in_batch} 条候选；水位线 → {datetime.datetime.fromtimestamp(batch_max_ts).isoformat()}")
-        watermark = batch_max_ts
+        watermark = batch_wm
 
     if dry:
         print("ℹ️ dry-run：未调 LLM、未写文件。水位线不推进。")
@@ -463,8 +333,9 @@ def main() -> int:
         # 否则 cron/监控把空跑误判为成功（静默停摆）
         print(f"❌ 本批 LLM 失败（batch_failed=True），返回非 0 退出码（水位线已停）")
         return 1
-    WATERMARK.write_text(str(watermark))
-    print(f"水位线落盘: {datetime.datetime.fromtimestamp(watermark).isoformat()}")
+    from lib import watermark as _wm
+    WATERMARK.write_text(_wm.format_watermark(watermark))
+    print(f"水位线落盘: {datetime.datetime.fromtimestamp(watermark[0]).isoformat()}")
     return 0
 
 

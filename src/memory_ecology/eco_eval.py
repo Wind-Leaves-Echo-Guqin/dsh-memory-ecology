@@ -87,6 +87,8 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
 
 
 def main() -> int:
+    from lib.cli_base import bootstrap as _bootstrap  # v2.5.0：编码兜底
+    _bootstrap()
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--detail", type=Path, default=DETAIL_DIR)

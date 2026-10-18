@@ -29,7 +29,25 @@ try:
 except Exception:
     pass
 
-import yaml
+try:
+    import yaml  # PyYAML：本机 miniconda 有；Hermes 托管 venv 按 pyproject.toml 显式排除 pyyaml
+except ModuleNotFoundError:  # 回退到 venv 已声明的 ruamel.yaml（safe 加载语义等价，168 份 SKILL.md 实测一致）
+    import io as _io
+
+    from ruamel.yaml import YAML as _YAML
+
+    _ruamel_safe = _YAML(typ="safe")
+
+    class _CompatYAML:
+        """仅暴露本脚本用到的 safe_load，签名与返回类型和 PyYAML 对齐。"""
+
+        @staticmethod
+        def safe_load(stream):
+            if hasattr(stream, "read"):
+                return _ruamel_safe.load(stream)
+            return _ruamel_safe.load(_io.StringIO(stream))
+
+    yaml = _CompatYAML()
 
 from lib.config import hermes_root
 
@@ -447,7 +465,7 @@ def fmt_size(n):
     return f"{n}B"
 
 
-def build_report():
+def build_report(write_history: bool = True):
     now = datetime.datetime.now().astimezone()
     L = []
     L.append("# 生态体检报告（正式版 v1.1 · 只读）")
@@ -506,9 +524,12 @@ def build_report():
             break
     if prev_score:
         try:
-            delta = int(score) - int(prev_score["score"])
+            _pv = prev_score.get("score")
+            if _pv is None:
+                raise ValueError("prev score missing")
+            delta = int(score) - int(_pv)
             L.append(f"- 上次评分: {prev_score.get('score')}（{prev_score.get('time', '?')}）→ 本次 {score}（Δ{delta:+d}）")
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, KeyError):
             # P2：历史评分损坏/非整数 → 跳过对比，报告照常产出
             L.append(f"- 上次评分: {prev_score.get('score')}（{prev_score.get('time', '?')}）→ 本次 {score}（历史评分格式异常，跳过对比）")
     else:
@@ -766,16 +787,49 @@ def build_report():
             else:
                 deduped[("__raw__", len(deduped))] = h
         history = list(deduped.values())[-20:]
-        SCORE_HISTORY.write_text(json.dumps(history, ensure_ascii=False), encoding="utf-8")
-    except OSError:
-        pass
+        # v2.5.0：--no-write 时不得写盘，否则 help 文案就是假的
+        if write_history:
+            SCORE_HISTORY.write_text(json.dumps(history, ensure_ascii=False), encoding="utf-8")
+    except OSError as _e:
+        print(f"⚠️ 评分历史写入失败: {_e}", file=sys.stderr)
     return "\n".join(L)
 
 
 if __name__ == "__main__":
-    report = build_report()
-    out1 = DESKTOP / "生态体检报告-v1.1.md"
-    out2 = DESIGNS_DIR / "生态体检报告-v1.1.md"
+    # v2.5.0：加 --no-write（用户模拟测试反馈：体检命令不问就写 3 处，
+    # 且 `--help` 被忽略直接执行并写盘，对只想看报告的人是意外副作用）。
+    # 另外：空库不再给"95/100 健康"——空库无法评估健康度，给分数会误导。
+    #
+    # ★ 不提供 --root：本模块在 import 期就把 HERMES_HOME 等路径算成常量，
+    #   而 lib/config 也在 import 时读走了 MEMORY_ECOLOGY_ROOT —— 运行期再设环境变量
+    #   是空操作。要换根请用环境变量重启进程。
+    import argparse as _ap
+    _p = _ap.ArgumentParser(
+        description="生态体检（只读）。默认把报告写到 ~/Desktop 与 ~/.memory-ecology/designs。")
+    _p.add_argument("--no-write", action="store_true",
+                    help="只输出到 stdout，不写任何文件（推荐脚本/CI 使用）")
+    _args, _ = _p.parse_known_args()
+
+    # 空库守卫必须在 build_report() 之前：
+    #   ① build_report 里有副作用（写评分历史），放后面会让 --no-write 也写盘
+    #   ② 空库时没必要跑全盘扫描（技能/备份普查/引用图）几十秒
+    _detail_dir = MEMORIES_DIR / "detail"
+    if not _detail_dir.is_dir():
+        print(f"找不到记忆目录: {_detail_dir}", file=sys.stderr)
+        print("请确认数据根正确（设 MEMORY_ECOLOGY_ROOT 后重新运行）。", file=sys.stderr)
+        sys.exit(1)
+    if len(list(_detail_dir.glob("*.md"))) == 0:
+        print("库为空（memories/detail 下 0 条），无法评估健康度。")
+        print("先存入记忆再跑体检；或加 --no-write 只看当前状态。")
+        sys.exit(0)
+
+    report = build_report(write_history=not _args.no_write)
+
+    if _args.no_write:
+        print(report)
+        sys.exit(0)
+
+
     try:
         out1.write_text(report, encoding="utf-8")
         out2.write_text(report, encoding="utf-8")

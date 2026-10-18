@@ -18,7 +18,7 @@ from pathlib import Path
 
 HERE = Path(__file__).parent
 COMPAT_GOLDEN = HERE / "golden" / "similarity_golden.json"
-DEV_GOLDEN = Path.home() / "memory-ecology-dev" / "scripts" / "golden" / "similarity_golden.json"
+DEV_GOLDEN = Path.home() / "memory-ecology-compat" / "scripts" / "golden" / "similarity_golden.json"
 
 # 人工标注：_candidates.json 的 pairs 下标 -> label（2026-10-04 逐对人工判读 + 二轮复核）
 # 判读口径：same=同一事实（措辞/粒度差异不改变事实，合并无损）；similar=同项目/同主题但
@@ -78,6 +78,8 @@ def load_corpus():
 
 
 def main() -> int:
+    from lib.cli_base import bootstrap as _bootstrap  # v2.5.0：编码兜底
+    _bootstrap()
     cands = json.loads((HERE / "golden" / "_candidates.json").read_text(encoding="utf-8"))["pairs"]
     pairs = []
 

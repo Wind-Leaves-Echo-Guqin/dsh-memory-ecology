@@ -8,13 +8,33 @@
 /* RENDER 注册表必须先于 views/*.js 存在（视图脚本向它挂载渲染函数） */
 var RENDER = {};
 
-/* CSS.escape —— focusSkill / 选择器拼接依赖（缺失时星图定位抛错级联失效） */
+/* CSS.escape —— focusSkill / 选择器拼接依赖（缺失时星图定位抛错级联失效）。
+   OCR 2026-10-03：对齐规范——补首字符为数字 / 「-」后跟数字 / 单独「-」的转义，
+   原实现 `CSS.escape("1col")` 原样返回，拼出的 `#1col` 在旧内核仍是非法选择器。 */
 if (typeof CSS !== 'object') { window.CSS = {}; }
 if (typeof CSS.escape !== 'function') {
   CSS.escape = function (s) {
-    return String(s).replace(/[^a-zA-Z0-9_\u00A0-\uFFFF-]/g, function (c) {
-      return '\\' + c;
-    });
+    var str = String(s);
+    var first = str.charCodeAt(0);
+    var out = '';
+    for (var i = 0; i < str.length; i++) {
+      var c = str.charCodeAt(i);
+      if (c === 0) { out += '\uFFFD'; continue; }
+      if ((c >= 0x01 && c <= 0x1F) || c === 0x7F ||
+          (i === 0 && c >= 0x30 && c <= 0x39) ||
+          (i === 1 && c >= 0x30 && c <= 0x39 && first === 0x2D)) {
+        out += '\\' + c.toString(16) + ' ';
+        continue;
+      }
+      if (i === 0 && str.length === 1 && c === 0x2D) { out += '\\-'; continue; }
+      if (c >= 0x80 || c === 0x2D || c === 0x5F ||
+          (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A)) {
+        out += str.charAt(i);
+      } else {
+        out += '\\' + str.charAt(i);
+      }
+    }
+    return out;
   };
 }
 
@@ -75,15 +95,30 @@ if (!String.prototype.startsWith) {
   String.prototype.startsWith = function (s, i) { return this.indexOf(s, i || 0) === 0; };
 }
 if (!String.prototype.endsWith) {
+  // OCR 2026-10-03：对齐规范——原实现只看"出现于 l-s.length 之后"，未校验恰好结束于 l，
+  // `"hello".endsWith("llo", 4)` 会误返回 true；且负起点未防护
   String.prototype.endsWith = function (s, l) {
+    s = String(s);
     if (l === undefined || l > this.length) l = this.length;
-    return this.indexOf(s, l - s.length) !== -1;
+    else if (l < 0) l = 0;
+    var start = l - s.length;
+    return start >= 0 && this.substring(start, l) === s;
   };
 }
 
 /* Array.prototype.includes */
 if (!Array.prototype.includes) {
-  Array.prototype.includes = function (x) { return this.indexOf(x) !== -1; };
+  // OCR 2026-10-03：对齐 SameValueZero 语义——原复用 indexOf 丢 NaN 匹配、忽略 fromIndex
+  Array.prototype.includes = function (x, fromIndex) {
+    var len = this.length >>> 0;
+    var i = fromIndex | 0;
+    if (i < 0) i = Math.max(len + i, 0);
+    for (; i < len; i++) {
+      var v = this[i];
+      if (v === x || (typeof v === 'number' && typeof x === 'number' && isNaN(v) && isNaN(x))) return true;
+    }
+    return false;
+  };
 }
 
 /* Object.entries / Object.values（图表与视图遍历常用） */
@@ -109,14 +144,27 @@ function ecoKernelCheck() {
     if (old || !bd) {
       var bar = document.createElement('div');
       bar.className = 'kernel-bar';
-      bar.innerHTML = '⚠ 当前窗口内核较旧（' + (old ? '缺基础 API' : '无 backdrop-filter') +
-        '），部分视觉效果受限。建议复制地址用系统浏览器打开：<a href="#" id="kernel-copy-url">' + location.href + '</a>';
-      document.body.insertBefore(bar, document.body.firstChild);
-      var a = document.getElementById('kernel-copy-url');
-      if (a) a.onclick = function () {
+      // OCR 2026-10-03（security）：location.href 原直接拼进 innerHTML——URL 携带 < 等
+      // 字符（查询参数反射）会被当 HTML 解析构成 XSS；改用文本节点插入
+      bar.textContent = '⚠ 当前窗口内核较旧（' + (old ? '缺基础 API' : '无 backdrop-filter') +
+        '），部分视觉效果受限。建议复制地址用系统浏览器打开：';
+      var link = document.createElement('a');
+      link.href = '#';
+      link.id = 'kernel-copy-url';
+      link.textContent = location.href;
+      link.onclick = function () {
         if (window.ecoCopy) window.ecoCopy(location.href);
         return false;
       };
+      bar.appendChild(link);
+      // OCR 2026-10-03：body 未就绪时不再直接访问 firstChild（抛错被吞、提示条永不出现）
+      if (document.body) {
+        document.body.insertBefore(bar, document.body.firstChild);
+      } else {
+        document.addEventListener('DOMContentLoaded', function () {
+          document.body.insertBefore(bar, document.body.firstChild);
+        });
+      }
     }
   } catch (e) { /* 检测失败不阻塞 */ }
 }

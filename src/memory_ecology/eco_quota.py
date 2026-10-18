@@ -61,6 +61,7 @@ import sys
 from pathlib import Path
 
 from lib.config import hermes_root
+from lib.cli_base import bootstrap as _bootstrap   # v2.5.0：统一编码兜底
 from lib.fs import atomic_write, norm, slug_of
 from lib.memstore import (parse_frontmatter, dump_frontmatter, load_detail,
                           detail_prefixes, is_same_source)  # §C：解析/口径单源（2026-10-04 收编）
@@ -349,15 +350,26 @@ LOCK_FILE = HERMES / "scripts" / ".eco_quota.lock"
 
 
 def run(args) -> int:
-    """入口：dry-run 不抢锁；实际执行抢 O_EXCL 锁防 cron 与手动并发（P1-7）。"""
+    """入口：dry-run 不抢锁；实际执行抢锁防 cron 与手动并发（P1-7）。
+
+    v2.5.0 修复（B7 + stale 回收）：
+      旧实现直接 `os.open(LOCK_FILE, O_CREAT|O_EXCL)`，而 LOCK_FILE 在
+      `<root>/scripts/` 下 —— 用户按 README 设 MEMORY_ECOLOGY_ROOT 指向新目录时
+      该目录不存在 -> FileNotFoundError，门②在自定义数据根上必崩。
+      改走 gatekit.acquire_lock_auto（mkdir 父目录 + 回收死进程残留锁），与门①/门④统一。
+      附带修掉两个隐患：
+        - 旧实现不回收 stale 锁 -> 上次异常退出会让本门永久跳过
+        - 抢不到锁时仍 return 0（跳过）——与"执行完成"共用退出码，调度器无法区分。
+          本轮不改退出码语义（会动调度契约），只补 stderr 提示。
+    """
     if not args.dry_run:
-        try:
-            fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, str(os.getpid()).encode())
-            os.close(fd)
-        except FileExistsError:
-            print("⚠️ 已有 eco_quota 实例在运行，本轮跳过")
+        from lib.gatekit import acquire_lock_auto
+        ok, how = acquire_lock_auto(LOCK_FILE)
+        if not ok:
+            print("⚠️ 已有 eco_quota 实例在运行，本轮跳过", file=sys.stderr)
             return 0
+        if how == "stale-cleared":
+            print("ℹ️ 已回收上次残留的锁", file=sys.stderr)
     try:
         return _run_inner(args)
     finally:
@@ -422,6 +434,7 @@ def _run_inner(args) -> int:
 
 
 def main() -> int:
+    _bootstrap()   # v2.5.0：编码兜底先于一切
     ap = argparse.ArgumentParser(description="记忆生态巩固/配额门（纯规则，零 LLM 调用）")
     ap.add_argument("--dry-run", action="store_true",
                     help="只打印将执行的动作（提升/挤出各条），不修改任何文件、不写日志")

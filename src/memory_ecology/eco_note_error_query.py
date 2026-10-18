@@ -41,30 +41,41 @@ STOPWORDS = {
 }
 
 
+def _pos_int(v: str) -> int:
+    """OCR 2026-10-03: --top 正整数校验——负数会让 rank() 的切片语义反转、0 恒空结果。"""
+    n = int(v)
+    if n <= 0:
+        raise argparse.ArgumentTypeError("--top 必须为正整数")
+    return n
+
+
 def extract_keywords(text: str, limit: int = 20) -> list[str]:
     """规则关键词提取：英文 token 过滤停用词；保留文件名/模块样式 token。"""
     toks = re.findall(r"[A-Za-z_][A-Za-z0-9_.]{2,}", text)
     out: list[str] = []
     seen: set[str] = set()
     for t in toks:
-        low = t.lower()
-        if low in STOPWORDS:
+        # OCR 2026-10-03: 剥掉句尾句点——"failed." 这类词带点后进不了停用词表，
+        # 反而污染检索；文件名后缀（.py 等）不以点结尾，不受影响
+        stripped = t.rstrip(".")
+        low = stripped.lower()
+        if not stripped or low in STOPWORDS:
             continue
         # 纯数字 token 跳过
-        if re.fullmatch(r"[\d_]+", t):
+        if re.fullmatch(r"[\d_]+", stripped):
             continue
         # 短 token 仅在带文件后缀/大写/下划线时保留
         if (
-            len(t) < 4
-            and not re.search(r"\.(py|sh|exe|md|json|yaml|yml|txt|nc|log)$", t)
-            and not re.search(r"[A-Z]", t)
-            and "_" not in t
+            len(stripped) < 4
+            and not re.search(r"\.(py|sh|exe|md|json|yaml|yml|txt|nc|log)$", stripped)
+            and not re.search(r"[A-Z]", stripped)
+            and "_" not in stripped
         ):
             continue
-        if t in seen:
+        if stripped in seen:
             continue
-        seen.add(t)
-        out.append(t)
+        seen.add(stripped)
+        out.append(stripped)
         if len(out) >= limit:
             break
     return out
@@ -152,7 +163,7 @@ def build_json(text: str, top: int) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description="报错文本 → 经验检索（只读）")
     ap.add_argument("text", help="报错/异常文本")
-    ap.add_argument("--top", type=int, default=3)
+    ap.add_argument("--top", type=_pos_int, default=3)
     ap.add_argument("--full", action="store_true")
     ap.add_argument("--format", choices=["text", "json"], default="text")
     args = ap.parse_args()
