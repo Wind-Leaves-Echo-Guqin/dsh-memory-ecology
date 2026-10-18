@@ -76,8 +76,11 @@ def env_key(name: str) -> str:
     env = hermes_root() / ".env"
     if not env.is_file():
         raise RuntimeError(
-            f"配置错误：{env} 不存在（无法读取 {name}）。"
-            f"可创建该文件（{name}=<key>）或改用环境变量 MEMORY_ECOLOGY_API_KEY")
+            f"配置错误：{env} 不存在（无法读取 {name}）。三种解法："
+            f"①创建该文件（{name}=<key>）；"
+            f"②设环境变量 MEMORY_ECOLOGY_API_KEY；"
+            f"③若接第三方 OpenAI 兼容网关，还需同时设 "
+            f"MEMORY_ECOLOGY_API_BASE / MEMORY_ECOLOGY_API_MODEL（v2.5.0 起支持）")
     for line in env.read_text(encoding="utf-8", errors="replace").splitlines():
         if line.startswith(name + "="):
             val = line.split("=", 1)[1].strip().strip('"').strip("'")

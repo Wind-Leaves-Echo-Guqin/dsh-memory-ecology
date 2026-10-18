@@ -1,8 +1,19 @@
 """LLM 调用公共函数（memory-ecology lib）。
 
 complete() 纯函数：默认走 deepseek API，client 可注入（测试用 fake）。
+
 密钥解析顺序（Q32 修复 2026-09-06，与文档口径对齐）：
   显式 api_key 参数 → 环境变量 MEMORY_ECOLOGY_API_KEY → 数据根 .env 的 DEEPSEEK_API_KEY
+
+★ v2.5.0 修复（用户模拟测试发现）：**端点与模型此前硬编码，只 key 可配**。
+  后果：想接 OpenAI 兼容的第三方网关（如 open-design / 自建代理）时，
+  key 能改但 URL 和 model 改不了 → 请求仍发去 api.deepseek.com → 401。
+  且报错只说"缺 API key"，把人引向错误方向。
+  现改为运行期解析（显式参数 > 环境变量 > 默认值），并支持：
+    MEMORY_ECOLOGY_API_BASE  —— 完整 chat/completions URL
+    MEMORY_ECOLOGY_API_MODEL —— 模型名
+  保持向后兼容：不设这两个变量时行为与旧版完全一致。
+
 不做类层次——13 脚本中真调 LLM 的仅 3-5 个，不值得客户端框架。周熔断逻辑留各脚本（成本护栏属业务配置）。
 """
 import json
@@ -17,12 +28,33 @@ DEFAULT_BASE_URL = "https://api.deepseek.com/v1/chat/completions"
 DEFAULT_TIMEOUT = 90
 
 
-def complete(prompt: str, *, client=None, model: str = DEFAULT_MODEL,
-             base_url: str = DEFAULT_BASE_URL, api_key: str | None = None,
+def resolve_base_url(explicit: str | None = None) -> str:
+    """端点解析：显式参数 > MEMORY_ECOLOGY_API_BASE > 默认 DeepSeek 官方。"""
+    return (explicit
+            or os.environ.get("MEMORY_ECOLOGY_API_BASE")
+            or config.cfg("llm", "base_url", None)
+            or DEFAULT_BASE_URL)
+
+
+def resolve_model(explicit: str | None = None) -> str:
+    """模型解析：显式参数 > MEMORY_ECOLOGY_API_MODEL > 配置 > 默认。"""
+    return (explicit
+            or os.environ.get("MEMORY_ECOLOGY_API_MODEL")
+            or config.cfg("llm", "model", None)
+            or DEFAULT_MODEL)
+
+
+def complete(prompt: str, *, client=None, model: str | None = None,
+             base_url: str | None = None, api_key: str | None = None,
              max_tokens: int = 800, temperature: float = 0.1,
              timeout: int = DEFAULT_TIMEOUT) -> str:
     """单轮 LLM 补全，返回文本内容。client 可注入（测试 fake 签名：
-    client(prompt, model=..., max_tokens=..., temperature=...) -> str）。"""
+    client(prompt, model=..., max_tokens=..., temperature=...) -> str）。
+
+    model / base_url 传 None 时按 resolve_* 的优先级解析（v2.5.0 起）。
+    """
+    model = resolve_model(model)
+    base_url = resolve_base_url(base_url)
     if client is not None:
         return client(prompt, model=model, max_tokens=max_tokens, temperature=temperature)
     key = (api_key

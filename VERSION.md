@@ -17,6 +17,10 @@
   - **报错改进**：`lib/safeio` 的 type 枚举校验报错现在列出合法值。
   - **第一公里**：README 新增「0) 先存一条记忆」与「如何迁移已有记忆」；
     `eco_health_check` 新增 `--no-write`（原来忽略 `--help` 直接执行并写 3 处），空库不再给健康分。
+  - **LLM 端点可配**：`lib/llm.py` 的 base_url/model 此前硬编码，只有 key 可配 →
+    接第三方 OpenAI 兼容网关时 401 且报错误导。现支持 `MEMORY_ECOLOGY_API_BASE` /
+    `MEMORY_ECOLOGY_API_MODEL`（运行期解析，不设时行为不变）。
+  - **`config.env_key` 报错改进**：原本文案提到环境变量但该函数只读 .env，已改为列出三种解法。
   - **测试**：新增 `test_concurrent_writes.py`（C1–C5）+ `test_mutation.py`（6 变异体，全抓到）。
   - **CI 门禁**：`check_entry_discipline.py`（D1 编码 / D2 数据根 / D3 建目录 / D4 锁成对）。
 - **v2.4.0**（2026-10-07）——向量缓存（灰度）· OR 召回 + RRF 融合（外部调研落地第二期）
