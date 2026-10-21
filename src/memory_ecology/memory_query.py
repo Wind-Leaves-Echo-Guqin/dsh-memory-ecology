@@ -46,6 +46,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -454,10 +455,41 @@ def revive(slug: str, detail_dir: Path | None = None, archive_dir: Path | None =
     return True, f"✅ {slug} 已复活（{'archive→detail' if from_archive else '原地'}，status=active，last_verified=今天）"
 
 
+# ── 自适应 top-k（v2.5.1，实测驱动）─────────────────────────────────
+# 背景：LongMemEval 上实测——多会话类题平均需要 2.6 条证据，
+# top-5 只能全命中 66.9% 的题，top-20 提到 87.2%。
+# 端到端 multi-session 正确率因此从 59.1% → 72.1%（+13.0pp）。
+# 而普通单点查询 top-5 已经够（R@1 = 0.87），加大只会增加噪声和成本。
+# 所以按查询形态自适应，而不是一律调大。
+_AGG_PAT = re.compile(
+    r"(总共|一共|合计|累计|加起来|多少次|多少回|多少个|多少种|几次|几次了|"
+    r"how many|how much|how often|in total|altogether|combined|every time)",
+    re.I)
+_MULTI_HOP_PAT = re.compile(
+    r"(分别|各自|对比|比较|先后|顺序|以及.*和|"
+    r"compare|respectively|in order|before|after|both)", re.I)
+
+
+def adaptive_top(query: str) -> int:
+    """按查询形态给召回条数。
+
+    · 聚合类（问"总共/多少次"）→ 20：需要凑齐多条证据才能算总数
+    · 多跳类（问"分别/顺序/对比"）→ 20：需要多条不同来源
+    · 其他 → 5：单点事实查询，5 条足够（实测 R@1=0.87）
+    """
+    if _AGG_PAT.search(query) or _MULTI_HOP_PAT.search(query):
+        return 20
+    return 5
+
+
 def main(argv: list[str] | None = None) -> int:
+    from lib.cli_base import bootstrap as _bootstrap  # v2.5.0：编码兜底
+    _bootstrap()
     ap = argparse.ArgumentParser(description="记忆查询门（detail+archive 打分检索，只读+遥测）")
     ap.add_argument("keyword", nargs="?", help="检索关键词（子串匹配，空格分隔多词=AND）")
-    ap.add_argument("--top", type=int, default=5, help="最多返回条数（默认 5）")
+    ap.add_argument("--top", type=int, default=None,
+                    help="最多返回条数。默认按查询自适应：普通查询 5，"
+                         "聚合/多跳类查询 20（v2.5.1，实测收益见下）")
     ap.add_argument("--format", choices=["text", "json"], default="text")
     ap.add_argument("--since", metavar="YYYY-MM-DD", default=None,
                     help="只返回发生时间 ≥ 此日的条目（valid_time→transaction_time→first_seen）")
@@ -558,7 +590,12 @@ def main(argv: list[str] | None = None) -> int:
                 scored = rrf_fuse([scored, or_hits])
                 mode = "lexical+recall"
     scored.sort(key=lambda t: (-t[0], t[1]["slug"]))  # 总分降序（奖励−罚分，越高越靠前）
-    hits = [{"score": s, **e} for s, e in scored[:args.top]]
+    # v2.5.1：--top 未显式指定时按查询形态自适应（实测 multi-session +13.0pp）
+    _top = args.top if args.top is not None else adaptive_top(args.keyword or "")
+    if args.top is None and _top != 5:
+        print(f"ℹ️ 聚合/多跳类查询，召回条数自动放宽到 {_top}（可用 --top 覆盖）",
+              file=sys.stderr)
+    hits = [{"score": s, **e} for s, e in scored[:_top]]
 
     if args.no_update:
         updated = 0
