@@ -17,6 +17,7 @@ detail/quarantine/gate_log/eco.db；幂等（fingerprint 防重 + 每动作即�
 """
 import argparse
 import datetime
+import difflib
 import hashlib
 import json
 import os
@@ -96,6 +97,121 @@ def rule_type(text: str) -> str:
     if re.search(r"(今天|昨天|上周|\d{4}-\d{2}-\d{2}|已完成|已提交|已发|办完|做完)", text):
         return "episodic"
     return "semantic"
+
+
+# ── v2.5.4（F-2）：规则层的同槽位冲突检测 ───────────────────────────────
+# 盲测发现（2026-10-22）：规则兜底只有 UPDATE/NOOP/ADD，没有 CONFLICT。
+# LLM 一挂，事实变更就退化成两种坏结果：
+#   · SPLIT_UPDATES=False（默认）：判 UPDATE → 新值被当重复计数吸收，
+#     "端口改成 6432" 的 6432 一个字没进库（**静默丢事实**）
+#   · SPLIT_UPDATES=True：判 ADD → 两条矛盾事实同时 active，quarantine=0
+#
+# 设计原则：规则层无法理解语义，所以**只在高度确定的形态上判冲突**——
+# 同一"槽位"（去掉数字后的骨架相似）出现了不同的数字/版本/IP。
+# 判不准就退回原逻辑，绝不在模糊情形下销毁内容（对齐「宁可重复，不可丢内容」）。
+#
+# 已知局限（有意保守）：中文专名变化（"值班人张伟"→"张强"）**不判冲突**，
+# 因为规则层无法知道两个中文名是不是同一槽位的不同值。盲测中上一版判据
+# 正是在这里把两条不同记忆判成合并销毁。
+
+# 硬标记：数字、版本号、IPv4
+_RE_NUM = re.compile(r"\d+(?:\.\d+)*")
+
+
+def _skeleton(text: str) -> str:
+    """去掉硬标记后的骨架，用于判断"是否同一槽位"。"""
+    s = _RE_NUM.sub("§", norm(text))
+    # 去掉常见的变更动词，让"是/改成/换成/升级到"落到同一骨架
+    s = re.sub(r"(改成|改为|换成|变成|升级到|调整为|设为|设置为|更新为|变成|是|为|现在|已经|了)", "", s)
+    s = re.sub(r"[\s\W_]+", "", s)
+    return s
+
+
+def _hard_tokens(text: str) -> set[str]:
+    """抽取硬标记（数字/IP/版本），用于判断"值是否变了"。"""
+    return set(_RE_NUM.findall(text))
+
+
+def is_slot_conflict(old_body: str, new_text: str, min_skeleton_ratio: float = 0.80,
+                     min_contain_share: float = 0.50) -> bool:
+    """同一槽位出现不同硬标记值 → 判为事实冲突。
+
+    保守四条件同时满足才返回 True：
+      1. 两边都有硬标记（数字/版本/IP）
+      2. 硬标记集合**不同**（值确实变了）
+      3. 骨架"算同一槽位"——满足其一即可：
+         a. 骨架相似度 ≥ min_skeleton_ratio
+         b. **短骨架完整包含于长骨架**，且长度占比 ≥ min_contain_share
+            （覆盖"数据库主库端口"vs"主库端口"这类省略写法：相似度只有 0.73，
+              但后者是前者的子串，语义上确实是同一槽位）
+    """
+    old_tok = _hard_tokens(old_body)
+    new_tok = _hard_tokens(new_text)
+    if not old_tok or not new_tok:
+        return False                       # 没有硬标记 → 无从判断
+    if old_tok == new_tok:
+        return False                       # 值没变 → 不是冲突
+    sk_old, sk_new = _skeleton(old_body), _skeleton(new_text)
+    if not sk_old or not sk_new:
+        return False
+    # 骨架相似度：用 difflib（与全项目同一内核，避免引入第二套口径）
+    ratio = difflib.SequenceMatcher(None, sk_old, sk_new).ratio()
+    if ratio >= min_skeleton_ratio:
+        return True
+    # 包含关系兜底（省略写法）：短骨架完整出现在长骨架里且占比够
+    short, long_ = (sk_old, sk_new) if len(sk_old) <= len(sk_new) else (sk_new, sk_old)
+    if short in long_ and len(long_) > 0 and len(short) / len(long_) >= min_contain_share:
+        return True
+    return False
+
+
+def rule_fallback_action(text: str, sims: list[dict],
+                         sim_near: float | None = None,
+                         sim_noop: float | None = None,
+                         sim_conflict: float | None = None) -> str:
+    """规则兜底的动作用判定（可测的纯函数）。
+
+    v2.5.4 起把动作判定从 main 里抽出来，并补上 CONFLICT 分支。
+    返回 "ADD" / "UPDATE" / "NOOP" / "CONFLICT"。
+
+    判定顺序（冲突优先，避免被 UPDATE 吸收）：
+      1. 无相似命中            → ADD
+      2. 同槽位不同值          → CONFLICT（新增，防静默丢事实）
+      3. 相似度 ≥ noop 阈值    → NOOP（完全重复）
+      4. 相似度 ≥ near 阈值    → UPDATE；若 SPLIT_UPDATES 且正文不同则 ADD
+      5. 其他                  → ADD
+
+    ★ 关于 CONFLICT 的相似度门槛（2026-10-22 实测修正）：
+      初版用 near(merge, 0.80) 作门槛，端到端实测**没有触发**——
+      因为候选文本带 "cN：" 前缀，把 ratio 从 0.80 压到 0.74，恰好卡在门下。
+      改为用 **suspect 阈值（0.50）**：CONFLICT 自带骨架级判定
+      (is_slot_conflict)，它要求"硬标记不同 + 骨架/包含关系成立"，
+      比单一 ratio 严格得多，所以 ratio 门槛可以放宽 —— 让骨架判据来把关。
+    """
+    if not sims:
+        return "ADD"
+    near = sim_near if sim_near is not None else similarity.gate_threshold("merge", SIM_NEAR)
+    noop = sim_noop if sim_noop is not None else similarity.gate_threshold("noop", 0.95)
+    # CONFLICT 用 suspect 级门槛（详见上方注释）：真正把门的是 is_slot_conflict
+    conflict_th = (sim_conflict if sim_conflict is not None
+                   else similarity.gate_threshold("suspect", SIM_SUSPECT))
+
+    top = sims[0]
+    ratio = top.get("ratio", 0.0)
+    old_body = (top.get("detail") or {}).get("body", "")
+
+    # ① 同槽位不同值 → CONFLICT（必须排在 UPDATE 之前）
+    if ratio >= conflict_th and old_body and is_slot_conflict(old_body, text):
+        return "CONFLICT"
+
+    if ratio >= near:
+        if ratio >= noop:
+            return "NOOP"
+        action = "UPDATE"
+        if SPLIT_UPDATES and norm(text) != norm(old_body):
+            action = "ADD"          # v2：非精确更新独立入库，不吸收新值
+        return action
+    return "ADD"
 
 
 
@@ -336,14 +452,21 @@ def _run(args) -> int:
         # 规则兜底
         if decision is None:
             ctype = rule_type(text)
-            if sims and sims[0]["ratio"] >= sim_near:
-                action = "UPDATE" if sims[0]["ratio"] < sim_noop else "NOOP"
-                if (SPLIT_UPDATES and action == "UPDATE"
-                        and norm(text) != norm(sims[0]["detail"]["body"])):
-                    action = "ADD"  # v2：非精确更新独立入库，不吸收新值
-            else:
-                action = "ADD"
-            decision = {"type": ctype, "action": action, "target": sims[0]["detail"]["name"] if sims else "", "note": "规则兜底" + ("（v2 拆分入库）" if action == "ADD" and sims else "")}
+            # v2.5.4（F-2）：动作判定抽成 rule_fallback_action，并补上 CONFLICT 分支。
+            # 原实现只有 UPDATE/NOOP/ADD，LLM 一挂时事实变更会被 UPDATE 吸收
+            # （新值不落库）或产出两条同时 active 的矛盾事实。
+            action = rule_fallback_action(text, sims, sim_near, sim_noop)
+            note_tag = ""
+            if action == "CONFLICT":
+                note_tag = "（规则判同槽位冲突）"
+            elif action == "ADD" and sims:
+                note_tag = "（v2 拆分入库）"
+            decision = {"type": ctype, "action": action,
+                        "target": sims[0]["detail"]["name"] if sims else "",
+                        "note": "规则兜底" + note_tag,
+                        # CONFLICT 需要 reason，规则层给一个人可读的说明
+                        "reason": (f"规则判为同槽位事实变更：旧「{sims[0]['detail']['body'][:40]}」"
+                                   f"→ 新「{text[:40]}」" if action == "CONFLICT" and sims else "")}
 
         action = decision.get("action", "ADD")
         if action not in ACTIONS:

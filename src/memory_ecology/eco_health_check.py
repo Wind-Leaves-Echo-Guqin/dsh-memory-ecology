@@ -33,22 +33,60 @@ except Exception:
 try:
     import yaml  # PyYAML：本机 miniconda 有；Hermes 托管 venv 按 pyproject.toml 显式排除 pyyaml
 except ModuleNotFoundError:  # 回退到 venv 已声明的 ruamel.yaml（safe 加载语义等价，168 份 SKILL.md 实测一致）
-    import io as _io
+    try:
+        import io as _io
 
-    from ruamel.yaml import YAML as _YAML
+        from ruamel.yaml import YAML as _YAML
 
-    _ruamel_safe = _YAML(typ="safe")
+        _ruamel_safe = _YAML(typ="safe")
 
-    class _CompatYAML:
-        """仅暴露本脚本用到的 safe_load，签名与返回类型和 PyYAML 对齐。"""
+        class _CompatYAML:
+            """仅暴露本脚本用到的 safe_load，签名与返回类型和 PyYAML 对齐。"""
 
-        @staticmethod
-        def safe_load(stream):
-            if hasattr(stream, "read"):
-                return _ruamel_safe.load(stream)
-            return _ruamel_safe.load(_io.StringIO(stream))
+            @staticmethod
+            def safe_load(stream):
+                if hasattr(stream, "read"):
+                    return _ruamel_safe.load(stream)
+                return _ruamel_safe.load(_io.StringIO(stream))
 
-    yaml = _CompatYAML()
+        yaml = _CompatYAML()
+    except ModuleNotFoundError:
+        # ★ v2.5.4（F-7）：第三级降级 —— 两个 YAML 库都没有时**不许崩**。
+        #   反直觉之处：本脚本是"环境不完整时最需要跑"的工具，
+        #   却偏偏是唯一硬依赖点（yaml+ruamel 双缺即崩）。
+        #   改为：用极简 frontmatter 解析器顶上（只支持本项目 SKILL.md 的
+        #   `key: value` 平坦结构），并在报告里明确标注"YAML 降级"。
+        class _MiniYAML:
+            """极简 YAML：只解析顶层 key: value（含引号/空值），不支持嵌套。
+
+            够用于 SKILL.md 的 frontmatter（本项目实测均为平坦结构）。
+            解析不了的复杂结构返回空 dict 并由调用方按"缺字段"处理。
+            """
+
+            YAML_FALLBACK_ACTIVE = True
+
+            @staticmethod
+            def safe_load(stream):
+                text = stream.read() if hasattr(stream, "read") else str(stream)
+                out = {}
+                for line in text.splitlines():
+                    if not line.strip() or line.lstrip().startswith("#"):
+                        continue
+                    if line[0] in " \t":          # 嵌套 → 不支持，跳过
+                        continue
+                    m = re.match(r"^([A-Za-z0-9_.-]+)\s*:\s*(.*)$", line)
+                    if not m:
+                        continue
+                    k, v = m.group(1), m.group(2).strip()
+                    if v.startswith(("|", ">", "[", "{")):   # 多行/容器 → 原样保留文本
+                        out[k] = v
+                        continue
+                    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                        v = v[1:-1]
+                    out[k] = v
+                return out
+
+        yaml = _MiniYAML()
 
 from lib.config import hermes_root
 
@@ -575,6 +613,12 @@ def build_report(write_history: bool = True):
     L.append(f"- 采集时点: 本报告为**快照**——生成后生态可能变化（实测数分钟内新增技能），以生成时刻数据为准")
     L.append("- 范围: 技能生态 / 记忆 / workflows / 备份普查 / cron 健康")
     L.append("- 模式: **只读**——本报告不修改任何生态文件，所有动作为建议")
+    # v2.5.4（F-7）：YAML 降级时必须显式告知，否则用户不知道自己在看降级解析的结果
+    if getattr(yaml, "YAML_FALLBACK_ACTIVE", False):
+        L.append("- ⚠️ **YAML 降级模式**：本机未安装 PyYAML 与 ruamel.yaml，"
+                 "frontmatter 用内置极简解析器（只支持顶层 key: value）。"
+                 "涉及嵌套结构的技能元数据可能被忽略，相关统计偏低。"
+                 "安装任一 YAML 库即可恢复完整解析。")
     # v0.3：元数据块——GUI 体检页「生态版本 × 报告时间轴」对照卡的数据来源
     eco_ver = "?"
     try:
