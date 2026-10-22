@@ -62,7 +62,9 @@ except ValueError:
 if MAX_BODY < 1:
     MAX_BODY = 200
 MAX_OUTPUT = 8       # 单次最多处理候选条数
-ACTIONS = ("ADD", "UPDATE", "NOOP", "CONFLICT")
+# v2.5.5：DISPUTE = 「疑似同槽位冲突但规则层无权销毁」
+# 新条目照常入库、旧条目只标 disputed_by 留在 detail，两条都能被检索到。
+ACTIONS = ("ADD", "UPDATE", "NOOP", "CONFLICT", "DISPUTE")
 
 PROMPT = """你是记忆整合器。以下是提取出的候选记忆（可能附带相似已有条目）。
 对每条候选给出 type 和 action：
@@ -127,21 +129,44 @@ def _skeleton(text: str) -> str:
     return s
 
 
+# ★ 2026-10-22 深夜修正（独立盲验证发现：初版误伤率 43%）
+#   盲验证用 92 组判据 + 24 组端到端 A/B（改前版从 git 取原文件实跑）得出：
+#     现状          TP25 / FP27  精确率 48%  误伤率 43%
+#     骨架0.80→0.95  TP25 / FP16  精确率 60%  误伤率 25%
+#     +包含占比0.85  TP19 / FP12  精确率 65%  误伤率 19%
+#   典型误伤（改前完全正常、改后被销毁）：
+#     · 订单A 100元 → 订单B 200元（不同实体，只差一个字）
+#     · 30秒 → 30000毫秒（同一个值的两种写法）
+#     · 主库5432+从库5433 → 主库5432（核心值没变）
+#     · 温度上限 → 温度下限（第二维变化）
+#   代价权衡：提门槛会漏掉一些真变更（TP 25→19），但**漏判只退回旧行为
+#   （UPDATE 吸收），误判却是不可逆销毁**。按"宁可重复，不可丢内容"取严。
+# ★ 门槛最终取宽松值（0.80 / 0.50），理由是**语义变了**：
+#   子代理的网格搜索（建议收 0.95/0.85）是在 CONFLICT（会销毁）语义下做的，
+#   那时误判不可逆，必须严防。
+#   改为 DISPUTE（只标记、不销毁、两条并存）后，误判代价≈0——
+#   最坏情况是"多打了一个 disputed 标记"，没有任何内容损失。
+#   所以应该反过来：门槛放宽松，尽量多抓真变更（TP 16→25），
+#   让 LLM 在线时再做人读复核。
+_MIN_SKELETON_RATIO = 0.80      # 骨架相似度（DISPUTE 语义下可宽）
+_MIN_CONTAIN_SHARE = 0.50       # 包含关系时短骨架占比（覆盖省略写法）
+
+
 def _hard_tokens(text: str) -> set[str]:
     """抽取硬标记（数字/IP/版本），用于判断"值是否变了"。"""
     return set(_RE_NUM.findall(text))
 
 
-def is_slot_conflict(old_body: str, new_text: str, min_skeleton_ratio: float = 0.80,
-                     min_contain_share: float = 0.50) -> bool:
+def is_slot_conflict(old_body: str, new_text: str, min_skeleton_ratio: float | None = None,
+                     min_contain_share: float | None = None) -> bool:
     """同一槽位出现不同硬标记值 → 判为事实冲突。
 
     保守四条件同时满足才返回 True：
       1. 两边都有硬标记（数字/版本/IP）
       2. 硬标记集合**不同**（值确实变了）
       3. 骨架"算同一槽位"——满足其一即可：
-         a. 骨架相似度 ≥ min_skeleton_ratio
-         b. **短骨架完整包含于长骨架**，且长度占比 ≥ min_contain_share
+         a. 骨架相似度 ≥ min_skeleton_ratio（默认 0.95，从严）
+         b. **短骨架完整包含于长骨架**，且长度占比 ≥ min_contain_share（默认 0.85）
             （覆盖"数据库主库端口"vs"主库端口"这类省略写法：相似度只有 0.73，
               但后者是前者的子串，语义上确实是同一槽位）
     """
@@ -154,13 +179,15 @@ def is_slot_conflict(old_body: str, new_text: str, min_skeleton_ratio: float = 0
     sk_old, sk_new = _skeleton(old_body), _skeleton(new_text)
     if not sk_old or not sk_new:
         return False
+    _sr = _MIN_SKELETON_RATIO if min_skeleton_ratio is None else min_skeleton_ratio
+    _cs = _MIN_CONTAIN_SHARE if min_contain_share is None else min_contain_share
     # 骨架相似度：用 difflib（与全项目同一内核，避免引入第二套口径）
     ratio = difflib.SequenceMatcher(None, sk_old, sk_new).ratio()
-    if ratio >= min_skeleton_ratio:
+    if ratio >= _sr:
         return True
     # 包含关系兜底（省略写法）：短骨架完整出现在长骨架里且占比够
     short, long_ = (sk_old, sk_new) if len(sk_old) <= len(sk_new) else (sk_new, sk_old)
-    if short in long_ and len(long_) > 0 and len(short) / len(long_) >= min_contain_share:
+    if short in long_ and len(long_) > 0 and len(short) / len(long_) >= _cs:
         return True
     return False
 
@@ -181,18 +208,54 @@ def rule_fallback_action(text: str, sims: list[dict],
       4. 相似度 ≥ near 阈值    → UPDATE；若 SPLIT_UPDATES 且正文不同则 ADD
       5. 其他                  → ADD
 
-    ★ 关于 CONFLICT 的相似度门槛（2026-10-22 实测修正）：
-      初版用 near(merge, 0.80) 作门槛，端到端实测**没有触发**——
-      因为候选文本带 "cN：" 前缀，把 ratio 从 0.80 压到 0.74，恰好卡在门下。
-      改为用 **suspect 阈值（0.50）**：CONFLICT 自带骨架级判定
-      (is_slot_conflict)，它要求"硬标记不同 + 骨架/包含关系成立"，
-      比单一 ratio 严格得多，所以 ratio 门槛可以放宽 —— 让骨架判据来把关。
+    ★ 关于 CONFLICT 的相似度门槛（2026-10-22 深夜，独立盲验证修正）：
+      初版先试 near(0.80) 发现端到端不触发，于是降到 suspect(0.50)。
+      **盲验证证明这个降级是错的**：
+        · 它以为的原因是"cN：前缀把 ratio 压到 0.74"，实测前缀后是 0.7586；
+          真正原因是 `_skeleton` 的动词剥离把差异消光、骨架 ratio 变成 1.0。
+        · 降门槛的代价：门槛扫描 0.80→TP16/FP16，0.50→TP25/FP27。
+          多抓 9 个真变更，却多销毁 11 组本该并存的记忆。
+      现在改回 **near(0.80)**，并配合收紧骨架判据（0.95 / 0.85）。
+      原则：漏判只是退回旧行为（UPDATE 吸收，可补救），误判是不可逆销毁。
+
+    ★★ 结构性修正（2026-10-22 深夜，第二轮盲验证驱动）★★
+      盲验证用 92 组标注数据做门槛网格搜索，结论是**无论怎么调门槛，
+      误伤率最低只到 19%**（精确率 66% / 召回 77%）。
+
+      这说明问题不在参数，而在**判据思路**：
+      规则层（difflib 字面相似 + 数字抽取）没有语义能力，
+      **没资格销毁内容**。典型误伤（改前完全正常）：
+        · 订单A 100元 → 订单B 200元（不同实体，只差一字）
+        · 主库5432+从库5433 → 主库5432（核心值没变）
+        · 温度上限 → 温度下限（第二维变化）
+        · 30秒 → 30000毫秒（同一个值的两种写法）
+
+      且实测确认：**「进 quarantine」≈「从记忆里消失」**——
+      `memory_query` 不扫 quarantine，`inject_gate` 第一条规则就是
+      `quarantined → drop`。所以误判 CONFLICT 等于真丢记忆。
+
+      因此改为 **DISPUTE（标记争议）**：
+        · 新条目照常 ADD 入库（**保证新值一定不丢** ← 原目标）
+        · 旧条目不 supersede、不移 quarantine，只在 fm 里标
+          `disputed_by: <新slug>` / `disputed_at` / `disputed_reason`
+        · 两条都留在 detail，都还能被检索到
+        · 写 gate_log 待 LLM 在线时复核
+      这样误伤归零（没有内容被销毁），核心目标仍满足。
+      真正需要"旧条目失效"的语义裁决，交给 LLM 在线时的 CONFLICT 路径。
+
+    返回值："ADD" / "UPDATE" / "NOOP" / "CONFLICT" / "DISPUTE"
     """
     if not sims:
         return "ADD"
     near = sim_near if sim_near is not None else similarity.gate_threshold("merge", SIM_NEAR)
     noop = sim_noop if sim_noop is not None else similarity.gate_threshold("noop", 0.95)
-    # CONFLICT 用 suspect 级门槛（详见上方注释）：真正把门的是 is_slot_conflict
+    # ★ DISPUTE 用 suspect 级门槛（0.50），而**不是** near（0.80）。
+    #   这正是结构性修正带来的好处：
+    #     · CONFLICT 会销毁内容 → 必须严防误判 → 门槛要高（网格搜索证明 0.80 才勉强）
+    #     · DISPUTE 只标记不销毁 → 误判代价≈0（两条并存，用户仍能检索到）→ 门槛可放宽
+    #   放宽后能多抓真变更（TP 16→25），而"多标的"只是多一个 disputed 标记，
+    #   没有内容损失。这也解释了为什么之前两版都不对：
+    #   第一版用 near 卡住（抓不到），第二版降门槛但走 CONFLICT（销毁太多）。
     conflict_th = (sim_conflict if sim_conflict is not None
                    else similarity.gate_threshold("suspect", SIM_SUSPECT))
 
@@ -200,9 +263,9 @@ def rule_fallback_action(text: str, sims: list[dict],
     ratio = top.get("ratio", 0.0)
     old_body = (top.get("detail") or {}).get("body", "")
 
-    # ① 同槽位不同值 → CONFLICT（必须排在 UPDATE 之前）
+    # ① 疑似同槽位不同值 → DISPUTE（不销毁，只标记 + 新值照常入库）
     if ratio >= conflict_th and old_body and is_slot_conflict(old_body, text):
-        return "CONFLICT"
+        return "DISPUTE"
 
     if ratio >= near:
         if ratio >= noop:
@@ -268,6 +331,33 @@ def add_entry(detail_dir: Path, text: str, fm_extra: dict) -> Path:
     else:
         safeio.write_entry(path, dump_frontmatter(fm, text[:MAX_BODY]), kind="detail")
     return path
+
+
+def _mark_disputed(d: dict, new_slug: str, reason: str = "") -> None:
+    """给旧条目打"争议"标记，但**不销毁**（v2.5.5 DISPUTE 路径）。
+
+    与 supersede_entry 的关键区别：
+      · status 保持 active（仍可被检索、仍参与注入）
+      · 不移动文件、不进 quarantine
+      · 只写三个审计字段：disputed_by / disputed_at / disputed_reason
+
+    为什么这样做（2026-10-22 第二轮盲验证）：
+      实测「进 quarantine」≈「从记忆里消失」——memory_query 不扫 quarantine，
+      inject_gate 第一条规则就是 quarantined→drop。
+      而规则层的判据误伤率最低只能到 19%（92 组网格搜索），
+      没有语义能力却要销毁内容，代价是真实记忆不可逆丢失。
+      故改为"标记待复核"：新值生效、旧值可查、等人/LLM 裁决。
+    """
+    today = datetime.date.today().isoformat()
+    try:
+        fm, body = parse_frontmatter(d["path"].read_text(encoding="utf-8"))
+    except OSError:
+        fm, body = dict(d["fm"]), d["body"]
+    fm["disputed_by"] = new_slug
+    fm["disputed_at"] = today
+    fm["disputed_reason"] = (reason or "")[:200]
+    # 明确不碰 status：保持 active，两条并存可检索
+    safeio.write_entry(d["path"], dump_frontmatter(fm, body), kind="detail")
 
 
 def update_entry(d: dict) -> None:
@@ -457,7 +547,9 @@ def _run(args) -> int:
             # （新值不落库）或产出两条同时 active 的矛盾事实。
             action = rule_fallback_action(text, sims, sim_near, sim_noop)
             note_tag = ""
-            if action == "CONFLICT":
+            if action == "DISPUTE":
+                note_tag = "（规则判疑似冲突→标记争议，不销毁）"
+            elif action == "CONFLICT":
                 note_tag = "（规则判同槽位冲突）"
             elif action == "ADD" and sims:
                 note_tag = "（v2 拆分入库）"
@@ -465,8 +557,9 @@ def _run(args) -> int:
                         "target": sims[0]["detail"]["name"] if sims else "",
                         "note": "规则兜底" + note_tag,
                         # CONFLICT 需要 reason，规则层给一个人可读的说明
-                        "reason": (f"规则判为同槽位事实变更：旧「{sims[0]['detail']['body'][:40]}」"
-                                   f"→ 新「{text[:40]}」" if action == "CONFLICT" and sims else "")}
+                        "reason": (f"规则判为疑似同槽位事实变更：旧「{sims[0]['detail']['body'][:40]}」"
+                                   f"→ 新「{text[:40]}」（仅标记争议，未销毁旧条目）"
+                                   if action == "DISPUTE" and sims else "")}
 
         action = decision.get("action", "ADD")
         if action not in ACTIONS:
@@ -545,6 +638,34 @@ def _run(args) -> int:
                     if not args.dry_run:
                         p = add_entry(args.detail, text, {"type": ctype})
                         log_gate(conn, fp, "ADD", p.stem, note, args.dry_run)
+            elif action == "DISPUTE":
+                # ★ v2.5.5（第二轮盲验证驱动）：规则层无权销毁内容。
+                #   新条目照常 ADD 入库（保证新值一定不丢）；
+                #   旧条目**不 supersede、不移 quarantine**，只打争议标记，
+                #   两条都留在 detail 且都能被检索到。
+                #   实测依据：「进 quarantine」≈「从记忆里消失」——
+                #   memory_query 不扫 quarantine，inject_gate 第一条就是 quarantined→drop。
+                hit = _match_target(decision, sims)
+                dispute_reason = (decision.get("reason") or decision.get("note") or "").strip()
+                if not args.dry_run:
+                    p = add_entry(args.detail, text, {"type": ctype})
+                    target = p.stem
+                    if hit:
+                        try:
+                            _mark_disputed(hit, p.stem, dispute_reason)
+                        except Exception as e:
+                            print(f"⚠️ 争议标记写入失败（不影响入库）: {e}")
+                    report.append(f"DISPUTE  {text[:40]} → 新条目 {target} 已入库；"
+                                  f"旧条目 {(hit or {}).get('name', '(无)')} 仅标记 disputed（未销毁）"
+                                  f" 理由: {dispute_reason} {note}")
+                    log_gate(conn, fp, "DISPUTE",
+                             (hit or {}).get("name", ""),
+                             f"new={target} reason={dispute_reason} {note}", args.dry_run)
+                else:
+                    report.append(f"DISPUTE  {text[:40]} → (dry-run) 将新增条目并标记旧条目争议"
+                                  f"（理由: {dispute_reason}）")
+                    log_gate(conn, fp, "DISPUTE",
+                             (hit or {}).get("name", ""), note, args.dry_run)
             else:  # NOOP
                 target = decision.get("target", "")
                 report.append(f"NOOP     {text[:40]} {note}")
