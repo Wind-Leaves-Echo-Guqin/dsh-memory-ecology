@@ -458,10 +458,53 @@ def _run(args) -> int:
     if args.dry_run:
         print("== DRY-RUN（未修改任何文件）==")
     else:
-        out = args.logdir / f"gate-{today}.md"
-        lines = [f"# 写入整合门 {today}", ""] + [f"- {r}" for r in report]
-        atomic_write(out, "\n".join(lines) + "\n")
-        print(f"✅ 整合日志 → {out}")
+        # ★ v2.5.2 修复（盲实测驱动）：原实现是 gate-<日期>.md + atomic_write，
+        #   每天只保留**最后一轮**——再跑一轮，上一轮记录就消失；跑一次空轮，
+        #   整个 md 被清成只剩标题 30 字节。而 SQLite 里历史仍在。
+        #   结果："完整可读的审计链只活在 eco.db，md 不能当审计依据"。
+        #   改为：每轮一个文件（互不覆盖）+ 当日汇总追加（保留全量，供人翻阅）。
+        #
+        # ★★ 二次修复（2026-10-22 独立盲验证发现两个口子）：
+        #   口子1（严重）：汇总读取失败时原代码 `except OSError: prev = ""`
+        #     然后直接拿空串覆盖 —— **一次瞬时读失败就把当日历史全清**，
+        #     原病症换个触发条件又回来。改为：读失败就**放弃更新汇总**，
+        #     但按轮文件已独立落盘，审计链不会丢。
+        #   口子2：文件名只有秒精度（%H%M%S），单轮耗时约 180-220ms，
+        #     连跑（cron 重试/手动补跑/批量回灌）必然同秒碰撞，后写的覆盖先写的。
+        #     实测无间隔连跑 15 轮只落 3 个文件。改为加毫秒 + 碰撞自增序号。
+        now = datetime.datetime.now()
+        stamp = now.strftime("%H%M%S")
+        ms = f"{now.microsecond // 1000:03d}"
+        base_name = f"gate-{today}-{stamp}-{ms}"
+        round_out = args.logdir / f"{base_name}.md"
+        seq = 1
+        while round_out.exists() and seq < 100:      # 同一毫秒内再碰撞则自增
+            seq += 1
+            round_out = args.logdir / f"{base_name}-{seq}.md"
+        lines = [f"# 写入整合门 {today} {stamp}.{ms}", ""] + [f"- {r}" for r in report]
+        atomic_write(round_out, "\n".join(lines) + "\n")
+
+        daily_out = args.logdir / f"gate-{today}.md"
+        agg_ok = True
+        if daily_out.exists():
+            try:
+                prev = daily_out.read_text(encoding="utf-8")
+            except OSError as _e:
+                # ★ 绝不用空串覆盖既有汇总——那会把当日历史整条抹掉。
+                #   本轮按轮文件已落盘，审计链完整；汇总留待下轮自然补齐。
+                prev = None
+                agg_ok = False
+                print(f"⚠️ 当日汇总读取失败（{_e}），本轮不更新汇总；"
+                      f"按轮日志已保存 → {round_out.name}")
+        else:
+            prev = f"# 写入整合门 {today}（当日汇总）\n"
+        if agg_ok:
+            if not (prev or "").strip():
+                prev = f"# 写入整合门 {today}（当日汇总）\n"
+            atomic_write(daily_out, prev.rstrip() + "\n\n" + "\n".join(lines) + "\n")
+            print(f"✅ 整合日志 → {round_out}（当日汇总 → {daily_out}）")
+        else:
+            print(f"✅ 整合日志 → {round_out}（汇总本轮跳过）")
     for r in report:
         print(r)
     skipped = len(cands_all) - len(fresh)

@@ -72,7 +72,22 @@ def atomic_write(path: Path, text: str) -> None:
         bak = path.with_name(path.name + ".eco-delbak")
         try:
             if path.exists():
-                os.replace(str(path), str(bak))   # 挪开旧文件（失败则什么都没改）
+                # ★ v2.5.2 修复（盲实测驱动）：第 3 级兜底原先直接 os.replace，
+                #   撞 WinError 5/32 就整体抛错。实测在读者持续高频读的压测下，
+                #   前两级退避已争取约 8 秒仍未兜住，这里自己也会撞同一个错
+                #   （约 6~8% 的写入失败率，26 次运行中 2 次）。
+                #   注意：核心承诺 bad_reads==0 从未被打破——失败的是写入完成度，
+                #   不是数据完整性。加上与第 2 级同样的退避即可消除。
+                for _bak_attempt in range(6):
+                    try:
+                        os.replace(str(path), str(bak))
+                        break
+                    except OSError as e:
+                        if getattr(e, "winerror", None) not in (5, 32):
+                            raise
+                        if _bak_attempt == 5:
+                            raise
+                        time.sleep(0.05 * (2 ** _bak_attempt))
             try:
                 os.replace(tmp, str(path))
             except OSError as e:

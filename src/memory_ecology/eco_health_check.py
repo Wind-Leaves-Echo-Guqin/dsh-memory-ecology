@@ -21,6 +21,7 @@ import math
 import os
 import re
 import sys
+import time
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -465,6 +466,106 @@ def fmt_size(n):
     return f"{n}B"
 
 
+def collect_cache_stats(days: int = 7) -> dict:
+    """v2.5.2 P0-E：缓存命中率监控（只读 state.db）。
+
+    为什么需要这个：实测本机命中率 98.64%，一旦某次改动破坏了 prompt 前缀，
+    成本会从 143 元涨到 2542 元（×17.8）。**任何优化都必须先有这条曲线**，
+    否则改了也不知道是赚是亏。
+
+    返回 dict；任何环节失败都返回 {"available": False, "error": ...}，绝不抛异常
+    （体检不能因为监控本身崩掉）。
+    """
+    db = HERMES_HOME / "state.db"
+    if not db.is_file():
+        return {"available": False, "error": f"找不到 {db}"}
+    try:
+        import sqlite3
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            cur = con.cursor()
+            cur.execute("""SELECT SUM(input_tokens), SUM(cache_read_tokens),
+                                  SUM(cache_write_tokens), SUM(output_tokens),
+                                  SUM(reasoning_tokens), COUNT(*)
+                           FROM sessions""")
+            inp, cr, cw, out, rt, n = cur.fetchone()
+            if not n:
+                return {"available": False, "error": "sessions 表为空"}
+            inp, cr, cw, out, rt = (inp or 0), (cr or 0), (cw or 0), (out or 0), (rt or 0)
+            total_prompt = inp + cr + cw
+            hit = (cr / total_prompt) if total_prompt else 0.0
+            rec = {
+                "available": True,
+                "sessions": n,
+                "input_tokens": inp,
+                "cache_read_tokens": cr,
+                "cache_write_tokens": cw,
+                "prompt_side_total": total_prompt,
+                "hit_rate": hit,
+                "output_tokens": out,
+                "reasoning_tokens": rt,
+                "reasoning_share_of_output": (rt / out) if out else 0.0,
+            }
+            # 近 N 天（按 sessions 的时间列；列名不同版本可能不同，失败就跳过）
+            for col in ("updated_at", "created_at", "last_active_at", "started_at"):
+                try:
+                    cur.execute(f"PRAGMA table_info(sessions)")
+                    names = {r[1] for r in cur.fetchall()}
+                    if col not in names:
+                        continue
+                    # started_at / last_activity_at 是 REAL unix 时间戳；
+                    # *_at TEXT 的变体才是 datetime 字符串。按列类型选比较方式。
+                    _is_real = any(r[1] == col and str(r[2]).upper() in ("REAL", "INTEGER", "NUMERIC")
+                                   for r in cur.execute("PRAGMA table_info(sessions)").fetchall())
+                    if _is_real:
+                        _cut = time.time() - int(days) * 86400
+                        _where = f"{col} >= ?"
+                        _params = (_cut,)
+                    else:
+                        _where = f"{col} >= datetime('now', '-{int(days)} days')"
+                        _params = ()
+                    cur.execute(f"""SELECT SUM(input_tokens), SUM(cache_read_tokens)
+                                    FROM sessions WHERE {_where}""", _params)
+                    r2 = cur.fetchone()
+                    if r2 and r2[0] is not None:
+                        i2, c2 = (r2[0] or 0), (r2[1] or 0)
+                        rec["recent_days"] = days
+                        rec["recent_hit_rate"] = (c2 / (i2 + c2)) if (i2 + c2) else 0.0
+                        rec["recent_time_col"] = col
+                    break
+                except sqlite3.Error:
+                    continue
+            return rec
+        finally:
+            con.close()
+    except Exception as e:                     # noqa: BLE001 - 体检不可因监控崩
+        return {"available": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def render_cache_stats(st: dict) -> list[str]:
+    """把缓存统计渲染成报告行。"""
+    L = ["", "## 缓存命中率（P0-E 监控 · 前缀健康度）", ""]
+    if not st.get("available"):
+        L.append(f"- ⚠️ 不可用：{st.get('error', '未知原因')}")
+        return L
+    L.append(f"- 统计范围: {st['sessions']:,} 个会话（只读 state.db）")
+    L.append(f"- prompt 侧总量: {st['prompt_side_total']:,} token")
+    L.append(f"  - 新输入（未命中）: {st['input_tokens']:,}")
+    L.append(f"  - 缓存命中读取: {st['cache_read_tokens']:,}")
+    L.append(f"  - 缓存写入: {st['cache_write_tokens']:,}")
+    L.append(f"- **缓存命中率: {st['hit_rate']:.2%}**")
+    if "recent_hit_rate" in st:
+        L.append(f"- 近 {st['recent_days']} 天命中率: {st['recent_hit_rate']:.2%}"
+                 f"（按 {st['recent_time_col']}）")
+    L.append(f"- 输出: {st['output_tokens']:,} token"
+             f"，其中 reasoning {st['reasoning_tokens']:,}"
+             f"（占 {st['reasoning_share_of_output']:.1%}）")
+    L.append("")
+    L.append("> **为什么盯这条**：命中率从 98.6% 掉到 50%，成本约 ×8；"
+             "掉到 0 则 ×17.8。任何改动前后都要看这行有没有跌。")
+    return L
+
+
 def build_report(write_history: bool = True):
     now = datetime.datetime.now().astimezone()
     L = []
@@ -486,6 +587,14 @@ def build_report(write_history: bool = True):
     L.append(f"- 生态版本: {eco_ver}")
     L.append("- 评分模型: v3（跨版本评分不可比）")
     L.append("- 口径声明: 技能/记忆/备份 = 目录实时统计 · cron = jobs.json 瞬时 + executions.db 近 7 天 · 评分 = 报告生成时点快照")
+    L.append("")
+
+    # P0-E：缓存命中率（前缀健康度）——放在最前面，因为它是成本的第一驱动
+    try:
+        _cache_st = collect_cache_stats()
+        L.extend(render_cache_stats(_cache_st))
+    except Exception as _e:      # noqa: BLE001
+        L.append(f"- ⚠️ 缓存统计失败: {_e}")
     L.append("")
 
     skills, bad = scan_skills()
