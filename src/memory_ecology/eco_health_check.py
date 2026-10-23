@@ -983,6 +983,14 @@ if __name__ == "__main__":
         sys.exit(0)
 
 
+    # v2.5.6 修复：out1/out2 在 v2.5.0 加 `--no-write` 重写 __main__ 时被漏定义 ——
+    # 每天 12:40 的 cron 跑到这里必 NameError（2026-10-23 17:42 部署后首次触发，
+    # 实测 `NameError: name 'out1' is not defined`，而上次成功是 10-21）。
+    DESIGNS_DIR.mkdir(parents=True, exist_ok=True)
+    DESKTOP.mkdir(parents=True, exist_ok=True)
+    out1 = DESKTOP / "生态体检报告.md"
+    out2 = DESIGNS_DIR / "生态体检报告.md"
+
     try:
         out1.write_text(report, encoding="utf-8")
         out2.write_text(report, encoding="utf-8")
