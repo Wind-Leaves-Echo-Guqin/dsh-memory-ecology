@@ -31,6 +31,7 @@ from lib.cli_base import bootstrap as _bootstrap   # v2.5.0：统一编码兜底
 from lib.fs import atomic_write, norm, slug_of
 from lib import safeio
 from lib import llm as _llm
+from lib import pii
 from lib import similarity
 from lib.gatekit import acquire_lock_auto, release_lock, connect_db
 from lib.memstore import (parse_frontmatter, dump_frontmatter, parse_candidates,
@@ -156,6 +157,44 @@ def _hard_tokens(text: str) -> set[str]:
     return set(_RE_NUM.findall(text))
 
 
+def _is_generational_change(text: str, old_body: str) -> bool:
+    """候选与目标的硬标记（数字/版本/IP）不同 → 事实换代，不是完全重复。
+
+    v2.5.7（审计 Finding1）：NOOP 语义是「完全重复」，只允许在值没变时使用。
+    旧实现只看整句相似度（Windows 11 → Windows 10 相似度 ≥0.95），
+    把换代当重复吞掉，新值永远进不了库（不可逆）。两边都有硬标记且集合不同，
+    即判换代；真正重复（标记相同，或双方无标记）仍返 False → 维持 NOOP。
+    """
+    new_tok, old_tok = _hard_tokens(text), _hard_tokens(old_body)
+    return bool(new_tok) and bool(old_tok) and new_tok != old_tok
+
+
+def escalate_noop_on_new_value(decision: dict, text: str, sims: list[dict]) -> dict:
+    """NOOP/UPDATE 决策终检：否定翻转或硬标记换代 → 升级 DISPUTE（否则原样返回）。
+
+    v2.5.7（审计 Finding1）：NOOP 语义是「完全重复」。LLM 直接判 NOOP、或
+    UPDATE→NOOP 同文钳制时，若候选带来新的数字/版本/IP（Windows 11 → 10），
+    说明是新旧值换代。转 DISPUTE：新值照常 ADD 入库、旧条目只标 disputed，
+    两条都留在 detail（可检索、可审计）。真正重复仍走 NOOP。
+
+    v2.5.8（红队 round3）：先复用 `escalate_polarity_flip`——否定/极性翻转不只
+    NOOP 会吞，UPDATE 也会（旧条目计数 +1、正文不变），CONFLICT 还会把旧条目
+    移出 detail；直接调用本函数时同样按该函数的口径升级。`_run` 里另有显式调用，
+    二者幂等。
+    """
+    decision = escalate_polarity_flip(decision, text, sims)
+    if decision.get("action") != "NOOP" or not sims:
+        return decision
+    old_body = (sims[0].get("detail") or {}).get("body", "")
+    if not _is_generational_change(text, old_body):
+        return decision
+    return dict(
+        decision, action="DISPUTE",
+        note=decision.get("note", "") + "（硬标记不同→NOOP 升级 DISPUTE，新值入库）",
+        reason=(f"事实换代：旧「{old_body[:40]}」→ 新「{text[:40]}」"
+                f"（硬标记不同，不判重复）"))
+
+
 def is_slot_conflict(old_body: str, new_text: str, min_skeleton_ratio: float | None = None,
                      min_contain_share: float | None = None) -> bool:
     """同一槽位出现不同硬标记值 → 判为事实冲突。
@@ -189,6 +228,116 @@ def is_slot_conflict(old_body: str, new_text: str, min_skeleton_ratio: float | N
     if short in long_ and len(long_) > 0 and len(short) / len(long_) >= _cs:
         return True
     return False
+
+
+# 否定/极性翻转判定（红队 round3，2026-10-23；B3 补全词表与 LLM 钳制）：
+# 否定的新事实与肯定旧事实只差一个"不/未/没有"，difflib ratio 天然 ≥ merge 阈值，
+# 旧逻辑判 UPDATE/NOOP 会把新事实静默吸收。规则层无需理解语义，只需识别
+# 「去掉极性标记后完全同形」这一高确定形态 → DISPUTE（新条目入库、旧条目留痕）。
+#
+# 词表（长词在前，避免"没有"被剥成"有"）：
+#   不 / 没 / 没有 / 未 / 无 / 别 / 非 / 禁止 / 停止
+#   以及成对极性：已↔未、能↔不能、是↔不是、有↔没有、允许↔禁止、运行/开始↔停止
+# 判定保守（四条件全满足）：
+#   1. 两侧剥完标记的骨架都非空且 ≥2 字；
+#   2. 负标记出现次数的奇偶性不同（一正一负；双重否定回到正极）；
+#   3. 剥掉极性对/否定/体标记后的骨架**完全相同**；
+#   4. 原句字面相似度 ≥ 0.50（防止"非常"等词被剥离后过度拉平）。
+# 这样普通差异（主语不同、谓词不同）不会被打成 DISPUTE；误报最多多一个
+# disputed 标记，没有内容损失（对齐"宁可重复，不可丢内容"）。
+_NEG_MARKERS = ("没有", "禁止", "停止", "无法", "无需", "未曾", "不曾", "不再",
+                "不", "没", "未", "无", "别", "非", "勿", "莫")
+_NEG_RE = re.compile("|".join(sorted(map(re.escape, _NEG_MARKERS), key=len, reverse=True)))
+# 体标记（已/曾经/尚）与否定标记常成对出现（已备份 vs 未备份），比较前两边都剥掉
+_ASPECT_RE = re.compile(r"(?:已经|曾经|已|曾|尚)")
+
+# 极性对（正极, 负极）：比较前两边都剥掉各自成员，让"允许写入/禁止写入"
+# 落到同一骨架；是否翻转由负标记奇偶性决定（不靠词表硬编码"反义"）。
+_POLARITY_PAIRS = (
+    ("有", "没有"),
+    ("允许", "禁止"),
+    ("运行", "停止"),
+    ("开始", "停止"),
+    ("启用", "禁用"),
+    ("开启", "关闭"),
+    ("能", "不能"),
+    ("可以", "不能"),
+    ("可以", "无法"),
+    ("需要", "无需"),
+    ("是", "不是"),
+)
+_PAIR_NEG_RE = re.compile("|".join(sorted({n for _, n in _POLARITY_PAIRS},
+                                          key=len, reverse=True)))
+_PAIR_POS_RE = re.compile("|".join(sorted({p for p, _ in _POLARITY_PAIRS},
+                                          key=len, reverse=True)))
+
+# 含否定字但**不是否定**的常用词：先换占位符，避免"非常/别人/无线/未来"误判。
+# 只列高频词，保持判定保守；未列出的词仍可能误报，但代价只是多一个 disputed 标记。
+_NEG_GUARDS = ("非常", "特别", "别的", "别人", "别处", "别致",
+               "无线", "无数", "无比", "无论", "无疑", "无妨", "无奈", "无所谓",
+               "差不多", "对不起", "了不起", "巴不得", "未来")
+_GUARD_RE = re.compile("|".join(sorted(map(re.escape, _NEG_GUARDS), key=len, reverse=True)))
+_GUARD_TOKEN = "\u25c7"  # ◇：不会与正文中文冲突；两边一致替换，不引入差异
+_MIN_NEG_RATIO = 0.50     # 与 DISPUTE 的 suspect 门槛同口径
+
+
+def _guard_negation(s: str) -> str:
+    """norm 后把"含否定字但非否定"的常用词换成占位符。"""
+    return _GUARD_RE.sub(_GUARD_TOKEN, norm(s))
+
+
+def _negation_parity(s: str) -> int:
+    """负标记出现次数的奇偶性（双重否定回到正极）。"""
+    return len(_NEG_RE.findall(s)) % 2
+
+
+def _without_polarity(s: str) -> str:
+    """剥掉极性对与否定/体标记后的骨架（norm 已去空白/标点）。"""
+    s = _PAIR_NEG_RE.sub("", s)
+    s = _PAIR_POS_RE.sub("", s)
+    s = _ASPECT_RE.sub("", s)
+    s = _NEG_RE.sub("", s)
+    return s
+
+
+def is_negation_flip(old_body: str, new_text: str) -> bool:
+    """否定/极性翻转：骨架相同但否定极性相反 → True（保守四条件见上）。"""
+    if not old_body or not new_text:
+        return False
+    old_g, new_g = _guard_negation(old_body), _guard_negation(new_text)
+    if not old_g or not new_g:
+        return False
+    if _negation_parity(old_g) == _negation_parity(new_g):
+        return False
+    old_c, new_c = _without_polarity(old_g), _without_polarity(new_g)
+    if len(old_c) < 2 or len(new_c) < 2 or old_c != new_c:
+        return False
+    return difflib.SequenceMatcher(None, norm(old_body), norm(new_text)).ratio() >= _MIN_NEG_RATIO
+
+
+# LLM 在线时可能把否定翻转判成 NOOP/UPDATE/CONFLICT（新事实被吸收 / 旧条目被
+# supersede 移出 detail）。这三种动作都与 DISPUTE 语义冲突，在动作分派前统一钳制。
+_POLARITY_CLAMP_ACTIONS = ("NOOP", "UPDATE", "CONFLICT")
+
+
+def escalate_polarity_flip(decision: dict, text: str, sims: list[dict]) -> dict:
+    """LLM/规则给出的 NOOP/UPDATE/CONFLICT 遇到否定翻转 → 升级 DISPUTE。
+
+    · NOOP    ：新事实被当重复丢弃（数据丢失）；
+    · UPDATE  ：旧条目 occurrences+1、正文不变，新事实丢失（数据丢失）；
+    · CONFLICT：旧条目移 quarantine（检索不到），违反"只标记不销毁"。
+    DISPUTE 路径：新值照常 ADD 入库，旧条目只打 disputed_by，两条都留在 detail。
+    """
+    if decision.get("action") not in _POLARITY_CLAMP_ACTIONS or not sims:
+        return decision
+    old_body = (sims[0].get("detail") or {}).get("body", "")
+    if not is_negation_flip(old_body, text):
+        return decision
+    return dict(
+        decision, action="DISPUTE",
+        note=decision.get("note", "") + "（否定翻转→升级 DISPUTE，新值入库）",
+        reason=(f"否定/极性翻转：旧「{old_body[:40]}」→ 新「{text[:40]}」"
+                f"（否定极性相反，不判重复、不销毁旧条目）"))
 
 
 def rule_fallback_action(text: str, sims: list[dict],
@@ -262,12 +411,17 @@ def rule_fallback_action(text: str, sims: list[dict],
     ratio = top.get("ratio", 0.0)
     old_body = (top.get("detail") or {}).get("body", "")
 
-    # ① 疑似同槽位不同值 → DISPUTE（不销毁，只标记 + 新值照常入库）
-    if ratio >= conflict_th and old_body and is_slot_conflict(old_body, text):
+    # ① 疑似同槽位不同值 / 否定翻转 → DISPUTE（不销毁，只标记 + 新值照常入库）
+    if ratio >= conflict_th and old_body and (
+            is_slot_conflict(old_body, text) or is_negation_flip(old_body, text)):
         return "DISPUTE"
 
     if ratio >= near:
         if ratio >= noop:
+            # v2.5.7（审计 Finding1）：完全重复才 NOOP；硬标记变了就是换代，
+            # 转 DISPUTE（新增入库 + 旧条目留痕），不再静默丢弃新值。
+            if old_body and _is_generational_change(text, old_body):
+                return "DISPUTE"
             return "NOOP"
         action = "UPDATE"
         if SPLIT_UPDATES and norm(text) != norm(old_body):
@@ -293,6 +447,15 @@ def find_similar(text: str, detail: list[dict], threshold: float) -> list[dict]:
 
 
 
+def slug_for(text: str) -> str:
+    """PII 安全 slug：先 mask 再生成文件名（同一段文本稳定、无随机）。
+
+    为什么必须先 mask：slug 会被备份、FTS 索引与 git 历史复制；手机号/身份证原文
+    一旦进文件名就无法靠"删正文"撤回（隐私判据 PF1）。
+    """
+    return slug_of(pii.mask(text))
+
+
 def add_entry(detail_dir: Path, text: str, fm_extra: dict) -> Path:
     now = datetime.date.today().isoformat()
     ts = datetime.datetime.now().isoformat(timespec="seconds")
@@ -313,8 +476,11 @@ def add_entry(detail_dir: Path, text: str, fm_extra: dict) -> Path:
         # 常规 ADD 时回退记 origin_session_id。逗号分隔，条目 slug 字符集内无逗号，可安全拆分。
         "evidence": str(fm_extra.get("evidence") or fm_extra.get("origin_session_id", "") or ""),
         "distilled_at": "",
+        # v2.5.8（隐私 R1/PF1）：机器可读敏感度标记。无 PII 时为空串（保持字段可枚举，
+        # 下游可稳定读取而无需区分"缺字段"与"不敏感"）。
+        "sensitivity": pii.sensitivity_of(text),
     }
-    path = safeio.safe_entry_path(detail_dir, slug_of(text))
+    path = safeio.safe_entry_path(detail_dir, slug_for(text))
     if path.exists():
         # 已存在（如 pending 重建致 fingerprint 变化）：不覆盖，走 UPDATE 语义。
         # P1：读取/写入失败直接抛给上层记失败（候选不消费、下轮重试）——
@@ -422,9 +588,10 @@ def log_gate(conn: sqlite3.Connection, fingerprint: str, action: str, target: st
     if dry:
         return
     ts = datetime.datetime.now().isoformat(timespec="seconds")
+    # 派生副本（gate_log）不是真源：note 里可能带候选正文/冲突理由，落库前统一脱敏。
     conn.execute(
         "INSERT OR IGNORE INTO gate_log(ts, fingerprint, action, target, note) VALUES(?,?,?,?,?)",
-        (ts, fingerprint, action, target, note),
+        (ts, fingerprint, action, target, pii.mask(note)),
     )
 
 
@@ -580,6 +747,13 @@ def _run(args) -> int:
         if decision.get("action") == "UPDATE" and sims and sims[0]["ratio"] >= sim_noop:
             decision = dict(decision, action="NOOP",
                             note=decision.get("note", "") + f"（≥{sim_noop:.2f} 同文钳制为 NOOP）")
+        # v2.5.8（红队 round3）：否定/极性翻转不得被 NOOP/UPDATE/CONFLICT 吸收。
+        # 先钳制极性（LLM 判 NOOP/UPDATE/CONFLICT → DISPUTE），再做 NOOP 硬标记终检。
+        _before_action = decision.get("action")
+        decision = escalate_polarity_flip(decision, text, sims)
+        decision = escalate_noop_on_new_value(decision, text, sims)
+        if decision.get("action") != _before_action:
+            action = decision["action"]
         ctype = decision.get("type", rule_type(text))
         note = decision.get("note", "")
         target = ""
@@ -589,7 +763,7 @@ def _run(args) -> int:
                     p = add_entry(args.detail, text, {"type": ctype})
                     target = p.stem
                 else:
-                    target = f"(new:{slug_of(text)})"
+                    target = f"(new:{slug_for(text)})"
                 report.append(f"ADD      {text[:40]} → {target} [type={ctype}] {note}")
                 log_gate(conn, fp, "ADD", target, note, args.dry_run)
             elif action == "UPDATE":
@@ -615,7 +789,7 @@ def _run(args) -> int:
                         # R10（v2.2.0 review）：先失效旧条目再写新条目；P1 补强——
                         # 写新失败时把旧条目从 quarantine 原位还原（fm 快照是 supersede 前的），
                         # 候选下轮可重试，不再留下「旧条目已废 + 新条目未落盘」且随 .done 丢失的半程态
-                        qtarget = supersede_entry(hit, slug_of(text), QUARANTINE_DIR, reason=conflict_reason)
+                        qtarget = supersede_entry(hit, slug_for(text), QUARANTINE_DIR, reason=conflict_reason)
                         try:
                             # v2.3.0 证据链：新条目 evidence 指向被取代旧条目（与旧条目 superseded_by 互指，
                             # 从任一侧可追溯完整换代链：Hindsight「矛盾保留历史」/腾讯 L0 回落同思想）
@@ -680,6 +854,10 @@ def _run(args) -> int:
             terminal.add(key)  # P0-1：成功处理才终态；失败候选留待下轮重试
         if not args.dry_run:
             conn.commit()  # P1-4：每个动作后立即落库，崩溃窗口不破坏幂等
+
+    # 派生副本（gate_log/*.md 按轮清单 + 当日汇总）只是审计投影，不是真源：
+    # 报告行里含候选正文前缀/冲突理由，写盘与打印前统一 mask（PF4）。
+    report = [pii.mask(r) for r in report]
 
     # v0.3 对齐门③④：零新候选轮次写 idle 心跳（"门在跑"有据可查）；
     # fingerprint 按日哈希，gate_log 主键不跨日冲突

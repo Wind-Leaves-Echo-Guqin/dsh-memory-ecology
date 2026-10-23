@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -53,6 +54,7 @@ from pathlib import Path
 from lib.config import hermes_root
 from lib.fs import atomic_write, norm
 from lib.gatekit import connect_db, write_ledger
+from lib import pii
 from lib.memstore import clean_value, parse_frontmatter, parse_frontmatter_strict, dump_frontmatter
 from eco_review import rewrite_status  # §C：status 重写口径单源（含 last_verified 补行）
 
@@ -453,6 +455,77 @@ def revive(slug: str, detail_dir: Path | None = None, archive_dir: Path | None =
     except Exception as e:
         return True, f"✅ {slug} 已复活（账本写入失败: {e}）"
     return True, f"✅ {slug} 已复活（{'archive→detail' if from_archive else '原地'}，status=active，last_verified=今天）"
+
+
+# ── 遗忘入口（隐私 R6 / PF5）─────────────────────────────────────────
+# 设计取舍：
+#   · 「遗忘」按**真删除**语义实现（unlink），不是 superseded——用户要求删除的
+#     PII 继续留在 detail/quarantine 里，等于没删；墓碑只保留 slug/时间/理由。
+#   · 删除后立即同步派生索引（mem_fts），不等 5s dirty TTL；search 另有
+#     源文件存在性过滤兜底。
+#   · 审计写两处：eco.db 的 gate_log(action=FORGET) + review_log，以及
+#     gate_log/forget-<date>.md（人读）。审计内容本身过 PII mask。
+
+def forget(slug: str, reason: str = "", detail_dir: Path | None = None,
+           db: Path | None = None, logdir: Path | None = None) -> tuple[bool, str]:
+    """可审计遗忘：删除 detail 条目 + 立即失效索引 + 写 FORGET 账。
+
+    返回 (是否成功, 说明)。slug 来自 detail 文件名（写入时已 PII-safe）。
+    """
+    detail_dir = detail_dir if detail_dir is not None else DETAIL_DIR
+    db = db if db is not None else DB
+    logdir = logdir if logdir is not None else GATE_LOG_DIR
+    slug = str(slug or "").strip()
+    if not slug or ".." in slug or "/" in slug or "\\" in slug:
+        return False, f"非法 slug: {slug!r}"
+    target = detail_dir / f"{slug}.md"
+    if not target.is_file():
+        return False, f"detail 未找到 {slug}.md"
+    try:
+        target.unlink()
+    except OSError as e:
+        return False, f"删除 {slug}.md 失败: {e}"
+    # 安全写路径可能留下 .bak-*（备份里同样有 PII）；遗忘必须一并清掉。
+    for bak in target.parent.glob(f"{target.name}.bak*"):
+        try:
+            bak.unlink()
+        except OSError:
+            pass
+    # 索引侧立即删除（DB 不存在时返回 False，不影响删除本身）
+    try:
+        from lib import sqlindex
+        sqlindex.forget_entry(slug, "detail", root=db.parent, detail_dir=detail_dir)
+    except Exception as e:  # 索引是派生层：失败可由 search 存在性过滤兜底，但必须可见
+        print(f"⚠️ 遗忘后索引同步失败（search 仍按源文件存在性过滤）: {e}",
+              file=sys.stderr)
+    ts = datetime.datetime.now().isoformat(timespec="seconds")
+    safe_reason = pii.mask(reason or "")
+    try:
+        conn = connect_db(db)
+        try:
+            write_ledger(conn, "gate_log",
+                         [(ts, hashlib.md5(f"forget|{slug}|{ts}".encode()).hexdigest(),
+                           "FORGET", slug, safe_reason)],
+                         ["ts", "fingerprint", "action", "target", "note"])
+            write_ledger(conn, "review_log",
+                         [(ts, "FORGET", slug, safe_reason)],
+                         ["ts", "action", "slug", "reason"])
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        return True, f"✅ 已删除 {slug}，但审计账写入失败: {e}"
+    try:
+        logdir.mkdir(parents=True, exist_ok=True)
+        f = logdir / f"forget-{TODAY.isoformat()}.md"
+        if not f.exists():
+            f.write_text(f"# 遗忘记录 {TODAY.isoformat()}（真删除；审计无 PII）\n\n"
+                         "| ts | slug | reason |\n|---|---|---|\n", encoding="utf-8")
+        with f.open("a", encoding="utf-8", newline="") as fh:
+            fh.write(f"| {ts} | {slug} | {safe_reason} |\n")
+    except OSError:
+        pass  # 人读账失败不阻塞删除（DB 账已落）
+    return True, f"✅ 已遗忘 {slug}（detail 已删除，索引立即失效，FORGET 已记账）"
 
 
 # ── 自适应 top-k（v2.5.1，实测驱动）─────────────────────────────────

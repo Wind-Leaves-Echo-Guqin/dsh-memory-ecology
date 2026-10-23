@@ -29,6 +29,7 @@ from pathlib import Path
 
 from lib.config import hermes_root
 from lib.memstore import parse_experience  # §C：解析单源
+from lib import pii  # v2.5.8（PF2）：命中携带机器可读敏感度
 from lib import sqlindex  # O7a：派生索引（不可用时回退子串路径，见 search）
 
 try:  # v0.3：子进程/管道下 stdout 走 GBK 会导致中文乱码，显式固定 UTF-8
@@ -161,7 +162,9 @@ def search(keyword: str, top: int = 3) -> list[dict]:
             if entry is None:
                 continue  # 索引与文件短暂不一致（如刚删除）：跳过该条
             hits.append({"path": p.stem, "entry": entry,
-                         "episode": _episode_key(entry), "score": r["score"]})
+                         "episode": _episode_key(entry), "score": r["score"],
+                         # PF2：非空当且仅当该条含 PII；调用方可在注入/导出前决策
+                         "sensitivity": pii.sensitivity_of(entry.get("full", ""))})
         folded = _fold(hits)
         if folded:
             return folded[:top]
@@ -197,7 +200,8 @@ def _search_substring(keyword: str, top: int) -> list[dict]:
     for path, entry, haystack, episode in _library():
         if kw not in haystack:
             continue
-        hits.append({"path": path.stem, "entry": entry, "episode": episode})
+        hits.append({"path": path.stem, "entry": entry, "episode": episode,
+                     "sensitivity": pii.sensitivity_of(entry.get("full", ""))})
     # 同 episode 折叠：保留每个 episode 的第一条（按文件名字典序，即 id 序）
     return _fold(hits)[:top]
 
@@ -226,6 +230,7 @@ def main() -> int:
             items.append({
                 "id": h["path"], "type": m.get("type", "?"), "status": m.get("status", "?"),
                 "title": h["entry"]["fields"].get("title", ""), "evidence": h["entry"]["fields"].get("evidence", ""),
+                "sensitivity": h.get("sensitivity") or pii.sensitivity_of(h["entry"].get("full", "")),
                 **({"score": h["score"]} if "score" in h else {}),  # 契约 v1.1.0：可选字段，降级路径无
                 **({"full": h["entry"]["full"]} if args.full else {}),
             })

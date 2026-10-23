@@ -16,7 +16,10 @@ from . import fs
 SAFE_NAME_RE = re.compile(r"^[\w.\-\u4e00-\u9fff]+$")  # \w 含字母数字下划线
 
 DETAIL_TYPES = {"semantic", "episodic", "procedural", "lesson"}
-DETAIL_STATUS = {"active", "dormant", "superseded"}
+# v2.5.7（红队 R-04 枚举漂移）：archived 是真实存在的失效态——memory_query 排序、
+# revive 复活、distill 跳过、sqlindex 排除都在用它，schema 必须认它合法；
+# 否则「索引层当合法排除态、写入层判非法」会把归档条目挡在安全写路径之外。
+DETAIL_STATUS = {"active", "dormant", "superseded", "archived"}
 EXPERIENCE_TYPES = {"error", "pattern", "negative", "success", "link"}
 EXPERIENCE_STATUS = {"draft", "verified", "dormant", "superseded"}
 DATE_KEYS = ("first_seen", "last_seen", "valid_time", "last_verified", "last_hit", "created",

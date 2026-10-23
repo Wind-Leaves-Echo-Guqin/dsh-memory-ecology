@@ -243,7 +243,9 @@ class Handler(BaseHTTPRequestHandler):
         localhost:8788.evil.com 之类畸形形态放行，审查 minor 修复）。"""
         host = (self.headers.get("Host") or "").strip().lower()
         if host.startswith("["):  # IPv6 字面量：[::1]:port
-            inner, _, rest = host[1:].partition("]")
+            inner, sep, rest = host[1:].partition("]")
+            if not sep:
+                return False  # 缺闭括号（[::1）——不得跳过端口校验后按回环放行
             if rest and not (rest.startswith(":") and rest[1:].isdigit()):
                 return False  # ] 后跟非端口垃圾（[::1]junk 形态）——审查 note 收紧
             port = rest[1:] if rest.startswith(":") else ""

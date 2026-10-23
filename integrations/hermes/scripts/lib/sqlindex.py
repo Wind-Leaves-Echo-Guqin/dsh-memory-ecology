@@ -23,10 +23,12 @@ import json
 import sqlite3
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 from . import config
 from . import memstore
+from . import pii
 
 SCHEMA_VERSION = 1
 DECAY_FRESH_DAYS = 30    # eco_review episodic 阈值镜像
@@ -39,6 +41,39 @@ DEFAULT_IMPORTANCE = "mid"
 STATUS_WEIGHT = {"dormant": 0.5, "stale": 0.5}
 STATUS_EXCLUDED = {"superseded", "archived"}
 DIRTY_TTL_S = 5.0        # 进程内 dirty 检查节流（长驻 hook 热路径；CLI 单次进程无感）
+
+# v2.5.7（红队 R-01/R-02/R3）：索引层对「声明了失效」的条目必须 fail-closed。
+# 宽松 frontmatter 解析器只认首字符就是 "---" 的文本；缩进/前导 Unicode 空白/
+# BOM/零宽字符都会让它返回 {}，随后索引把 status 缺省成 active 继续服务。
+# 修法：解析前剥掉这些前缀（只在剥离后确实以 --- 开头时生效，正文不受影响），
+# status 比较前统一 NFKC（全角→半角）+ strip + lower。
+_FM_LEADING_JUNK = "\ufeff\u200b\u200c\u200d\u2060\u180e"
+
+
+def _strip_fm_prefix(text: str) -> str:
+    """去掉 frontmatter 之前的前导空白/零宽噪声，使缩进 frontmatter 仍可识别。
+
+    仅当剥离后文本以 "---" 开头时返回剥离结果；否则原样返回——绝不改写正文。
+    """
+    if not text:
+        return text
+    i, n = 0, len(text)
+    while i < n and (text[i].isspace() or text[i] in _FM_LEADING_JUNK):
+        i += 1
+    if i and text.startswith("---", i):
+        return text[i:]
+    return text
+
+
+def normalize_status(status) -> str:
+    """status 归一化：NFKC（折叠全角字形）+ 去首尾空白 + lower。
+
+    索引侧与 STATUS_EXCLUDED 比较前必须走这里；否则 'Superseded' /
+    'SUPERSEDED' / 'ｓｕｐｅｒｓｅｄｅｄ' 都会绕过排除集。
+    """
+    return unicodedata.normalize("NFKC", str(status or "")).strip().lower()
+
+
 MATCH_LIMIT = 200        # 单次查询最多取回的候选行（再由 Python 打分截断）
 
 _DDL = (
@@ -106,19 +141,21 @@ def _detail_rows(detail_dir: Path) -> list[tuple]:
     rows = []
     for p in sorted(detail_dir.glob("*.md")):
         try:
-            fm, body = memstore.parse_frontmatter(
-                p.read_text(encoding="utf-8", errors="replace"))
+            text = p.read_text(encoding="utf-8", errors="replace")
+            fm, body = memstore.parse_frontmatter(_strip_fm_prefix(text))
         except OSError:
             continue
         if not body:
             continue
         rows.append((
             p.stem, "detail", str(fm.get("type", "")),
-            str(fm.get("status", "active")),
+            normalize_status(fm.get("status", "active")) or "active",
             str(fm.get("importance", DEFAULT_IMPORTANCE)),
             str(fm.get("last_seen") or fm.get("last_hit") or fm.get("first_seen")
                 or fm.get("transaction_time") or ""),
-            body[:80], body, str(fm.get("keywords", "")),
+            # v2.5.8（隐私 R4/PF4）：FTS 是派生副本，不是真源——正文/标题/关键词
+            # 入库前统一 mask。查询用原文号码会因此查不到（隐私优先于可检索性）。
+            pii.mask(body[:80]), pii.mask(body), pii.mask(str(fm.get("keywords", ""))),
         ))
     return rows
 
@@ -128,8 +165,8 @@ def _exp_rows(exp_dir: Path) -> list[tuple]:
     rows = []
     for p in sorted(exp_dir.glob("exp-*.md")):
         try:
-            entry = memstore.parse_experience(
-                p.read_text(encoding="utf-8", errors="replace"))
+            text = p.read_text(encoding="utf-8", errors="replace")
+            entry = memstore.parse_experience(_strip_fm_prefix(text))
         except OSError:
             continue
         if entry is None:
@@ -137,10 +174,11 @@ def _exp_rows(exp_dir: Path) -> list[tuple]:
         meta, fields = entry["meta"], entry["fields"]
         rows.append((
             p.stem, "exp", str(meta.get("type", "")),
-            str(meta.get("status", "draft")),
+            normalize_status(meta.get("status", "draft")) or "draft",
             str(meta.get("importance", DEFAULT_IMPORTANCE)),
             str(meta.get("last_hit") or meta.get("created") or ""),
-            str(fields.get("title", ""))[:80], entry["full"], "",
+            pii.mask(str(fields.get("title", ""))[:80]),
+            pii.mask(entry["full"]), "",
         ))
     return rows
 
@@ -266,11 +304,21 @@ def search(keyword: str, *, stores: tuple = ("exp",), top: int = 20,
         ).fetchall()
     finally:
         conn.close()
+    # v2.5.8（隐私 R6/PF5）：派生索引可能比真源晚一拍（dirty 缓存 5s 内不重建，
+    # 或删除时未走 forget）。返回前按源文件存在性过滤——索引里没有源文件的条目
+    # 一律不服务，删文件后立刻 search 也不会返回幽灵条目。
+    def _source_exists(row: tuple) -> bool:
+        slug, store = row[0], row[1]
+        base = detail_d if store == "detail" else exp_d if store == "exp" else None
+        return base is None or (base / f"{slug}.md").is_file()
+
+    rows = [r for r in rows if _source_exists(r)]
     if not rows:
         return []
     # 先剔除排除态再算质量分布（OCR 二审 2026-10-03：被排除行会拉大 span、
-    # 压缩剩余条目的 quality 区分度）
-    rows = [r for r in rows if r[3] not in STATUS_EXCLUDED]
+    # 压缩剩余条目的 quality 区分度）。v2.5.7：老库可能存着未归一化的 status，
+    # 比较时再归一化一次，防「索引已建好但排除失效」。
+    rows = [r for r in rows if normalize_status(r[3]) not in STATUS_EXCLUDED]
     if not rows:
         return []
     best = min(r[6] for r in rows)   # FTS5 约定：bm25 越小（越负）匹配越好
@@ -278,7 +326,8 @@ def search(keyword: str, *, stores: tuple = ("exp",), top: int = 20,
     span = (worst - best) or 1.0
     out = []
     for slug, store, typ, status, imp, updated, b in rows:
-        w = IMPORTANCE_WEIGHT.get(imp, 1.0) * STATUS_WEIGHT.get(status, 1.0)
+        norm_status = normalize_status(status)
+        w = IMPORTANCE_WEIGHT.get(imp, 1.0) * STATUS_WEIGHT.get(norm_status, 1.0)
         quality = 1.0 - (b - best) / span       # 1.0 = 本查询最佳匹配
         days = _days_since(updated)
         decay = (DECAY_FRESH if days is None or days <= DECAY_FRESH_DAYS
@@ -327,6 +376,37 @@ def sync_entry(path: Path, store: str, root: Path | None = None) -> bool:
         return False
     finally:
         conn.close()
+
+
+def forget_entry(slug: str, store: str = "detail", *,
+                 root: Path | None = None, detail_dir: Path | None = None,
+                 exp_dir: Path | None = None) -> bool:
+    """立即删除索引中的单条记录（PF5「遗忘」的索引侧同步）。
+
+    与 sync_entry 同纪律：索引不存在/任何失败 → False（不建库、不抛）。
+    真源文件由调用方（memory_query.forget）负责删除；这里只保证派生索引
+    不再返回它，并刷新快照让 dirty 判定与文件现状一致。
+    """
+    db = (Path(root) / "eco.db") if root else config.db_path()
+    if not db.is_file():
+        return False
+    conn = None
+    try:
+        conn = _connect(db)
+        _ensure(conn)
+        conn.execute("DELETE FROM mem_fts WHERE slug=? AND store=?", (slug, store))
+        det_d, exp_d = _store_dirs(root=root, detail_dir=detail_dir, exp_dir=exp_dir)
+        n, mt = _file_snapshot(det_d, exp_d)
+        conn.execute("INSERT OR REPLACE INTO mem_fts_meta(key, value) VALUES('snapshot', ?)",
+                     (json.dumps({"files": n, "mtime": mt}),))
+        conn.commit()
+        _dirty_cache[str(db)] = (time.monotonic(), False)
+        return True
+    except (sqlite3.Error, OSError):
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 # ── O7b 事件账 + O7c 体检面 ───────────────────────────────────────────

@@ -25,6 +25,7 @@ import sys
 from pathlib import Path
 
 from lib.config import hermes_root
+from lib import gatekit
 from lib import llm as _llm
 from lib.fs import atomic_write
 try:
@@ -153,7 +154,9 @@ def main() -> int:
     ku_conflicts = 0
     ku_cutoff = (datetime.date.today() - datetime.timedelta(days=30)).isoformat()
     try:
-        conn = sqlite3.connect(args.db, timeout=10)
+        # v2.5.7（审计 Finding7）：dry-run 必须零副作用——库不存在时用 :memory: 顶替，
+        # 否则 sqlite3.connect 会顺手建出 0 字节 eco.db（gatekit 既有正确做法）。
+        conn = gatekit.connect_db(args.db, dry_run=args.dry_run)
         try:
             ku_conflicts = conn.execute(
                 "SELECT COUNT(*) FROM gate_log WHERE action IN ('CONFLICT','UPDATE') "

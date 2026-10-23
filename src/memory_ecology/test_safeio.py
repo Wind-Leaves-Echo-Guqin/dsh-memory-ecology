@@ -45,10 +45,15 @@ class SafePathTest(unittest.TestCase):
 class SchemaTest(unittest.TestCase):
     def test_detail_enum_and_dates(self):
         self.assertEqual(safeio.validate_detail_fm({"type": "semantic", "status": "active"}), [])
-        errs = safeio.validate_detail_fm({"type": "fact", "status": "archived", "last_seen": "2026/09/06"})
+        # v2.5.7（红队 R-04）：archived 从「非法枚举」改为合法失效态——原断言钉住的
+        # 正是枚举漂移（索引层排除它、schema 却判非法）。此处改用真正非法的状态值，
+        # 三类错误（type/status/date）的断言目的不变。
+        errs = safeio.validate_detail_fm({"type": "fact", "status": "bogus", "last_seen": "2026/09/06"})
         self.assertTrue(any("type" in e for e in errs))
         self.assertTrue(any("status" in e for e in errs))
         self.assertTrue(any("last_seen" in e for e in errs))
+        # 归档是合法状态：写入路径不再拒绝
+        self.assertEqual(safeio.validate_detail_fm({"type": "semantic", "status": "archived"}), [])
 
     def test_detail_counts(self):
         self.assertEqual(safeio.validate_detail_fm({"occurrences": "3"}), [])

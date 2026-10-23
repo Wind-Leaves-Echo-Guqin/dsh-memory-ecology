@@ -73,6 +73,12 @@ def scan_new_msgs(watermark) -> tuple[list[str], tuple[float, int] | None]:
 def main() -> int:
     from lib.cli_base import bootstrap as _bootstrap  # v2.5.0：编码兜底
     _bootstrap()
+    # v2.5.7（审计 Finding6）：宿主依赖缺失必须给可操作信息，不能抛 sqlite3 裸 traceback。
+    # 与 eco_note_signals 同一口径（FileNotFoundError: state.db 不存在: <path>）。
+    if not DB.is_file():
+        print(f"❌ state.db 不存在: {DB}（Hermes 宿主数据库；请先配置 HERMES_HOME "
+              f"或启动宿主，使 {DB} 可用）", file=sys.stderr)
+        return 2
     from lib import watermark as _wm
     PENDING_DIR.mkdir(parents=True, exist_ok=True)
     wm = WATERMARK.read_text().strip() if WATERMARK.exists() else ""

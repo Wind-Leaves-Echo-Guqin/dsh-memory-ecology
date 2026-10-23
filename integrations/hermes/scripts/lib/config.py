@@ -26,22 +26,52 @@ except ImportError:
 _CONFIG: dict = {}
 _CONFIG_LOADED = False
 
+def _read_toml(path: Path) -> dict | None:
+    """读一份 TOML；缺失/损坏一律 None（fail-open，用代码默认值）。"""
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
 def _load_config() -> dict:
-    """加载 configs/eco.toml，fail-open 返回空 dict（用代码默认值）。"""
+    """加载 configs/eco.toml，fail-open 返回空 dict（用代码默认值）。
+
+    R-8（v2.5.7）：配置路径必须与数据路径同源 —— 先读
+    `hermes_root()/configs/eco.toml`（尊重 MEMORY_ECOLOGY_ROOT，多实例才完整），
+    再以代码树 `_P3/configs/eco.toml` 作过渡 fallback。实例优先：
+    同一 section 的键以实例为准，实例没写的 section/键保留代码树值。
+    """
     global _CONFIG, _CONFIG_LOADED
     if _CONFIG_LOADED:
         return _CONFIG
     _CONFIG_LOADED = True
     if not _HAS_TOML:
         return _CONFIG
-    p = _P3 / "configs" / "eco.toml"
-    if not p.is_file():
-        return _CONFIG
-    try:
-        with open(p, "rb") as f:
-            _CONFIG = tomllib.load(f)
-    except Exception:
-        pass  # 损坏 → 空配置 → 代码默认值
+    paths = [_P3 / "configs" / "eco.toml", hermes_root() / "configs" / "eco.toml"]
+    merged: dict = {}
+    seen: set[Path] = set()
+    for p in paths:
+        try:
+            key = p.resolve()
+        except OSError:
+            key = p
+        if key in seen:          # 默认部署（hermes_root == _P3）只读一次
+            continue
+        seen.add(key)
+        if not p.is_file():
+            continue
+        data = _read_toml(p)
+        if not data:
+            continue
+        for section, value in data.items():
+            if isinstance(value, dict) and isinstance(merged.get(section), dict):
+                merged[section] = {**merged[section], **value}
+            else:
+                merged[section] = value
+    _CONFIG = merged
     return _CONFIG
 
 

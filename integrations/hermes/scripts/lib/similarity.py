@@ -20,6 +20,8 @@ from __future__ import annotations
 import difflib
 import math
 import os
+import re
+import unicodedata
 from collections import Counter
 
 _BACKEND_UNAVAILABLE = {}  # backend name -> 提示信息（只打印一次）
@@ -51,6 +53,89 @@ def cosine(c1: Counter, c2: Counter) -> float:
     if n1 == 0 or n2 == 0:
         return 0.0
     return dot / (n1 * n2)
+
+
+# ── 改写归一化通道（v2.5.7，审计 Finding3）─────────────────────────────
+# 背景：difflib 对同义改写几乎无能力（红队实测同一事实改写 19 对 → 100% 未达
+# merge 阈值）。这里把「同义词/语序/停用词」归并成规范 token 集，再算覆盖度，
+# 作为相似度的**提升项**：ratio = max(字面分, 改写分)——只加不减，
+# 因此既有真重复对的分数不会下降（阈值语义不漂移）。
+#
+# 判据（保守，避免把"话题相近"误当"同一事实"）：
+#   · 两边各 ≥2 个规范 token，且共享 ≥2 个；
+#   · 短边覆盖率 ≥0.75（共享 token 占短边比例）；
+#   · 长度平衡 ≥0.5（防 2 词子串去蹭 10 词长文）。
+# 满足则给出 0.8+ 的改写分；否则 0——字面分照旧。
+_SYNONYMS = {
+    # 否定式反义（必须排在通用同义词前：短语整体命中后不再拆出"不"）
+    "不喜欢长篇大论": "简洁", "不喜欢啰嗦": "简洁", "不喜欢废话": "简洁",
+    "不要长篇大论": "简洁", "不要啰嗦": "简洁", "不要废话": "简洁",
+    "别长篇大论": "简洁", "别啰嗦": "简洁", "不爱啰嗦": "简洁",
+    # 通用同义词
+    "用户": "用户", "本人": "用户", "自己": "用户", "我": "用户",
+    "偏好": "偏好", "偏爱": "偏好", "喜欢": "偏好", "倾向于": "偏好", "倾向": "偏好",
+    "回答": "回答", "答复": "回答", "回复": "回答",
+    "简洁": "简洁", "简短": "简洁", "精简": "简洁", "精炼": "简洁",
+    "简明": "简洁", "简练": "简洁", "凝练": "简洁",
+    "直接": "直接", "直给": "直接", "直说": "直接", "直白": "直接",
+    "直截了当": "直接", "开门见山": "直接",
+    "冗长": "冗长", "啰嗦": "冗长", "长篇大论": "冗长", "废话": "冗长", "拖沓": "冗长",
+    "生态四道门": "四门", "生态四门": "四门", "四道门": "四门",
+    "四个门": "四门", "四门": "四门",
+    "按顺序": "顺序", "按次序": "顺序", "依次": "顺序", "顺序": "顺序",
+    "运行": "运行", "执行": "运行", "运转": "运行", "跑": "运行", "驱动": "运行",
+    "写入整合": "整合", "整合": "整合",
+    "配额": "配额", "蒸馏": "蒸馏",
+    "复核": "复核", "复查": "复核", "审核": "复核",
+    "每天": "每天", "每日": "每天",
+}
+_TERM_RE = re.compile("|".join(
+    re.escape(k) for k in sorted(_SYNONYMS, key=len, reverse=True)))
+_STOP_TOKENS = frozenset((
+    "的", "了", "要", "是", "在", "和", "与", "也", "都", "就", "并", "而", "及",
+    "或", "把", "被", "给", "让", "对", "从", "向", "于", "不", "别", "请", "吗",
+    "呢", "吧", "啊", "先", "再", "然后", "接着", "之后", "以及", "一个", "一下",
+    "很", "太", "更", "最", "会", "能", "可", "有", "没", "最后", "首先", "其次",
+))
+
+
+def _fallback_tokens(gap: str) -> list[str]:
+    """词表之外的片段：按非词字符切分，整段作为 token（保持保守，不拆单字）。"""
+    return [t for t in re.split(r"[^\w]+", gap) if t]
+
+
+def canon_tokens(s: str) -> list[str]:
+    """改写归一化：NFKC + lower → 最长同义词替换 → 去停用词，返回规范 token 序列。"""
+    if not s:
+        return []
+    text = unicodedata.normalize("NFKC", str(s)).lower()
+    out: list[str] = []
+    pos = 0
+    for m in _TERM_RE.finditer(text):
+        out.extend(_fallback_tokens(text[pos:m.start()]))
+        canon = _SYNONYMS[m.group(0)]
+        if canon:
+            out.append(canon)
+        pos = m.end()
+    out.extend(_fallback_tokens(text[pos:]))
+    return [t for t in out if t and t not in _STOP_TOKENS]
+
+
+def paraphrase_ratio(a: str, b: str) -> float:
+    """同义改写相似度（0 = 未达改写判据；仅作 ratio() 的提升项，不单独当阈值用）。"""
+    ta, tb = set(canon_tokens(a)), set(canon_tokens(b))
+    if len(ta) < 2 or len(tb) < 2:
+        return 0.0
+    shared = ta & tb
+    if len(shared) < 2:
+        return 0.0
+    shorter, longer = sorted((len(ta), len(tb)))
+    coverage = len(shared) / shorter
+    balance = shorter / longer
+    if coverage < 0.75 or balance < 0.5:
+        return 0.0
+    # 覆盖率为主，长度平衡做轻微抑制；上限 0.99（留出"完全同文"的区分度）
+    return min(0.99, coverage * (0.85 + 0.15 * balance))
 
 
 # ── L3：本地 ONNX embedding（可选依赖，惰性加载）─────────────────────
@@ -214,7 +299,11 @@ def gate_threshold(role: str, default: float) -> float:
 
 
 def ratio(a: str, b: str) -> float:
-    """相似度 0..1（越高越相似）。按 backend 分派；embedding 缺依赖自动回退 ngram。"""
+    """相似度 0..1（越高越相似）。按 backend 分派；embedding 缺依赖自动回退 ngram。
+
+    v2.5.7：返回值 = max(所选后端字面/语义分, 改写归一化分)。改写通道只提升，
+    因此「既有真重复对分数不下降」，换后端时的阈值校准也不会被打乱。
+    """
     if a is None or b is None:
         return 0.0
     a, b = str(a), str(b)
@@ -222,21 +311,23 @@ def ratio(a: str, b: str) -> float:
         return 0.0
     be = backend_name()
     if be == "difflib":
-        return difflib.SequenceMatcher(None, _norm(a), _norm(b)).ratio()
-    if be == "ngram":
-        return cosine(ngram_counter(a), ngram_counter(b))
-    if be == "embedding":
+        base = difflib.SequenceMatcher(None, _norm(a), _norm(b)).ratio()
+    elif be == "ngram":
+        base = cosine(ngram_counter(a), ngram_counter(b))
+    elif be == "embedding":
         try:
             emb = _get_embedder()
             va, vb = emb.embed(a), emb.embed(b)
-            return sum(x * y for x, y in zip(va, vb))
+            base = sum(x * y for x, y in zip(va, vb))
         except BackendUnavailable as e:
             if be not in _BACKEND_UNAVAILABLE:
                 _BACKEND_UNAVAILABLE[be] = True
                 print(f"⚠️ similarity: embedding 后端不可用（{e}），回退 ngram")
-            return cosine(ngram_counter(a), ngram_counter(b))
-    # 未知后端 → 旧行为兜底
-    return difflib.SequenceMatcher(None, _norm(a), _norm(b)).ratio()
+            base = cosine(ngram_counter(a), ngram_counter(b))
+    else:
+        # 未知后端 → 旧行为兜底
+        base = difflib.SequenceMatcher(None, _norm(a), _norm(b)).ratio()
+    return max(base, paraphrase_ratio(a, b))
 
 
 def is_same(a: str, b: str, threshold: float = 0.8) -> bool:
