@@ -40,6 +40,14 @@ def atomic_write(path: Path, text: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
             f.write(text)
+            # v2.5.6（审计 P2-2 并集）：fsync 原先只在生产 10-07 版里，
+            # 重试/挪开兜底只在 dev/compat 里 —— 两个正确属性从未同时存在于同一份代码。
+            # os.replace 只保证"改名原子"，不保证"数据已落盘"；不 fsync 时断电/崩溃会留
+            # "文件名可见、内容为空或半截"的记忆条目。
+            f.flush()
+            os.fsync(f.fileno())
+        # mkstemp 建的是 0600；恢复与旧实现（write_text）一致的 0644
+        os.chmod(tmp, 0o644)
         last = None
         for attempt in range(_REPLACE_RETRIES):
             try:

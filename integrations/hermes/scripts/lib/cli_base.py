@@ -39,6 +39,7 @@ __all__ = [
     "ensure_parent",
     "locked",
     "fail",
+    "banner",
 ]
 
 
@@ -139,7 +140,44 @@ def locked(lock_path: Path | str, *, blocking: bool = False):
             release_lock(path)
 
 
-# ── 5. 退出码 ──────────────────────────────────────────────────────────────
+# ── 5. 门标识（v2.5.6）─────────────────────────────────────────────────────
+
+def banner(name: str | None = None, *, file: str | os.PathLike | None = None) -> None:
+    """门启动横幅：脚本名 + 版本 + 自身源码 SHA256（前 12 位）+ 数据根。
+
+    为什么需要（审计 P0-1）：三棵树曾长期各跑各的，**没有任何地方能回答
+    "此刻在生产跑的是哪一版"** —— 生产停在 2026-10-07 快照这件事，是靠人工比对
+    文件大小/日期才发现的。横幅把版本与哈希打进 cron 日志，"部署是否生效"
+    从此是可观测事实，不再是推断。
+
+    哈希按 LF 归一计算：dev 工作树 CRLF、生产 LF，字节级哈希会把同一份代码
+    算成两个值；归一后与 tools/eco_selfcheck.py 的算法一致。
+
+    永不抛异常：横幅是观测设施，不能因为它自己坏掉而拖垮门。
+    """
+    import hashlib
+
+    src = None
+    try:
+        src = Path(file if file is not None else sys.argv[0]).resolve()
+        digest = hashlib.sha256(
+            src.read_bytes().replace(b"\r\n", b"\n")).hexdigest()[:12]
+    except (OSError, ValueError):
+        digest = "?"
+    try:
+        from lib import __version__ as _ver
+    except Exception:                      # 布局异常也不能中断门
+        _ver = "?"
+    try:
+        from lib.config import hermes_root
+        root = str(hermes_root())
+    except Exception:
+        root = "?"
+    print(f"[gate] {name or (src.stem if src else '?')} v{_ver} srcsha={digest} "
+          f"root={root} py={sys.version.split()[0]}")
+
+
+# ── 6. 退出码 ──────────────────────────────────────────────────────────────
 
 def fail(message: str, code: int = 1) -> int:
     """统一失败出口：打印到 stderr 并返回退出码（供 `return fail(...)` 用）。

@@ -224,6 +224,8 @@ def _stamp_distilled_at(d: dict, day: str) -> None:
 
 def main() -> int:
     _bootstrap()   # v2.5.0：编码兜底先于一切
+    from lib.cli_base import banner as _banner   # v2.5.6：部署可观测（哈希+版本+数据根）
+    _banner("distill_stage", file=__file__)
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--detail", type=Path, default=DETAIL_DIR)

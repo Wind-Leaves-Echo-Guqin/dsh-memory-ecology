@@ -52,15 +52,14 @@ SIM_SUSPECT = 0.50   # 疑似冲突窗口下界——difflib 口径默认值
 # 默认计数吸收（v1 行为）；置 1 后改为独立入库（ADD），新值保留在库，版本裁决交给检索与语义层。
 SPLIT_UPDATES = os.environ.get("MEMORY_ECOLOGY_GATE1_SPLIT_UPDATES", "") == "1"
 
-# L2 detail 正文上限。MEMORY_ECOLOGY_GATE_MAX_BODY 可覆盖（默认 200 行为不变）；
-# 论文 5.7 归因消融用：检验 200 字符截断对对话型语料的伤害（放宽上限是否修复 LME 失分）。
-# 上限只影响新写入的截断，不改相似度内核与既有条目。
-try:
-    MAX_BODY = int(os.environ.get("MEMORY_ECOLOGY_GATE_MAX_BODY", "") or "200")
-except ValueError:
-    MAX_BODY = 200
-if MAX_BODY < 1:
-    MAX_BODY = 200
+# L2 detail 正文上限（v2.5.6：解析收敛到 lib.config.gate_max_body）。
+# 优先级：MEMORY_ECOLOGY_GATE_MAX_BODY > configs/eco.toml [gate] max_body > 200。
+# 超限时正文尾追加 TRUNC_MARK —— 截断必须**可见**：审计实测 22 篇正文恰好 200 字且
+# 断在词中间（`…HMAC-SHA256(secret,`），词面检索下后半句的关键词根本不存在，
+# 而用户从落盘内容上看不出被截过。
+from lib.config import TRUNC_MARK, gate_max_body
+
+MAX_BODY = gate_max_body(200)
 MAX_OUTPUT = 8       # 单次最多处理候选条数
 # v2.5.5：DISPUTE = 「疑似同槽位冲突但规则层无权销毁」
 # 新条目照常入库、旧条目只标 disputed_by 留在 detail，两条都能被检索到。
@@ -329,7 +328,8 @@ def add_entry(detail_dir: Path, text: str, fm_extra: dict) -> Path:
         old_fm["last_verified"] = now
         safeio.write_entry(path, dump_frontmatter(old_fm, old_body), kind="detail")
     else:
-        safeio.write_entry(path, dump_frontmatter(fm, text[:MAX_BODY]), kind="detail")
+        body = text if len(text) <= MAX_BODY else text[:MAX_BODY] + TRUNC_MARK
+        safeio.write_entry(path, dump_frontmatter(fm, body), kind="detail")
     return path
 
 
@@ -458,6 +458,8 @@ def consumable_files(by_file: dict[str, list[dict]], terminal: set[str],
 
 def main(argv=None) -> int:
     _bootstrap()   # v2.5.0：编码兜底先于一切
+    from lib.cli_base import banner as _banner   # v2.5.6：部署可观测（哈希+版本+数据根）
+    _banner("write_gate", file=__file__)
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--pending", type=Path, default=PENDING_DIR)

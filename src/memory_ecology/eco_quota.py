@@ -77,7 +77,8 @@ from lib.metrics import (MEMORY_QUOTA, USER_QUOTA, RATIO, MEMORY_TRIGGER, USER_T
                          chars_of, parse_l1, serialize_l1)  # noqa: F401
 QUOTAS = {"MEMORY": MEMORY_QUOTA, "USER": USER_QUOTA}   # 文件名主干 → 配额（字符）
 DEFAULT_QUOTA = MEMORY_QUOTA              # 未知文件名默认配额
-MAX_BODY = 220                            # 提升时正文截断上限（字符）
+from lib.config import TRUNC_MARK, gate_max_body      # v2.5.6：上限与截断标记单源
+MAX_BODY = gate_max_body(220)                            # 提升时正文截断上限（字符）
 PREFIX_LEN = 30                           # 同源判定：detail 正文规范化前 N 字符
 PROMO_TYPES = ("semantic", "procedural")  # 提升候选允许的 type
 MIN_OCCURRENCES = 3
@@ -228,7 +229,11 @@ def process_file(path: Path, quota_override: int, detail_items: list, prefixes: 
             if any(is_same_source(d["body"], e) for e in entries):
                 continue
             seen_prefixes.add(pfx)
-            promo_records.append((d["body"][:MAX_BODY], d["name"], d["fm"]))
+            _body = d["body"]
+            # v2.5.6（审计 P0-2）：截断必须可见。这是"门②挤出直接写 detail"的那条路径，
+            # 此前 51 篇正文被静默切在词中间，且没有 gate_log 记录。
+            _body = _body if len(_body) <= MAX_BODY else _body[:MAX_BODY] + TRUNC_MARK
+            promo_records.append((_body, d["name"], d["fm"]))
     work = [(e, False, i) for i, e in enumerate(entries)]
     work += [(b, True, None) for (b, _s, _f) in promo_records]
 
@@ -435,6 +440,8 @@ def _run_inner(args) -> int:
 
 def main() -> int:
     _bootstrap()   # v2.5.0：编码兜底先于一切
+    from lib.cli_base import banner as _banner   # v2.5.6：部署可观测（哈希+版本+数据根）
+    _banner("eco_quota", file=__file__)
     ap = argparse.ArgumentParser(description="记忆生态巩固/配额门（纯规则，零 LLM 调用）")
     ap.add_argument("--dry-run", action="store_true",
                     help="只打印将执行的动作（提升/挤出各条），不修改任何文件、不写日志")

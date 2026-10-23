@@ -51,6 +51,36 @@ def cfg(section: str, key: str, default):
     return c.get(section, {}).get(key, default)
 
 
+# ── 正文上限与截断标记（v2.5.6，审计 P0-2）──────────────────────────────────
+# 为什么要单源：同一件事曾有两个互不知道的实现 —— write_gate 硬编码 200、
+# eco_quota 硬编码 220，且两边都是"默默切掉"，落盘后没人能看出正文被截过。
+TRUNC_MARK = "…[truncated]"
+
+
+def gate_max_body(default: int = 200) -> int:
+    """detail 正文上限的**唯一**解析入口。
+
+    优先级：环境变量 MEMORY_ECOLOGY_GATE_MAX_BODY
+          > configs/eco.toml [gate] max_body
+          > default
+    非法值（非整数 / < 1）一律回默认 —— 上限是安全阀，不能因配置手误变成 0。
+    """
+    for raw in (os.environ.get("MEMORY_ECOLOGY_GATE_MAX_BODY"),
+                cfg("gate", "max_body", None)):
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        try:
+            value = int(text)
+        except (TypeError, ValueError):
+            continue
+        if value >= 1:
+            return value
+    return default
+
+
 def hermes_root() -> Path:
     """生态根目录（生产=hermes；环境变量可覆盖）。"""
     return Path(_ENV_OVERRIDE) if _ENV_OVERRIDE else _HERMES

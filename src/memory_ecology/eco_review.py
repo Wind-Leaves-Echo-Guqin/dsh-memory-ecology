@@ -466,6 +466,8 @@ def main(argv=None) -> int:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')  # 与 eco_note_query 对齐：管道 GBK 容错
     except Exception:
         pass
+    from lib.cli_base import banner as _banner   # v2.5.6：部署可观测（哈希+版本+数据根）
+    _banner("eco_review", file=__file__)
     # P0-3（2026-10-04）：门④与门①②③看齐加实例锁——cron 与手动执行并发时
     # 两实例会同时 shutil.move 同一文件。锁文件与脚本同目录（本门不依赖 hermes 根）。
     locked, how = acquire_lock_auto(LOCK)

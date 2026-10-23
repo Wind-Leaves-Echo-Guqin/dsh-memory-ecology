@@ -13,13 +13,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+from lib import __version__          # v2.5.6：版本唯一真源在 lib/__init__.py
 from lib.config import hermes_root
 from lib.metrics import MEMORY_TRIGGER as MEM_DISPLAY_MAX, chars_of, parse_l1  # 口径单源（PORT_SPEC §4-C）
 
 HERMES = hermes_root()
 REPO = HERMES / "ecosystem.git"
 OUT = HERMES / "VERSION.md"
-ECOSYSTEM_VERSION = "v2.4.0"  # ⑧ 版本行常量（2026-10-04 统一：此前 README 双提 v2.2.4/v2.2.5、代码 v2.2.0 三方不一致；v3.0.0 仍待架构升级完成时切换并移居 lib）
+ECOSYSTEM_VERSION = f"v{__version__}"  # ⑧ v2.5.6：改为从 lib 派生（此前四版本并存：pyproject 2.2.0 / VERSION.md v2.5.0 / 本文件 v2.4.0 / 提交文案 v2.5.5）
 JOBS = HERMES / "cron" / "jobs.json"
 EXEC_DB = HERMES / "cron" / "executions.db"
 
