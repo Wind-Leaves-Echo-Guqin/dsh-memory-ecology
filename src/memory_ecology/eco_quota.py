@@ -63,6 +63,7 @@ from pathlib import Path
 from lib.config import hermes_root
 from lib.cli_base import bootstrap as _bootstrap   # v2.5.0：统一编码兜底
 from lib.fs import atomic_write, norm, slug_of
+from lib import pii   # v3.0.0a1：EXTRUDE 账本行 note 脱敏（与 write_gate.log_gate 同口径）
 from lib.memstore import (parse_frontmatter, dump_frontmatter, load_detail,
                           detail_prefixes, is_same_source)  # §C：解析/口径单源（2026-10-04 收编）
 
@@ -321,6 +322,12 @@ def execute(actions: list, changed_files: list, detail_dir: Path, db: Path) -> N
     try:
         conn.execute("CREATE TABLE IF NOT EXISTS quota_log("
                      "ts TEXT, action TEXT, slug TEXT, l1_preview TEXT, reason TEXT)")
+        # v3.0.0a1（审计 P0-3）：gate_log 与门① 同形（ts, fingerprint PK, action, target, note）。
+        # 门② 挤出直写 detail 此前只记 quota_log，detail 账本视角是「无账直写」——
+        # 存量 51 篇无 gate_log 的根因。schema 必须与 write_gate 建表一致，fingerprint
+        # 用 "EXTRUDE|slug" 域隔离（门① 的指纹是候选 md5，两者互不碰撞）。
+        conn.execute("CREATE TABLE IF NOT EXISTS gate_log("
+                     "ts TEXT, fingerprint TEXT PRIMARY KEY, action TEXT, target TEXT, note TEXT)")
         now = datetime.datetime.now().isoformat(timespec="seconds")
 
         def log(action: str, slug: str, preview: str, reason: str) -> None:
@@ -331,11 +338,24 @@ def execute(actions: list, changed_files: list, detail_dir: Path, db: Path) -> N
             conn.commit()
             n += 1
 
+        def log_gate_extrude(slug: str, text: str, reason: str) -> None:
+            """v3.0.0a1（审计 P0-3）：挤出直写 detail 逐条记 gate_log EXTRUDE 行。
+            与 write_gate.log_gate 同口径：INSERT OR IGNORE（幂等）+ pii.mask（note
+            含 L1 原文，账本可被导出，先脱敏）。"""
+            fp = hashlib.md5(f"EXTRUDE|{slug}".encode("utf-8")).hexdigest()
+            conn.execute(
+                "INSERT OR IGNORE INTO gate_log(ts, fingerprint, action, target, note) "
+                "VALUES(?,?,?,?,?)",
+                (datetime.datetime.now().isoformat(timespec="seconds"),
+                 fp, "EXTRUDE", slug, pii.mask(reason)))
+            conn.commit()
+
         for a in actions:
             if a["kind"] == "extrude" and a.get("write_detail"):
                 p = write_detail(detail_dir, a["text"], a["slug"])
                 print(f"  写入detail: {p.name} ← {a['preview']}")
                 log("extrude", a["slug"], a["preview"], a["reason"] + "（detail已落盘）")
+                log_gate_extrude(a["slug"], a["text"], a["reason"] + "（detail已落盘）")
         # 3) L1 原子写回（逐文件写、逐文件记账——失败时账本停在最后成功处）
         for path, final_text in changed_files:
             atomic_write(path, final_text)

@@ -456,6 +456,35 @@ def slug_for(text: str) -> str:
     return slug_of(pii.mask(text))
 
 
+def origin_from_sidecar(pending_dir: Path, fname: str) -> str:
+    """候选来源溯源（v3.0.0a1，审计 P0-3）：读 eco_extract 落的
+    `<候选文件>.md.sessions.json` sidecar，返回逗号分隔的 session_id 串。
+
+    · 文件缺失/损坏/字段异常 → 空串（老候选没有 sidecar；fail-open，行为不变）
+    · 保序去重；>8 个会话截断为前 8 + `|more:N`（窗口被多会话稀释时仍可读）
+    · 这是从「捕获」到「入库」唯一能带出会话关联的通道：候选正文是 LLM 提炼，
+      落库后无法反查 state.db——必须在门① 写入时随 fm 落 frontmatter。
+    """
+    p = pending_dir / f"{fname}.sessions.json"
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        ids = data.get("session_ids")
+        if not isinstance(ids, list):
+            return ""
+        seen: list[str] = []
+        for s in ids:
+            s = str(s or "").strip()
+            if s and s not in seen:
+                seen.append(s)
+    except Exception:
+        return ""
+    if not seen:
+        return ""
+    if len(seen) > 8:
+        return ",".join(seen[:8]) + f"|more:{len(seen) - 8}"
+    return ",".join(seen)
+
+
 def add_entry(detail_dir: Path, text: str, fm_extra: dict) -> Path:
     now = datetime.date.today().isoformat()
     ts = datetime.datetime.now().isoformat(timespec="seconds")
@@ -687,6 +716,9 @@ def _run(args) -> int:
         key = f"{c['file']}|{c['raw']}"
         fp = hashlib.md5(key.encode("utf-8")).hexdigest()
         text = c["text"]
+        # v3.0.0a1（审计 P0-3）：本候选的来源会话（sidecar 缺失 → 空串，行为不变）。
+        # 逐候选读一次（文件级粒度；同文件候选共享一个窗口，O(1) 小文件读，可接受）
+        origin = origin_from_sidecar(args.pending, c["file"])
         if not norm(text):
             report.append(f"SKIP     {text[:40]}（空/纯标点，无信息量）")
             log_gate(conn, fp, "NOOP", "", "空内容", args.dry_run)
@@ -760,7 +792,7 @@ def _run(args) -> int:
         try:
             if action == "ADD":
                 if not args.dry_run:
-                    p = add_entry(args.detail, text, {"type": ctype})
+                    p = add_entry(args.detail, text, {"type": ctype, "origin_session_id": origin})
                     target = p.stem
                 else:
                     target = f"(new:{slug_for(text)})"
@@ -777,7 +809,7 @@ def _run(args) -> int:
                 else:
                     report.append(f"UPDATE   {text[:40]} → 无目标，按 ADD 处理")
                     if not args.dry_run:
-                        p = add_entry(args.detail, text, {"type": ctype})
+                        p = add_entry(args.detail, text, {"type": ctype, "origin_session_id": origin})
                         log_gate(conn, fp, "ADD", p.stem, note, args.dry_run)
             elif action == "CONFLICT":
                 hit = _match_target(decision, sims)
@@ -793,7 +825,9 @@ def _run(args) -> int:
                         try:
                             # v2.3.0 证据链：新条目 evidence 指向被取代旧条目（与旧条目 superseded_by 互指，
                             # 从任一侧可追溯完整换代链：Hindsight「矛盾保留历史」/腾讯 L0 回落同思想）
-                            p = add_entry(args.detail, text, {"type": ctype, "evidence": target})
+                            # v3.0.0a1：origin_session_id 同步带上捕获侧溯源（evidence 保持指向旧条目）
+                            p = add_entry(args.detail, text, {"type": ctype, "evidence": target,
+                                                              "origin_session_id": origin})
                         except Exception:
                             try:
                                 os.replace(qtarget, hit["path"])
@@ -812,7 +846,7 @@ def _run(args) -> int:
                 else:
                     report.append(f"CONFLICT {text[:40]} → 无目标条目，按 ADD 处理")
                     if not args.dry_run:
-                        p = add_entry(args.detail, text, {"type": ctype})
+                        p = add_entry(args.detail, text, {"type": ctype, "origin_session_id": origin})
                         log_gate(conn, fp, "ADD", p.stem, note, args.dry_run)
             elif action == "DISPUTE":
                 # ★ v2.5.5（第二轮盲验证驱动）：规则层无权销毁内容。
@@ -824,7 +858,7 @@ def _run(args) -> int:
                 hit = _match_target(decision, sims)
                 dispute_reason = (decision.get("reason") or decision.get("note") or "").strip()
                 if not args.dry_run:
-                    p = add_entry(args.detail, text, {"type": ctype})
+                    p = add_entry(args.detail, text, {"type": ctype, "origin_session_id": origin})
                     target = p.stem
                     if hit:
                         try:
