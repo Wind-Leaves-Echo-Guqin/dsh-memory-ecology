@@ -148,3 +148,85 @@ def env_key(name: str) -> str:
                 raise RuntimeError(f"配置错误：{name} 为空（残留空值键，请检查 {env}）")
             return val
     raise RuntimeError(f"配置错误：{env} 中无 {name} 行")
+
+
+# ── Guard：schema 保持写入 + 配置不变量（v3.1.0，PLAN「回原文/Guard/加密」批）──
+#
+# 动机（2026-10-24 事故）：eco.toml 被整文件重写时 [gate].max_body=800 静默丢失
+# （P0-2 修复被回退）。教训蒸馏成两件结构：
+#   1. set_key()——**唯一受支持的配置改写方式**：行级手术（换值/补行/补段），
+#      未知键、注释、原有段落全部保留；整文件替换从此没有正当理由。
+#   2. REQUIRED_CONFIG——配置不变量表：selfcheck A6 据此断言「关键键在场」，
+#      丢键当场红（而非等截断证据间接暴露）。
+
+REQUIRED_CONFIG = {
+    # (section, key): (期望默认, 说明) —— A6 断言「键在场」；值允许实例覆盖，不锁死
+    ("quota", "memory_limit"): (3000, "L1 MEMORY 配额"),
+    ("quota", "memory_trigger"): (2550, "L1 触发线"),
+    ("gate", "max_body"): (800, "正文上限（审计 P0-2）"),
+}
+
+
+def set_key(section: str, key: str, value, root: Path | None = None) -> bool:
+    """schema 保持地写入一个配置键（行级手术，写前备份）。
+
+    · 键已存在 → 原位换值（保留行内注释之后的部分丢弃——值行不支持行内注释保真，
+      但其余行/注释/未知段全部不动）
+    · 键缺失但段存在 → 插到段尾
+    · 段缺失 → 追加到文件尾
+    · 修改成功后强制重载本模块配置缓存
+    返回是否发生写盘。fail-open 之外唯一正当的 eco.toml 写入路径（Guard 语义）。
+    """
+    global _CONFIG, _CONFIG_LOADED
+    import re as _re
+    path = (Path(root) if root else hermes_root()) / "configs" / "eco.toml"
+    if not path.is_file():
+        return False
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    sec_re = _re.compile(r"^\s*\[(.+?)\]\s*$")
+    key_re = _re.compile(rf"^(\s*){ _re.escape(key) }\s*=\s*.*$")
+    sec_start = None
+    sec_end = len(lines)
+    for i, ln in enumerate(lines):
+        m = sec_re.match(ln)
+        if m:
+            if sec_start is not None:
+                sec_end = i
+                break
+            if m.group(1).strip() == section:
+                sec_start = i
+    if sec_start is None:
+        lines += ["", f"[{section}]", f"{key} = {value}"]
+    else:
+        for i in range(sec_start + 1, sec_end):
+            if key_re.match(lines[i]):
+                lines[i] = f"{key} = {value}"
+                break
+        else:
+            lines.insert(sec_end, f"{key} = {value}")
+    backup = path.with_suffix(path.suffix + ".bak-setkey")
+    try:
+        import shutil as _shutil
+        _shutil.copy2(path, backup)
+    except OSError:
+        pass
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    os.replace(tmp, path)
+    _CONFIG_LOADED = False
+    _load_config()
+    return True
+
+
+def missing_required() -> list[str]:
+    """A6 判据：REQUIRED_CONFIG 里**生效配置**中缺席的键。
+
+    生效口径 = _load_config() 的实例+代码树合并（R-8）——任一文件提供即算在场；
+    读侧 fail-open 兜底 ≠ 配置健康，这里只回答「配置面是否完整」。
+    """
+    data = _load_config()
+    out = []
+    for (sec, key), (default, why) in REQUIRED_CONFIG.items():
+        if key not in (data.get(sec) or {}):
+            out.append(f"[{sec}].{key}（{why}，默认 {default}）")
+    return out

@@ -98,9 +98,13 @@ class TestGateThreshold(unittest.TestCase):
     def test_embedding_unavailable_uses_ngram_threshold(self):
         """配置 embedding 但模型缺失 → 分数走 ngram 回退，阈值也必须取 ngram 值
         （否则"阈值按 embedding 校准、分数来自 ngram"静默错配）。"""
+        # v3.1.0 加固：缺失路径不得用网络盘符（Z:）——网络盘掉线时 Windows 盘符
+        # 解析阻塞数分钟、测试假死（2026-10-24 云迁移网络抖动实测）；本地路径秒回。
+        import tempfile
+        missing = str(Path(tempfile.gettempdir()) / "eco-definitely-missing-models")
         with mock.patch.dict("os.environ",
                              {"MEMORY_ECOLOGY_SIM_BACKEND": "embedding",
-                              "MEMORY_ECOLOGY_MODELS": "Z:/definitely/missing"}), \
+                              "MEMORY_ECOLOGY_MODELS": missing}), \
              mock.patch.object(similarity, "_EMBED_FAILED", False), \
              mock.patch.object(similarity, "_EMBEDDER", None):
             self.assertEqual(similarity.effective_backend(), "ngram")
