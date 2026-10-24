@@ -80,7 +80,7 @@ def main() -> int:
     _bootstrap()
     if not (REPO / ".git").exists():
         print("ecosystem.git 不存在，跳过")
-        return 1
+        return 0  # 本机无生态仓库属正常（云端），静默（live 2026-10-24 修复回迁，v3.0.1 部署前合并）
 
     # 1) memories / skills / scripts（OCR: changed 原为死变量——提交与否由 git status 决定）
     for name in ("memories", "skills", "scripts"):

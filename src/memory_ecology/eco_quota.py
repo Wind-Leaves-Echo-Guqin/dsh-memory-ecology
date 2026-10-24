@@ -190,6 +190,8 @@ def write_detail(detail_dir: Path, text: str, slug: str) -> Path:
         "transaction_time": now_t,
         "last_verified": now_d,
         "origin_session_id": "extrude-from-L1",
+        # v3.0.1：scope 统一键位（挤出直写无候选来源 → 诚实空串；A5 按此分段判）
+        "scope": "",
         "superseded_by": "",
     }
     path = detail_dir / f"{slug}.md"

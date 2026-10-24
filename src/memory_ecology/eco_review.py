@@ -239,6 +239,7 @@ def scan_detail(detail_dir: Path):
             'path': p, 'slug': slug, 'type': mtype or 'unknown',
             'status': status or 'unknown', 'last_verified': fields.get('last_verified') or '',
             'days': days, 'threshold': threshold, 'overdue': overdue,
+            'last_hit': fields.get('last_hit') or '',
             'body': body, 'raw': raw, 'action': None,
         }
         if status == 'active' and overdue:
@@ -417,6 +418,22 @@ def build_report(date_str, detail_actions, candidates, q_actions, files, failure
     lines += ["", "## 三、quarantine 清理清单", "", "| 文件 | 超期天数 | 动作 |", "|---|---|---|"]
     for r in q_actions:
         lines.append(f"| {cell(str(r['rel']))} | {r['days']} | quarantine_cleanup |")
+    # v3.0.1（PLAN §1.3，shadow 报告，不改任何行为）：last_verified 刷新缺口量化。
+    # last_hit 新于 last_verified 的条目 = 「在使用但复核戳停滞」——启用派生刷新后
+    # 这些条目的 last_verified 将随 last_hit 走。只报告条数与样例，不写条目。
+    stale_while_used = []
+    for r in files:
+        lv = parse_date_value(r.get('last_verified'))
+        lh = parse_date_value(r.get('last_hit'))
+        if lh is not None and (lv is None or lh > lv):
+            stale_while_used.append(r['slug'])
+    lines += ["", "## 四、last_verified 刷新缺口（v3.0.1 shadow，仅报告）", ""]
+    lines.append(f"- last_hit 新于 last_verified 的条目：**{len(stale_while_used)}** 条"
+                 f"（启用「从 last_hit 派生刷新」后这些条目的复核戳将自动前进）")
+    for s in stale_while_used[:10]:
+        lines.append(f"  - {s}")
+    if len(stale_while_used) > 10:
+        lines.append(f"  - … 共 {len(stale_while_used)} 条")
     lines.append("")
     return '\n'.join(lines)
 

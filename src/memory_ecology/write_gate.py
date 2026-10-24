@@ -504,6 +504,10 @@ def add_entry(detail_dir: Path, text: str, fm_extra: dict) -> Path:
         # v2.3.0 证据链：CONFLICT 换代时指向被取代的旧条目 slug（与旧条目 superseded_by 互指）；
         # 常规 ADD 时回退记 origin_session_id。逗号分隔，条目 slug 字符集内无逗号，可安全拆分。
         "evidence": str(fm_extra.get("evidence") or fm_extra.get("origin_session_id", "") or ""),
+        # v3.0.1（联邦化数据地基，决策见 PLAN-v3.0.1 §1.4）：scope = 候选来源文件名
+        # （指纹链已验证 127/127 可归因的硬证据；桶映射留给消费层，不提前承诺）。
+        # 无来源（extrude 直写等）保持空串——诚实缺省，selfcheck A5 按生成日期分段判。
+        "scope": str(fm_extra.get("scope", "") or ""),
         "distilled_at": "",
         # v2.5.8（隐私 R1/PF1）：机器可读敏感度标记。无 PII 时为空串（保持字段可枚举，
         # 下游可稳定读取而无需区分"缺字段"与"不敏感"）。
@@ -792,7 +796,8 @@ def _run(args) -> int:
         try:
             if action == "ADD":
                 if not args.dry_run:
-                    p = add_entry(args.detail, text, {"type": ctype, "origin_session_id": origin})
+                    p = add_entry(args.detail, text, {"type": ctype, "origin_session_id": origin,
+                                                          "scope": c["file"]})
                     target = p.stem
                 else:
                     target = f"(new:{slug_for(text)})"
@@ -809,7 +814,8 @@ def _run(args) -> int:
                 else:
                     report.append(f"UPDATE   {text[:40]} → 无目标，按 ADD 处理")
                     if not args.dry_run:
-                        p = add_entry(args.detail, text, {"type": ctype, "origin_session_id": origin})
+                        p = add_entry(args.detail, text, {"type": ctype, "origin_session_id": origin,
+                                                          "scope": c["file"]})
                         log_gate(conn, fp, "ADD", p.stem, note, args.dry_run)
             elif action == "CONFLICT":
                 hit = _match_target(decision, sims)
@@ -827,7 +833,8 @@ def _run(args) -> int:
                             # 从任一侧可追溯完整换代链：Hindsight「矛盾保留历史」/腾讯 L0 回落同思想）
                             # v3.0.0a1：origin_session_id 同步带上捕获侧溯源（evidence 保持指向旧条目）
                             p = add_entry(args.detail, text, {"type": ctype, "evidence": target,
-                                                              "origin_session_id": origin})
+                                                              "origin_session_id": origin,
+                                                              "scope": c["file"]})
                         except Exception:
                             try:
                                 os.replace(qtarget, hit["path"])
@@ -846,7 +853,8 @@ def _run(args) -> int:
                 else:
                     report.append(f"CONFLICT {text[:40]} → 无目标条目，按 ADD 处理")
                     if not args.dry_run:
-                        p = add_entry(args.detail, text, {"type": ctype, "origin_session_id": origin})
+                        p = add_entry(args.detail, text, {"type": ctype, "origin_session_id": origin,
+                                                          "scope": c["file"]})
                         log_gate(conn, fp, "ADD", p.stem, note, args.dry_run)
             elif action == "DISPUTE":
                 # ★ v2.5.5（第二轮盲验证驱动）：规则层无权销毁内容。
@@ -858,7 +866,8 @@ def _run(args) -> int:
                 hit = _match_target(decision, sims)
                 dispute_reason = (decision.get("reason") or decision.get("note") or "").strip()
                 if not args.dry_run:
-                    p = add_entry(args.detail, text, {"type": ctype, "origin_session_id": origin})
+                    p = add_entry(args.detail, text, {"type": ctype, "origin_session_id": origin,
+                                                          "scope": c["file"]})
                     target = p.stem
                     if hit:
                         try:

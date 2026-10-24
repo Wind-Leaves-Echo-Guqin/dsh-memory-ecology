@@ -81,6 +81,28 @@ def _db_path() -> Path:
     return Path(os.environ.get("ECO_NOTE_INJECT_DB") or os.path.join(HERMES_HOME, "state.db"))
 
 
+def _session_ctx(session_id: str) -> str:
+    """v3.0.1（联邦化数据地基）：当前会话的项目上下文（cwd，state.db 只读单查）。
+
+    用途：注入相关性遥测——「这条经验被注入到了哪个项目的会话」。只读
+    `?mode=ro`（WAL 副作用红线）；会话不存在/无 cwd/state.db 缺失 → ""（fail-open，
+    与 401/休眠等任何宿主状态解耦，绝不影响注入主流程）。
+    """
+    if not session_id:
+        return ""
+    try:
+        import sqlite3
+        conn = sqlite3.connect(f"file:{_db_path().as_posix()}?mode=ro", uri=True)
+        try:
+            row = conn.execute("SELECT cwd FROM sessions WHERE id=?",
+                               (session_id,)).fetchone()
+        finally:
+            conn.close()
+        return str(row[0] or "") if row else ""
+    except Exception:
+        return ""
+
+
 def _exp_dir() -> Path:
     return Path(os.environ.get("ECO_NOTE_INJECT_EXP_DIR") or os.path.join(HERMES_HOME, "experiences"))
 
@@ -496,13 +518,43 @@ def handle(payload: dict) -> str:
                                      "msg_id": err["msg_id"], "entry_ids": entry_ids,
                                      "chars": len(text), "error": err_text[:200],
                                      "would_skip": would_skip})
-    if not sqlindex.log_event("inject", session_id,
-                              {"entry_ids": entry_ids, "chars": len(text),
-                               "would_skip": would_skip,
-                               "error": err_text[:200]},
-                              root=_exp_dir().parent):
+    # O7b：SQL 镜像账（jsonl 仍是主账；fail-open 可观测）
+    # v3.0.1 fail-open 演练发现：log_event 设计为"失败返回 False"，但若其内部出现
+    # 未预期异常（非 False 路径），原样抛出会经 main() 兜底吞掉本次注入返回值——
+    # 遥测异常不得影响注入，会话级与逐条行统一包 try。
+    try:
+        if not sqlindex.log_event("inject", session_id,
+                                  {"entry_ids": entry_ids, "chars": len(text),
+                                   "would_skip": would_skip,
+                                   "error": err_text[:200]},
+                                  root=_exp_dir().parent):
+            _log_line({"ts": now.isoformat(), "warn": "sql-log-failed",
+                       "kind": "inject"})
+    except Exception as exc:
         _log_line({"ts": now.isoformat(), "warn": "sql-log-failed",
-                   "kind": "inject"})  # O7b：SQL 镜像账（jsonl 仍是主账；fail-open 可观测）
+                   "kind": "inject", "exc": repr(exc)[:200]})
+    # v3.0.1（审计 P1-2 收口 + 联邦化数据地基）：逐条注入账（每条目一行）。
+    # 此前 inject 行的 entry_ids 是列表，记分卡聚合要拆 JSON；逐条行带
+    # session_ctx（会话 cwd——「经验被注入到了哪个项目的会话」），供 D1-D5
+    # 记分卡与晋升器校准直接聚合。条目自身的 scope 字段属 detail 线（v3.0.1 §1.4），
+    # exp 前向 scope 留待后续批次；inject_id 串联回会话级 inject 行。
+    # fail-open：遥测失败只留痕，不影响注入返回值。
+    inject_id = f"{session_id}@{now.strftime('%Y%m%dT%H%M%S')}"
+    try:
+        session_ctx = _session_ctx(session_id)
+        for pos, eid in enumerate(entry_ids, 1):
+            if not sqlindex.log_event("inject_entry", session_id,
+                                      {"inject_id": inject_id, "entry_id": eid,
+                                       "position": pos, "session_ctx": session_ctx,
+                                       "chars": len(text)},
+                                      root=_exp_dir().parent):
+                _log_line({"ts": now.isoformat(), "warn": "sql-log-failed",
+                           "kind": "inject_entry", "entry_id": eid})
+                break  # 连续失败不再逐条重试（同库同因），会话级行已记账
+    except Exception as exc:
+        # 遥测段整体 fail-open：任何意外都不得吞掉注入返回值（jsonl 主账已在手）
+        _log_line({"ts": now.isoformat(), "warn": "inject-entry-telemetry-failed",
+                   "exc": repr(exc)[:200]})
     _log_line({"ts": now.isoformat(), "session": session_id, "injected": True,
                "entry_ids": entry_ids})
     return json.dumps({"context": text}, ensure_ascii=True)
