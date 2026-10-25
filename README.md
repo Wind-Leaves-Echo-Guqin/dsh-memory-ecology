@@ -2,7 +2,12 @@
 
 **让 agent 不再每次会话都失忆。**
 
-`MIT` · `Python 3.10+` · `核心零依赖` · `纯本地` · `多宿主` · `v3.1.0`
+[![version](https://img.shields.io/badge/version-v3.1.0-2ea043?style=flat-square)](VERSION.md)
+[![python](https://img.shields.io/badge/python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)]()
+[![hosts](https://img.shields.io/badge/宿主-Hermes%20%7C%20dsh%20%7C%20GUI%20%7C%20任意-8957e5?style=flat-square)]()
+[![core deps](https://img.shields.io/badge/核心依赖-0-success?style=flat-square)]()
+[![local](https://img.shields.io/badge/数据-纯本地-007ec6?style=flat-square)]()
+[![deletion](https://img.shields.io/badge/物理删除-代码层禁用-8957e5?style=flat-square)]()
 
 > 多数记忆方案在解决「**怎么召回**」；
 > 我们解决它前面那层——「**记忆的生命周期怎么治理**」。
@@ -84,20 +89,27 @@ agent 的记忆通常"只进不出、写入靠自觉、超限不可见"。本生
 
 ## 🏗 架构总览
 
+```mermaid
+flowchart TB
+    subgraph HOST ["宿主层"]
+        H["Hermes · dsh（EAC / cordis）· 观测舱 GUI · …任何能 spawn Python 子进程的宿主<br/><b>integrations/ 薄适配层——只读检索 + 追加候选，宿主不直接写记忆</b>"]
+    end
+
+    subgraph CORE ["治理核心 src/memory_ecology（零宿主依赖 · 规则驱动为主）"]
+        direction LR
+        G["<b>四道门</b><br/>① 写入整合 → ② 巩固/配额<br/>③ 蒸馏 → ④ 复核"]
+        N["<b>经验笔记本</b><br/>信号捕获 → 候选区 → 按需检索<br/>→ 人工兜底 → 技能"]
+        Q["<b>检索消费端</b><br/>memory_query / eco_note_query"]
+    end
+
+    R[("<b>数据根</b> MEMORY_ECOLOGY_ROOT<br/>memories/ · experiences/ · pending/ · 门日志")]
+
+    H -->|"spawn 子进程 · 只读查询"| CORE
+    CORE -->|"唯一写入方（单写入方纪律）"| R
 ```
-宿主层    Hermes │ dsh(EAC / cordis) │ 观测舱 GUI │ …任何能 spawn Python 子进程的宿主
-          integrations/ 薄适配层：只读检索 + 向 pending/ 追加候选（宿主不直接写记忆）
-                           │
-                           ▼
-数据根    MEMORY_ECOLOGY_ROOT：memories/ · experiences/ · pending/ · 门日志
-                           ▲
-                           │ 读写仅限唯一调度器（单写入方纪律）
-                           │
-治理核心   src/memory_ecology（零宿主依赖，规则驱动为主）
-          ├─ 四道门     ① 写入整合 → ② 巩固/配额 → ③ 蒸馏 → ④ 复核
-          ├─ 经验笔记本  信号捕获 → 候选区 → 按需检索 → 人工兜底 → 技能
-          └─ 检索消费端  memory_query / eco_note_query
-```
+
+- **宿主只做两件事**：spawn 子进程调检索 CLI、向 `pending/` 追加候选——记忆的读写大权只在治理核心手里。
+- **多宿主并存**：不同宿主把 `MEMORY_ECOLOGY_ROOT` 指向同一条数据根即可共享记忆与经验。
 
 ## 🚀 30 秒上手
 
