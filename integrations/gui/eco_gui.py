@@ -36,11 +36,18 @@ sys.path.insert(0, str(HERE))
 
 import collector  # noqa: E402
 import runner      # noqa: E402
+try:                       # v3.2.0 数据层（dsh 根）。缺失时新视图降级为"不可用"，不影响旧视图
+    import collector_v3_2_0  # noqa: E402
+except Exception:          # noqa: BLE001
+    collector_v3_2_0 = None
 
 STATIC = HERE / "static"
 V2_DIST = HERE.parent / "gui-v2" / "dist"  # gui-v2 构建产物（决策 28 预览版；dist 不入库，npm run build 重新生成）
 V22_DIST = HERE.parent / "gui-v2.2" / "dist"  # gui-v2.2（Sentri 设计系统版）构建产物；dist 不入库，npm run build 重新生成
-V23_DIST = HERE.parent / "gui-v2.3" / "dist"  # gui-v2.3（液态玻璃 / iOS 外壳版）构建产物；dist 不入库，npm run build 重新生成
+# 当前发布版：gui-v3（液态玻璃 / iOS 外壳），版本号与核心对齐 3.2.0。
+# 历史版本 gui-v2.3 目录保留（用户要求保留全部历史版本），但**不再作为发布入口**。
+V3_DIST = HERE.parent / "gui-v3" / "dist"
+V23_DIST = HERE.parent / "gui-v2.3" / "dist"  # 旧版，仅为兼容旧链接保留
 _MIME = {".html": "text/html", ".css": "text/css", ".js": "text/javascript",
          ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon",
          ".woff2": "font/woff2", ".json": "application/json"}
@@ -94,9 +101,43 @@ ACTIONS: dict[str, dict] = {
                      "impact": "清陈旧锁 + 重建过期索引（缓存与锁层面，不动数据本体）",
                      "rollback": "锁文件会由写入方自动重建",
                      "special": "firstaid"},
+
+    # ── v3.2.0 写动作（全部转发给核心 CLI，GUI 不碰任何文件）──
+    # 纪律（决策 D6）：GUI **永不写记忆内容**（不写 detail/MEMORY/user/pending、
+    # 不跑门改数据）。只允许圈配置、记忆包启停、幂等重建这三类。
+    "circle_write": {"name": "写入圈配置", "risk": "strong",
+                     "impact": "改变哪些启动目录归到哪个圈、每圈目录预算。下一次会话装配时生效。",
+                     "rollback": "核心写前自动备份 circles.json.bak-改圈前-*，可整体还原",
+                     "core": "circle_write"},
+    "pack_enable": {"name": "启用记忆包", "risk": "light",
+                    "impact": "把已登记的只读记忆包纳入目录（只读引用，内容不进本库）",
+                    "rollback": "再点停用即可；物理文件始终保留",
+                    "core": "pack_enable"},
+    "pack_disable": {"name": "停用记忆包", "risk": "strong",
+                     "impact": "目录里不再出现该包的内容（不影响本库记忆）",
+                     "rollback": "再点启用即可；物理文件始终保留",
+                     "core": "pack_disable"},
+    "core_maintain": {"name": "立即跑四门", "risk": "light",
+                     "impact": "整合候选 → 配额巩固 → 画像蒸馏 → 复核降级（全部幂等，写前自动备份）",
+                     "rollback": "各门写前都备份（MEMORY.md.bak-配额前-* / USER.md.bak-蒸馏前-*）",
+                     "core": "maintain"},
+    "core_materialize": {"name": "重建目录视图", "risk": "light",
+                        "impact": "重新生成 .eco/catalog/*.json（插件热路径只读它）；幂等",
+                        "rollback": "无需回滚（纯派生数据，可反复重生成）",
+                        "core": "materialize"},
 }
 
-_utf8_env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+# 子进程环境。**必须带根**：GUI 用 --root 起在沙盒上时，若子进程只看 os.environ，
+# 写动作会落到生产根（实测：沙盒 GUI 的"跑四门"写到了 %LOCALAPPDATA%\hermes）。
+# 而 `_utf8_env` 之前是 **dict 却被当函数调用**（`env=_utf8_env()`），
+# 于是 9 个写动作里有 7 个在 spawn 之前就 TypeError —— 写通道整体是死的。
+def _utf8_env() -> dict:
+    env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+    try:
+        env["MEMORY_ECOLOGY_ROOT"] = str(collector.data_root())
+    except Exception:  # noqa: BLE001 - 取不到根就退回原 env，不阻断
+        pass
+    return env
 
 
 def _log_error(path: str, tb: str) -> None:
@@ -198,6 +239,17 @@ def execute_action(name: str, params: dict, stage: str) -> dict:
             import first_aid
             res = first_aid.diagnose(fix=(stage == "run"))
             ok, out = True, json.dumps(res, ensure_ascii=False)
+        elif spec.get("core"):
+            # v3.2.0 动作：**统一转发给核心 CLI**（核心自己校验 + 备份 + 原子写）。
+            # GUI 绝不直接改 circles.json / pack 目录。
+            if collector_v3_2_0 is None:
+                ok, out = False, "collector_v3_2_0 未就绪（找不到 memory-ecology 核心）"
+            else:
+                res = collector_v3_2_0.run_action(spec["core"], params, stage)
+                ok = bool(res.get("ok"))
+                entry["cmd"] = res.get("cmd", "")
+                out = (res.get("output") or "") + (
+                    ("\n[error] " + str(res.get("error"))) if res.get("error") else "")
         elif spec.get("hermes"):
             argv = [a.format(**params) if "{" in a else a for a in spec["hermes"]]
             entry["cmd"] = f"hermes {' '.join(argv)}"
@@ -296,8 +348,12 @@ class Handler(BaseHTTPRequestHandler):
         """gui-v2.2（Sentri 版）构建产物——与旧 static 同款越界防护。"""
         self._serve_file(V22_DIST, rel)
 
+    def _v3_static(self, rel: str):
+        """gui-v3（液态玻璃版，当前发布版）构建产物——与旧 static 同款越界防护。"""
+        self._serve_file(V3_DIST, rel)
+
     def _v23_static(self, rel: str):
-        """gui-v2.3（液态玻璃版）构建产物——与旧 static 同款越界防护。"""
+        """gui-v2.3（历史版本，仅为兼容旧链接保留）。"""
         self._serve_file(V23_DIST, rel)
 
     def do_GET(self):
@@ -332,9 +388,17 @@ class Handler(BaseHTTPRequestHandler):
         path, qs = unquote(u.path), parse_qs(u.query)
 
         if path in ("/", "/index.html"):
-            return self._static("index.html")
+            # **默认入口 = 当前发布版**。以前指到旧的 static（v0.3 那一代），
+            # 于是"打开观测舱"看到的永远是旧界面——新版藏在 /v2.3/ 里没人知道。
+            return self._v3_static("index.html")
         if path.startswith("/static/"):
             return self._static(path[len("/static/"):])
+        # **当前发布版**：/v3/ → gui-v3。"/" 也指到它（默认入口 = 最新版）。
+        if path in ("/v3", "/v3/"):
+            return self._v3_static("index.html")
+        if path.startswith("/v3/"):
+            return self._v3_static(path[len("/v3/"):])
+        # 历史版本路由全部保留（用户要求保留全部历史版本，旧书签不能失效）
         if path == "/v2" or path == "/v2/":
             return self._v2_static("index.html")
         if path.startswith("/v2/"):
@@ -444,15 +508,54 @@ class Handler(BaseHTTPRequestHandler):
         if api == "firstaid":
             import first_aid
             return self._json({"ok": True, "result": first_aid.diagnose(fix=False)})
+
+        # ── v3.2.0 新视图（dsh 根；与上面的旧根视图**双根并存，绝不混算**）──
+        if api.startswith("v3.2.0/"):
+            return self._route_v3(api[len("v3.2.0/"):], one)
+
         if api == "healthz":
             sd = collector.scripts_dir()
+            v3_2_0 = collector_v3_2_0.meta() if collector_v3_2_0 is not None else {}
             return self._json({"ok": True,
                                "alive": True,
                                "data_root_ok": collector.data_root().is_dir(),
                                "search_cli_ready": bool(sd and (sd / "eco_note_query.py").is_file()),
+                               "core_ok": bool(v3_2_0.get("core_ok")),
+                               "core_root": v3_2_0.get("root", ""),
+                               "core_version": v3_2_0.get("version", ""),
                                "ts": datetime.now().isoformat(timespec="seconds")})
 
         return self._json({"ok": False, "error": "unknown api"}, 404)
+
+    # ── v3.2.0 路由（等值分发；单接口失败不炸整站）──
+    _V3_ROUTES = {
+        "meta": lambda m: m.meta(),
+        "stats": lambda m: m.stats(),
+        "circles": lambda m: m.circles(),
+        "circles/config": lambda m: m.circles_config(),
+        "gates": lambda m: m.gates(),
+        "inject": lambda m: m.inject(),
+        "cost": lambda m: m.cost(),
+        "packs": lambda m: m.packs(),
+        "firstaid": lambda m: m.firstaid(),
+    }
+
+    def _route_v3(self, sub: str, one):
+        if collector_v3_2_0 is None:
+            return self._json({"ok": False, "error": "core-not-found",
+                               "detail": "collector_v3_2_0 未就绪"}, 200)
+        fn = self._V3_ROUTES.get(sub)
+        if fn is None:
+            return self._json({"ok": False, "error": "unknown v3_2_0 api"}, 404)
+        try:
+            data = fn(collector_v3_2_0)
+        except Exception as exc:  # noqa: BLE001 - 单接口失败不炸整站
+            _log_error(self.path, traceback.format_exc())
+            return self._json({"ok": False,
+                               "error": "%s: %s" % (type(exc).__name__, str(exc)[:200])}, 200)
+        if not isinstance(data, dict):
+            data = {"value": data}
+        return self._json({"ok": bool(data.get("ok", True)), **data})
 
     # ── POST 路由（v0.3 写通道，仅 127.0.0.1）──
     def _route_post(self):
@@ -516,6 +619,10 @@ def main():
     ap.add_argument("--no-window", action="store_true", help="禁用 pywebview 窗口")
     ap.add_argument("--tray", action="store_true",
                     help="托盘常驻模式（需 pystray+Pillow；缺失时给出安装指引并正常起服务）")
+    ap.add_argument("--eco-root", dest="eco_root",
+                    help="v3.2.0 数据根（默认 MEMORY_ECOLOGY_ROOT > ~/.dsh/memory-eco-root > 布局默认）")
+    ap.add_argument("--eco-core", dest="eco_core",
+                    help="memory-ecology 核心包目录（默认自动探测）")
     a = ap.parse_args()
     # 端口策略：默认端口上已有本服务 → 只开窗口连过去；
     # 显式 --port 时维持旧语义（端口占用自动上扫，可并存多实例）
@@ -535,6 +642,8 @@ def main():
         return 0
 
     collector.set_root(a.root, a.scripts_dir)
+    if collector_v3_2_0 is not None:
+        collector_v3_2_0.set_root(a.eco_root, a.eco_core)
     port = find_port(a.port)
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = f"http://127.0.0.1:{port}"
