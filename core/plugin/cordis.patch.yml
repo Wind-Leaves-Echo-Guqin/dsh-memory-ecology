@@ -1,0 +1,7 @@
+# eco-memory bundle patch —— 一行 insert 挂载本插件。
+# 机器相关配置（数据根 / 解释器 / 核心路径）不写死在这里：在 profile 的
+# cordis.patch.yml 用同 id 条目覆盖，或设 ECO_HOME / ECO_PYTHON / ECO_CORE。
+- insert:
+    - id: eco-memory
+      name: 'eco-memory-dsh'
+      config: {}

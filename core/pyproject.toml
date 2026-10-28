@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dsh-memory-ecology"
+version = "3.2.1"
+description = "记忆生态 · 可移植核心：四道门（写入整合/配额巩固/画像蒸馏/复核降级）+ 圈 + 检索 + 只读记忆包。stdlib only，零宿主依赖。"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+keywords = ["memory", "ecology", "ai-agent", "governance", "dsh"]
+classifiers = [
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Operating System :: OS Independent",
+  "Topic :: Software Development :: Libraries",
+]
+
+[project.scripts]
+eco = "memory_ecology.cli:main"
+eco-memory = "memory_ecology.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["memory_ecology*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

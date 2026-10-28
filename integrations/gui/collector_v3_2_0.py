@@ -63,11 +63,17 @@ def find_eco_core() -> Path | None:
     here = Path(__file__).resolve()
     for rel in ("../../src", "../../../src"):
         cands.append((here.parent / rel).resolve())
+    # **同仓库 `core/`**：v3.2.1 起核心引擎并入主仓库这个子目录。
+    # 不加这条，"clone 下来就能用"是假的——GUI 会探测不到引擎，
+    # 新视图全部 404（真核心在 core/src，不在 src）。
+    for rel in ("../../core/src", "../../../core/src"):
+        cands.append((here.parent / rel).resolve())
     for base in (Path("D:/work"), Path.home()):
         # 新名字优先；旧名字留着兼容（老机器上目录可能还没改名）
         for name in ("dsh-memory-ecology", "eco-dsh"):
             cands.append(base / name / "src")
             cands.append(base / name)
+            cands.append(base / name / "core" / "src")
     for c in cands:
         try:
             if (c / "memory_ecology" / "cli.py").is_file() and _is_v3_2_0(c):

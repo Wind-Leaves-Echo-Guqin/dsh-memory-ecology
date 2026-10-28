@@ -1,0 +1,32 @@
+# 运行时产物（不是源码）
+**/__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# 插件依赖（dsh profile 用 link: 引入，不入库）
+node_modules/
+
+# 本地数据根 / 测试沙盒（绝不入库：里面有真实记忆）
+/.eco/
+/memories/
+/data/
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+
+# 备份（写前自动生成，可重新生成）
+*.bak-*
+*.bak
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

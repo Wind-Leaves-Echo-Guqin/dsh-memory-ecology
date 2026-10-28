@@ -1,0 +1,32 @@
+{
+  "name": "eco-memory-dsh",
+  "version": "3.2.1",
+  "description": "记忆生态 · dsh 独立插件：四道门（整合/巩固/蒸馏/复核）+ warm 目录 + 只读记忆包，事件驱动、零 cron、零配置。",
+  "type": "module",
+  "main": "index.js",
+  "engines": {
+    "dsh": ">=0.2.1-rc.2"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*",
+    "@deepseek-ai/dsh-system-prompt": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-system-prompt": {
+      "optional": true
+    }
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "test": "node test_plugin.mjs"
+  }
+}

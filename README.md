@@ -1,18 +1,45 @@
-# 🧠 Memory Ecology Compat · 记忆生态
+# 🧠 dsh-memory-ecology · 记忆生态
 
 **让 agent 不再每次会话都失忆。**
 
-`MIT` · `Python 3.10+` · `核心零依赖` · `纯本地` · `多宿主`
+`MIT` · `Python 3.11+` · `核心零依赖` · `纯本地` · `多宿主`
 
 > 多数记忆方案在解决「**怎么召回**」；
 > 我们解决它前面那层——「**记忆的生命周期怎么治理**」。
 
 源自 [memory-ecology](https://github.com/Wind-Leaves-Echo-Guqin/memory-ecology)（Hermes 版）。
-本仓库把**可移植核心**与**宿主适配层**分离，让 Hermes 之外的 agent（当前：dsh；规划：任意 CLI/MCP 宿主）
-复用同一套记忆生命周期治理与经验笔记本。
+本仓库把**可移植核心**与**宿主适配层**分离，让 Hermes 之外的 agent（当前：dsh）复用同一套记忆生命周期治理与经验笔记本。
+
+## 仓库结构（v3.2.1 起两层并存）
+
+| 目录 | 是什么 | 版本 |
+|---|---|---|
+| **`core/`** | **v3.2.0 核心引擎（唯一真源）**：四道门 + 多生态圈 + 只读记忆包 + 检索，纯 stdlib。dsh 插件本体（`core/plugin/`）也在这里 | **3.2.1** |
+| `src/memory_ecology/` | v3.1 治理核心（历史线，50 个 CLI 脚本）：写门/配额/蒸馏/复核/eco_note/向量缓存 | 3.1.0 |
+| `integrations/gui-v3/` | 观测舱当前发布版（v3.2.0，液态玻璃 / iOS 外壳，七新视图） | 3.2.0 |
+| `integrations/gui/` | 观测舱服务端（8788）+ v0.3 静态前端（历史） | — |
+| `integrations/hermes/` | Hermes 参考实现（state.db / cron 耦合件） | — |
+| `integrations/dsh/` | dsh 适配器（EAC + cordis） | — |
+
+> **为什么要两层**：`core/` 是重写版（14 个模块，`gates.py`/`ledger.py`/`packs.py`），
+> 与 `src/` 下的 v3.1（50 个脚本，`write_gate.py`/`eco_quota.py`）**实现完全不同**，
+> 只有 `__init__.py` / `similarity.py` 同名。直接覆盖会毁掉 v3.1 的 50 个脚本，
+> 所以并存而非替换。迁移完成后再合并。
+
+### 快速开始（核心引擎）
+
+```bash
+cd core
+python -m memory_ecology --root <数据根> init
+python -m memory_ecology --root <数据根> deposit --session s1 --text "要记住的事"
+python -m memory_ecology --root <数据根> gate all      # 顺跑四门
+python -m memory_ecology --root <数据根> materialize   # 生成目录视图
+python run_tests.py                                    # 全量测试
+```
 
 > ⚠️ **当前边界（先读这段再用）**
 > 1. **检索是词面级的，不是语义检索**：默认后端 difflib（字符级子串 + 词面打分），召回依赖关键词选择。
+
 >    v2.3.0 起带时间维（三档半连续衰减 + `--since/--until/--window` 发生时间过滤）与
 >    **零结果率观测**（`eco_retrieval_report.py` / GUI「检索质量」页签——换内核的在线证据）。
 >    v2.5.0 起**入口纪律统一**（编码/数据根/锁/目录，见 lib/cli_base.py） + 并发写入修复（同进程锁互斥、Windows 原子写重试）；

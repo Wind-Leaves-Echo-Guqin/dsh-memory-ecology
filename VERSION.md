@@ -1,5 +1,15 @@
 # Memory Ecology Compat · 版本
 
+- **v3.2.1**（2026-10-28）—— v3.2.0 核心引擎并入 `core/`（GitHub 上一直缺的就是它）
+  - **`core/` 新增**：v3.2.0 重写版核心的**唯一真源**（14 个模块 / 纯 stdlib / 零宿主依赖）——
+    四道门 `gates.py` + 账本 `ledger.py` + 存储与指纹 `store.py` + 圈与路由
+    `config.py`/`root.py` + 检索 `retrieve.py` + 只读记忆包 `packs.py` + dsh 插件本体 `plugin/`。
+  - **为什么并存不替换**：`core/`（14 模块）与 `src/memory_ecology/`（v3.1，50 个 CLI 脚本
+    `write_gate.py`/`eco_quota.py`）是**两套完全不同的实现**，只有 `__init__.py`/`similarity.py`
+    同名。直接覆盖会毁掉 v3.1 的 50 个脚本，所以放 `core/` 子目录；迁移完成后再合并。
+  - 版本号对齐 **3.2.1**（核心四处 + 主仓库 VERSION）；`core/run_tests.py` **7/7 全绿**。
+  - 修 `test_version_report_shape`：原硬编码 `"3.2.0"`，发版必红；改为断言「四处一致 + 形如 X.Y.Z」。
+
 - **v3.2.0**（2026-10-28）—— 观测舱 GUI v3.2.0（七视图）· 项目定名 dsh-memory-ecology
   - **观测舱新增 `integrations/gui-v3/`**（液态玻璃 / iOS 外壳，版本号与核心对齐 3.2.0）：
     在原有九视图之外新增七个——**四门实况** / 圈的视角 / 注入观测 / 记忆包 /
