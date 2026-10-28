@@ -54,13 +54,13 @@ python run_tests.py                                    # 全量测试
 >    已知问题与架构待办见 [ARCHITECTURE_TODO.md](ARCHITECTURE_TODO.md)。
 
 > 派生声明：本项目为原 memory-ecology（Hermes 单宿主版）的兼容衍生线，独立仓库、独立演进；
-> 自 v2.1.2 起**版本号同步**（当前 **v2.5.0**）；compat = 治理核心（四道门）＋检索消费端，
+> 自 v2.1.2 起**版本号同步**（当前 **v3.2.1**，核心引擎在 `core/`）；compat = 治理核心（四道门）＋检索消费端，
 > 捕获链（信号/提取/回填）为宿主树专属，移植路线见 ARCHITECTURE_TODO.md 第四节；
 > 本线只多出「多宿主化 + 观测舱 GUI」这一集成层。
 
 ## English TL;DR
 
-Memory Ecology Compat is the **multi-host derivative** of
+dsh-memory-ecology is the **multi-host derivative** of
 [memory-ecology](https://github.com/Wind-Leaves-Echo-Guqin/memory-ecology) — an agent memory/experience
 lifecycle governance toolkit that treats memories as an ecosystem: bounded, alive, and always reversible
 (four lifecycle gates + an experience notebook + quality gate evaluation, rule-first — LLM participates
