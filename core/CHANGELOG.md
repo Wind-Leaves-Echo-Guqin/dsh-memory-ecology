@@ -226,6 +226,13 @@
 | `tests/test_gui.py` | ~~38~~ | **已归档** | 那是错目标那套 GUI 的测试（`_archive/gui-wrong-target-v0.4/`） |
 
 > 两个仓库各自 `python run_tests.py`：**dsh-memory-ecology 7/7**、**memory-ecology-compat 57/57**，全绿。
+>
+> **读表提醒（2026-10-30 审计补充）**：`所在仓库` 列写「兼容版」的三行
+> （`test_gui_v3_2_0.py` / `test_gui_contract.py` / 已归档的 `test_gui.py`）**不在本仓库**——
+> 它们属于 memory-ecology-compat那棵树。本仓库 `core/tests/` 实际只有 6 个文件
+> （`test_core` / `test_compat` / `test_regressions` / `test_concurrency` / `test_stability` /
+> `test_mutation`），加上 `plugin/test_plugin.mjs` 共 7 组。此前仅靠"所在仓库"这一列区分，
+> 容易让读者以为本仓库也有 GUI 测试，故显式说明。
 
 **变异测试是这套测试体系的信任基础**：第一轮跑出 5 个存活 + 1 个无效，说明有 5 条断言是
 同义反复（比如"BOM 用例"用 `assertIn` 断言，BOM 残留时子串仍匹配，等于没测）。补强后

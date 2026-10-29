@@ -33,9 +33,9 @@
   - **`core/` 新增**：v3.2.0 重写版核心的**唯一真源**（14 个模块 / 纯 stdlib / 零宿主依赖）——
     四道门 `gates.py` + 账本 `ledger.py` + 存储与指纹 `store.py` + 圈与路由
     `config.py`/`root.py` + 检索 `retrieve.py` + 只读记忆包 `packs.py` + dsh 插件本体 `plugin/`。
-  - **为什么并存不替换**：`core/`（14 模块）与 `src/memory_ecology/`（v3.1，50 个 CLI 脚本
+  - **为什么并存不替换**：`core/`（14 模块）与 `src/memory_ecology/`（v3.1，33 个 CLI 脚本
     `write_gate.py`/`eco_quota.py`）是**两套完全不同的实现**，只有 `__init__.py`/`similarity.py`
-    同名。直接覆盖会毁掉 v3.1 的 50 个脚本，所以放 `core/` 子目录；迁移完成后再合并。
+    同名。直接覆盖会毁掉 v3.1 的 33 个脚本，所以放 `core/` 子目录；迁移完成后再合并。
   - 版本号对齐 **3.2.1**（核心四处 + 主仓库 VERSION）；`core/run_tests.py` **7/7 全绿**。
   - 修 `test_version_report_shape`：原硬编码 `"3.2.0"`，发版必红；改为断言「四处一致 + 形如 X.Y.Z」。
 
@@ -50,7 +50,9 @@
   - **四门实况区分五种状态**：`ok` / `dead`（账本一行都没有）/ `idle-spin`（有行全是心跳）/
     `starved`（有动作但期望的那种从没成功过）/ `stale`。旧界面只能看出第一种，
     而"有行但没产出"正是治理停摆两个月的伪装形态。
-  - **写动作只有 5 个**（circle_write / pack_enable / pack_disable / maintain / materialize），
+  - **写动作共 14 个**（quota_extrude / gate_integrate / note_adopt / skill_breed / cron_rerun /
+    cron_pin / health_run / index_rebuild / firstaid_fix / circle_write / pack_enable / pack_disable /
+    core_maintain / core_materialize），
     全部转发核心 CLI 并走确认闸门，**没有任何删除记忆的动作**。
   - **修两个挡路的旧缺陷**：① `_utf8_env` 是 dict 却被当函数调用（9 个写动作里 7 个在
     spawn 前就 TypeError，写通道整体是死的）；② `--root` 不传导给子进程（沙盒 GUI 的写会落到生产根）。

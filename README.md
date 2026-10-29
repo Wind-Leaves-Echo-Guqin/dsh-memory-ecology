@@ -108,7 +108,7 @@ flowchart TB
     end
 
     R[("<b>数据根</b><br/>memories/ · .eco/ · 门账本")]
-    LEG["src/memory_ecology<br/>v3.1 历史线（50 个 CLI 脚本）"]
+    LEG["src/memory_ecology<br/>v3.1 历史线（33 个 CLI 脚本）"]
 
     HOST -->|"子进程 · JSON 进 JSON 出"| CORE
     CORE -->|"唯一写入方（单写入方纪律）"| R
@@ -189,7 +189,9 @@ python integrations/gui/eco_gui.py
 > 它们刻意不对齐：GUI 是可选的人类观测界面，改动节奏与核心无关。
 > README 里凡是裸版本号若未带上下文，一律指①。
 
-纯离线、仅绑 `127.0.0.1`；写动作只有 5 个（圈配置 / 记忆包开关 / 维护 / 物化），
+纯离线、仅绑 `127.0.0.1`；写动作共 **14 个**（配额挤出 / 写入门整合 / 经验采纳 / 技能繁育 /
+cron 重跑 / cron 钉住 / 体检 / 索引重建 / 急救修复 / 圈配置 / 记忆包开 / 记忆包关 /
+核心维护 / 物化），
 全部转发核心 CLI 并走确认闸门，**没有任何删除记忆的动作**。
 Hermes 专属动作（cron 重跑等）在未安装 Hermes 的机器上降级为"可复制命令"。
 
@@ -205,7 +207,7 @@ Hermes 专属动作（cron 重跑等）在未安装 Hermes 的机器上降级为
 | `core/src/memory_ecology/` | 14 个模块：`gates.py` / `ledger.py` / `store.py` / `paths.py` / `retrieve.py` / `packs.py` / `config.py` / `root.py` / `similarity.py` / `measure.py` / `version.py` / `cli.py` | 3.2.2 |
 | `core/tests/` | 核心 / 兼容与数据安全 / 并发 / 稳定性 / 变异（`run_tests.py` 7 组） | — |
 | `core/docs/` | `ARCHITECTURE.md`（含 7 blocker + 11 major 缺陷清单）、`OPS.md`（零运维手册） | — |
-| `src/memory_ecology/` | v3.1 治理核心（历史线，50 个 CLI 脚本）：写门/配额/蒸馏/复核/eco_note/向量缓存 | 3.1.0 |
+| `src/memory_ecology/` | v3.1 治理核心（历史线，33 个 CLI 脚本 + 17 个测试）：写门/配额/蒸馏/复核/eco_note/向量缓存 | 3.1.0 |
 | `integrations/hermes/` | Hermes 参考实现（state.db / cron 耦合件） | — |
 | `integrations/dsh/` | dsh 适配器（`package/`＝EAC；`package-cordis/`＝官方桌面版 cordis） | — |
 | `integrations/gui-v3/` | 观测舱当前发布版（液态玻璃 / iOS 外壳，七新视图） | 3.2.0 |
@@ -214,8 +216,8 @@ Hermes 专属动作（cron 重跑等）在未安装 Hermes 的机器上降级为
 | `tools/` | `sync_trees_check.py`（双树漂移比对） | — |
 
 > **为什么要两层**：`core/` 是重写版（14 个模块，`gates.py`/`ledger.py`/`packs.py`），
-> 与 `src/` 下的 v3.1（50 个脚本，`write_gate.py`/`eco_quota.py`）**实现完全不同**，
-> 只有 `__init__.py` / `similarity.py` 同名。直接覆盖会毁掉 v3.1 的 50 个脚本以及依赖它们的
+> 与 `src/` 下的 v3.1（33 个脚本，`write_gate.py`/`eco_quota.py`）**实现完全不同**，
+> 只有 `__init__.py` / `similarity.py` 同名。直接覆盖会毁掉 v3.1 的 33 个脚本以及依赖它们的
 > `integrations/hermes` / `integrations/dsh`，所以并存而非替换。
 
 ### 双树收敛计划（**不是"永久并存"**）
@@ -330,8 +332,8 @@ node test_cordis.mjs                  # 官方桌面版：纯函数 + apply() �
 
 **结论**：不合并成"一棵树"，而是让 `core/` 吸收 `src/` 的缺口，齐平后直接删 `src/`。
 
-**为什么不现在做**：两棵树差的是**能力面**，不是结构。`core/` 14 个模块 / 16 个子命令，
-`src/` 33 个模块 / 50 个脚本；`core/` 目前**没有** v3.1 的写入门（`write_gate`）、
+**为什么不现在做**：两棵树差的是**能力面**，不是结构。`core/` 14 个模块 / 17 个子命令，
+`src/` 33 个 CLI 脚本（另有 17 个测试）；`core/` 目前**没有** v3.1 的写入门（`write_gate`）、
 golden 评测链路、`eco_health_check` 等。直接合并 = 功能回退。
 
 **顺序（每步都可独立验证）**：
