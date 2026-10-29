@@ -243,7 +243,7 @@ def run_arm_eval(name: str, ctx_map: dict, qs, client, results: list):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--repo", default=r"<USER_HOME>\memory-ecology-compat")
+    ap.add_argument("--repo", default=str(Path(__file__).resolve().parent.parent))
     ap.add_argument("--out", default=str(Path(__file__).parent / "results"))
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--sessions", type=int, default=30)

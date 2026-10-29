@@ -13,7 +13,7 @@
 全程零 LLM 零网络；确定性种子。
 
 用法:
-  python ablation.py --repo "<USER_HOME>/memory-ecology-compat" \
+  python ablation.py --repo "<仓库根>" \
       --out results --seeds 42,43,44,45,46 --sessions 30 --cands 10 --arms raw,g1,full
 """
 from __future__ import annotations
@@ -417,7 +417,7 @@ def run_arm(repo: Path, arm: str, seed: int, sessions: int, cands: int, keep: bo
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--repo", default=r"<USER_HOME>\memory-ecology-compat")
+    ap.add_argument("--repo", default=str(Path(__file__).resolve().parent.parent))
     ap.add_argument("--out", default=str(Path(__file__).parent / "results"))
     ap.add_argument("--seeds", default="42,43,44,45,46")
     ap.add_argument("--sessions", type=int, default=30)

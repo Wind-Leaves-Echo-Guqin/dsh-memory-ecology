@@ -38,7 +38,7 @@ import tempfile
 from pathlib import Path
 
 
-HERMES = Path(r"<USER_HOME>\AppData\Local\hermes")
+HERMES = Path(os.environ.get("MEMORY_ECOLOGY_HOME") or (Path.home() / "AppData" / "Local" / "hermes"))
 DB = HERMES / "eco.db"
 LOGDIR = HERMES / "memories" / "gate_log"
 
@@ -168,7 +168,9 @@ def main() -> int:
         text = render(day, by_date[day])
         # 原子写（复用项目自己的实现，保证与生产一致）
         try:
-            sys.path.insert(0, r"<USER_HOME>\memory-ecology-compat\src\memory_ecology")
+            # 相对本脚本定位（原为硬编码旧发布树 memory-ecology-compat，
+            # 2026-10-29 该目录已改名/归档，硬编码会静默降级到 except 分支）
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "memory_ecology"))
             from lib.fs import atomic_write
             atomic_write(p, text)
         except Exception:
