@@ -102,15 +102,16 @@ DESKTOP = Path.home() / "Desktop"
 SCORE_HISTORY = DESIGNS_DIR / "eco_score_history.json"
 
 # v0.8 合法状态组合矩阵（status \ fate）——未显式声明的默认 active/retained
-LEGAL_MATRIX = {
-    ("active", "retained"): True,
-    ("dormant", "retained"): True,
-    ("dormant", "superseded"): True,
-    ("dormant", "archived"): True,
-    ("frozen", "retained"): True,
-    ("frozen", "archived"): True,
-    ("candidate", "retained"): True,  # 2026-10-04 拍板：与 eco_state.VALID 对齐（breed 产物为合法持久态）
-}
+#
+# v3.2.3（2026-10-29）**销 D 双源**：这张表以前是手抄的另一份，与
+# `eco_state.VALID` 各写各的（内容虽碰巧一致，但再改一处就必然漂移）。
+# 现在只保留一个真源：`eco_state.VALID`。这里做的是**形状转换**，不是复制——
+# `LEGAL_MATRIX` 是 (status, fate) -> True 的映射（供 `(st, fa) not in LEGAL_MATRIX`
+# 这种成员判断用），`eco_state.VALID` 是集合。转换在导入期完成，两边永远同步。
+from eco_state import VALID as _VALID_STATE_FATE  # noqa: E402 - 同目录模块，脚本直跑时由 sys.path 兜底
+
+LEGAL_MATRIX = {pair: True for pair in _VALID_STATE_FATE}
+
 REQUIRED_FIELDS = ["name", "description", "version", "status", "fate", "domain", "environment"]
 CONDITIONAL_FIELDS = {
     "merged_into": lambda s: s["fate"] == "merged",

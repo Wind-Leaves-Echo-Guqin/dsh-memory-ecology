@@ -16,8 +16,15 @@
 
 ### 仍然登记在案的债
 - **P1-2 注入审计**：inject_events 仅 3 行——a2 批次（inject_gate shadow 接线 + last_hit 回写 + D1-D5 记分卡），证据驱动晋升的前置。
-- **disputed_by 无消费方**：F-2/红队 round3 产出的大量 DISPUTE 标记无 LLM 复核闭环——a3 批次。
-- **门④ last_verified 从不刷新**（最活跃记忆反被归档）：与 a2 last_hit 联动。
+- ~~**disputed_by 无消费方**：F-2/红队 round3 产出的大量 DISPUTE 标记无 LLM 复核闭环——a3 批次。~~
+  → **2026-10-29 部分销账**：消费方已补（`memory_query --disputes` / `--resolve`，
+  `list_disputes()` / `resolve_dispute()`），标记不再"死"在库里、有人工终审入口。
+  **仍未做的**：自动 LLM 复核裁决（a3 批次原定内容）——现在只是**人工闭环**，不是自动闭环。
+- ~~**门④ last_verified 从不刷新**（最活跃记忆反被归档）：与 a2 last_hit 联动。~~
+  → **2026-10-29 销账（v3.1 线）**：`eco_review.refresh_last_verified()` + `refresh_lv` 通路，
+  窗口内被使用的条目复核戳随之前进（有 5 条断言锁死，含"只判 actions 测不出回退"的说明）。
+  `core/` 线此前已有等价实现（`used_recently` → 刷戳 + dormant 复活）。
+  **注意口径**：本条过去被误记为"仍未做"，实际 `core/` 修了而 v3.1 没修——判"修没修"要先定树。
 - **看门狗无推送通道**（仅日志+桌面 txt+退出码）：a4。
 - **经验线 .watermark 冻结**（2026-08-07）：a4 诊断，注意只动经验线。
 - **水位贴顶拉锯**（MEMORY.md 2343/~2550）：指针化试点（a4）。

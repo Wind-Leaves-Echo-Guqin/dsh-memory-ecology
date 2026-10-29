@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""生态两轴状态机模块（memory-skill-ecosystem 项目 4.1 节）。
+r"""生态两轴状态机模块（memory-skill-ecosystem 项目 4.1 节）。
 
 status（活性轴，可逆）: active | dormant | frozen
 fate（存续轴，不可逆但可回溯）: retained | superseded | merged | archived

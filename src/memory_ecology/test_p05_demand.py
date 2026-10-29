@@ -144,13 +144,21 @@ class TestUseDrivenDormancy(unittest.TestCase):
         self._td = tempfile.TemporaryDirectory()
         self.detail = Path(self._td.name) / "detail"
         self.detail.mkdir(parents=True)
+        self.archive = Path(self._td.name) / "archive"
+        self.archive.mkdir(parents=True)
 
     def tearDown(self):
         self._td.cleanup()
 
     def _scan(self) -> list[dict]:
+        """只取**降级/归档**动作（v3.2.3 起 actions 也含"只刷新复核戳"的条目）。
+
+        历史上 actions 等于"要改状态的条目"，语义单一；v3.2.3 让"只推进
+        last_verified"的条目也进来（否则刷新根本不会落盘）。于是这个 helper 把
+        "要改状态"的口径显式写出来，老用例的意图（不降级）保持不变。
+        """
         actions, files, failures = er.scan_detail(self.detail)
-        return actions
+        return [a for a in actions if a["action"]]
 
     def test_recent_hit_exempts_from_dormancy(self):
         recent = (TODAY - datetime.timedelta(days=2)).isoformat()
@@ -159,6 +167,70 @@ class TestUseDrivenDormancy(unittest.TestCase):
             encoding="utf-8")
         actions = self._scan()
         self.assertEqual(actions, [], "窗口内有命中 → 不降级")
+
+    def test_recent_hit_advances_last_verified(self):
+        """v3.2.3（2026-10-29）：窗口内被使用 → `last_verified` 必须前进。
+
+        这条是「门④ last_verified 从不刷新」的回归锁。旧实现只用 last_hit 把条目
+        **这一轮**挪出超期名单，复核戳纹丝不动，于是用户一旦停用超过阈值天数，
+        条目立刻按"几个月没核验"被降级——恰好违背"最活跃的不先归档"这个核心承诺。
+
+        断言必须落在**写盘后的文件内容**上，不能只断言 actions：只挪名单的那版
+        同样返回 []，从 actions 根本看不出区别。
+        """
+        recent = (TODAY - datetime.timedelta(days=2)).isoformat()
+        p = self.detail / "被使用且复核戳该前进.md"
+        p.write_text(
+            _entry_md("被使用且复核戳该前进", "正文", last_verified="2026-01-01", last_hit=recent),
+            encoding="utf-8")
+        actions, _, _ = er.scan_detail(self.detail)
+        self.assertEqual([a for a in actions if a["action"]], [], "窗口内有命中 → 不降级")
+        self.assertTrue(any(a["refresh_lv"] for a in actions), "窗口内被使用却没标 refresh_lv")
+        er.apply_detail_actions(actions, self.archive, dry_run=False)
+        fields, _ = parse_frontmatter_strict(p.read_text(encoding="utf-8"))
+        self.assertEqual(fields["last_verified"], TODAY.isoformat(),
+                         "窗口内被使用却没推进 last_verified —— 复核戳与'最近被用到'脱节")
+
+    def test_refresh_lv_is_recorded_on_the_record(self):
+        """刷新意图要能被上层数出来（报告口径），否则等于静默行为。"""
+        recent = (TODAY - datetime.timedelta(days=2)).isoformat()
+        (self.detail / "需刷新条目.md").write_text(
+            _entry_md("需刷新条目", "正文", last_verified="2026-01-01", last_hit=recent),
+            encoding="utf-8")
+        (self.detail / "今天已核验.md").write_text(
+            _entry_md("今天已核验", "正文", last_verified=TODAY.isoformat(), last_hit=recent),
+            encoding="utf-8")
+        _, files, _ = er.scan_detail(self.detail)
+        flags = {f["slug"]: f["refresh_lv"] for f in files}
+        self.assertTrue(flags["需刷新条目"], "复核戳是旧的 → 应标 refresh_lv")
+        self.assertFalse(flags["今天已核验"], "已是今天 → 不该重复写盘（幂等）")
+
+    def test_refresh_last_verified_helper_edges(self):
+        """`refresh_last_verified` 的四个易错形态（与 rewrite_status 同口径）。"""
+        today = TODAY.isoformat()
+        # ① 幂等：已是今天 → changed=False，内容不变
+        raw = "---\nname: a\nlast_verified: %s\n---\nb\n" % today
+        out, changed = er.refresh_last_verified(raw)
+        self.assertFalse(changed)
+        self.assertEqual(out, raw)
+        # ② 缺字段 → 补在首个 --- 之后
+        out, changed = er.refresh_last_verified("---\nname: b\nstatus: active\n---\nb\n")
+        self.assertTrue(changed)
+        self.assertIn("last_verified: %s" % today, out)
+        # ③ 键名带空格仍要命中（P0-7 同类坑）
+        out, changed = er.refresh_last_verified(
+            "---\nname: c\nlast_verified : 2026-01-01\n---\nb\n")
+        self.assertTrue(changed)
+        self.assertIn("last_verified: %s" % today, out)
+        # ④ 正文里的 --- 之后的 last_verified 绝不能被改
+        raw = ("---\nname: d\nlast_verified: 2026-01-01\n---\n---\n"
+               "last_verified: 1999-01-01\n")
+        out, changed = er.refresh_last_verified(raw)
+        self.assertTrue(changed)
+        self.assertIn("last_verified: 1999-01-01", out, "正文里的伪字段被误改了")
+        # ⑤ BOM 必须原样保留
+        out, _ = er.refresh_last_verified("\ufeff---\nname: e\nlast_verified: 2026-01-01\n---\n")
+        self.assertTrue(out.startswith("\ufeff"), "BOM 被吞了")
 
     def test_old_hit_still_expires(self):
         old = (TODAY - datetime.timedelta(days=200)).isoformat()
@@ -211,6 +283,128 @@ class TestRevive(MemoryQueryBase):
         finally:
             conn.close()
         self.assertIsNotNone(row)
+
+
+class TestDisputeConsumer(MemoryQueryBase):
+    """v3.2.3（2026-10-29）销「disputed_by 无消费方」。
+
+    债的形态：write_gate 的 DISPUTE 路径只写 `disputed_by`/`disputed_at`/
+    `disputed_reason` 三个字段，**没有任何读方** —— 冲突被检测出来就悬在那里，
+    两条矛盾的记忆同时留在库里、都还能被检索到。本组锁定刚补上的消费方。
+    """
+
+    def _disputed(self, slug: str, by: str = "新值条目", when: str = "2026-10-01"):
+        fm = _entry_md(slug, "旧的说法", status="active")
+        fm = fm.replace("---\n\n旧的说法", "")
+        lines = ["---", f"name: {slug}", "type: semantic", "status: active",
+                 "occurrences: 3", "session_count: 2",
+                 "last_verified: 2026-09-01", "last_seen: 2026-09-01",
+                 f"disputed_by: {by}", f"disputed_at: {when}",
+                 "disputed_reason: 同槽位不同值", "---", "", "旧的说法", ""]
+        return self._write(self.detail, slug, "\n".join(lines))
+
+    def test_list_disputes_finds_marks(self):
+        self._disputed("备份保留七天")
+        self._write(self.detail, "无关条目", _entry_md("无关条目", "正文"))
+        rows = mq.list_disputes(self.detail)
+        self.assertEqual(len(rows), 1, "带 disputed_by 的条目没被列出")
+        self.assertEqual(rows[0]["slug"], "备份保留七天")
+        self.assertEqual(rows[0]["disputed_by"], "新值条目")
+        self.assertEqual(rows[0]["disputed_reason"], "同槽位不同值")
+
+    def test_list_disputes_empty_is_not_an_error(self):
+        self._write(self.detail, "干净条目", _entry_md("干净条目", "正文"))
+        self.assertEqual(mq.list_disputes(self.detail), [])
+
+    def test_resolve_kept_clears_marks_but_keeps_content(self):
+        p = self._disputed("备份保留七天")
+        ok, msg = mq.resolve_dispute("备份保留七天", keep=True, reason="人工确认本条正确",
+                                     detail_dir=self.detail, db=self.db)
+        self.assertTrue(ok, msg)
+        fields, body = parse_frontmatter_strict(p.read_text(encoding="utf-8"))
+        for k in ("disputed_by", "disputed_at", "disputed_reason"):
+            self.assertNotIn(k, fields, f"{k} 没被清掉 —— 争议仍会一直悬着")
+        self.assertEqual(fields["dispute_verdict"], "kept")
+        self.assertEqual(fields["status"], "active", "保留判定不该改动 status")
+        self.assertIn("旧的说法", body, "终审不得丢内容（宁可重复，不可丢内容）")
+
+    def test_resolve_superseded_sends_to_dormant_without_deleting(self):
+        p = self._disputed("备份保留七天")
+        ok, msg = mq.resolve_dispute("备份保留七天", keep=False,
+                                     detail_dir=self.detail, db=self.db)
+        self.assertTrue(ok, msg)
+        fields, body = parse_frontmatter_strict(p.read_text(encoding="utf-8"))
+        self.assertEqual(fields["status"], "dormant")
+        self.assertEqual(fields["fate"], "superseded")
+        self.assertEqual(fields["superseded_by"], "新值条目")
+        self.assertTrue(p.exists(), "终审也不该物理删除条目")
+        self.assertIn("旧的说法", body)
+
+    def test_resolve_writes_ledger(self):
+        import sqlite3
+        self._disputed("有争议的条目")
+        mq.resolve_dispute("有争议的条目", keep=True, detail_dir=self.detail, db=self.db)
+        conn = sqlite3.connect(str(self.db))
+        try:
+            row = conn.execute(
+                "SELECT action, slug FROM review_log "
+                "WHERE action='dispute-resolve' AND slug='有争议的条目'").fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row, "终审没有留痕 —— 争议了结必须可审计")
+
+    def test_refresh_entries_do_not_crash_report_and_log(self):
+        """v3.2.3 回归锁：`detail_actions` 混入"无 action"条目后，
+        `build_report()` 与账本循环原来直接 `act, reason = r['action']` → TypeError。
+
+        独立审查抓到的正是这里：单元层面只测 `apply_detail_actions` 全绿，
+        但真实跑 `eco_review.py` 会在**生成报告**那一步崩。所以这条必须同时走
+        `build_report` 与账本路径，而不是只看 actions。
+        """
+        recent = (TODAY - datetime.timedelta(days=2)).isoformat()
+        self.detail.mkdir(parents=True, exist_ok=True)
+        (self.detail / "被使用条目.md").write_text(
+            _entry_md("被使用条目", "正文", last_verified="2026-01-01", last_hit=recent),
+            encoding="utf-8")
+        actions, files, _ = er.scan_detail(self.detail)
+        self.assertTrue(any(a["refresh_lv"] and not a["action"] for a in actions),
+                        "前提不成立：这里应当有一条'只刷新'的条目")
+        # 崩点 1：报告生成
+        report = er.build_report(TODAY.isoformat(), actions, [], [], files, 0)
+        self.assertIn("refresh_lv", report, "报告里没有把刷新动作标出来")
+        # 崩点 2：账本条目构造（_run 里的循环，抽成同样形态验证）
+        entries = []
+        for r in actions:
+            if not r["action"]:
+                act, reason = "refresh_lv", "x"
+            else:
+                act, reason = r["action"]
+            entries.append((r["slug"], act))
+        self.assertIn(("被使用条目", "refresh_lv"), entries)
+
+    def test_resolve_on_clean_entry_is_refused(self):
+        self._write(self.detail, "干净条目", _entry_md("干净条目", "正文"))
+        ok, msg = mq.resolve_dispute("干净条目", detail_dir=self.detail, db=self.db)
+        self.assertFalse(ok, "没有争议标记却报成功 = 静默假成功")
+        self.assertIn("无需处理", msg)
+
+    def test_resolve_refuses_path_traversal(self):
+        """`--resolve ../evil` 曾能改写 detail/ 之外的任意 .md（实测确认）。
+
+        `slug` 被直接拼进 `detail_dir / f"{slug}.md"`；只要越界目标文件真实存在，
+        `../` 就生效。这条用例把"越界必须被拒"钉死——注意要让目录外文件**真的
+        带 disputed_by 标记**，否则旧代码会因为"没有标记"而拒绝，测试会假绿。
+        """
+        outside = self.root / "outside.md"
+        outside.write_text(
+            "---\nname: evil\nstatus: active\ndisputed_by: x\n"
+            "disputed_at: 2026-10-01\n---\n危险内容\n", encoding="utf-8")
+        before = outside.read_text(encoding="utf-8")
+        for bad in ("../outside", "..\\outside", "a/../../outside"):
+            ok, _msg = mq.resolve_dispute(bad, detail_dir=self.detail, db=self.db)
+            self.assertFalse(ok, "%r 竟然被接受了" % bad)
+        self.assertEqual(outside.read_text(encoding="utf-8"), before,
+                         "detail/ 之外的文件被改写了 —— 路径穿越")
 
 
 if __name__ == "__main__":

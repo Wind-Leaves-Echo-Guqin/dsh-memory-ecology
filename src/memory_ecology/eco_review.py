@@ -110,6 +110,63 @@ def days_display(days) -> str:
     return str(days) if days is not None else '未知(视为超期)'
 
 
+def refresh_last_verified(raw: str, when: str | None = None) -> tuple[str, bool]:
+    """把 frontmatter 里的 `last_verified` 推进到今天，**不动 status**。
+
+    v3.2.3（2026-10-29）新增，销「门④ last_verified 从不刷新」这条债。
+
+    为什么需要单独一个函数：`rewrite_status()` 只在**命中 status 行**时返回
+    changed=True，而"条目在窗口内被用过"这种情况 status 不需要改（active 还是
+    active），于是它没法用来刷新复核戳。
+
+    为什么必须修：整套设计的承诺是"最活跃的记忆不会先被归档"，而归档判据看的是
+    `last_verified`。原来的实现只用 `last_hit` 把条目**这一次**挪出超期名单，
+    却从不把复核戳往前推——于是每轮复核都要靠上一次命中反复救它，一旦用户隔了
+    阈值天数没用它，它立刻按"几个月没核验"被降级。**"最后核验时间"与"最近被用到"
+    是两回事，这正是反向 bug 的根**。被使用即视为已验证，复核戳应当随之前进。
+
+    返回 (新内容, changed)。changed=False 表示已经是今天（幂等，不产生无谓写盘）。
+    """
+    today = when or date.today().isoformat()
+    original = raw          # 幂等分支要原样返回（含原 BOM），不能重新拼接
+    bom = ''
+    if raw.startswith('\ufeff'):
+        bom = '\ufeff'
+        raw = raw[len(bom):]
+    lines = raw.splitlines(keepends=True)
+    fence = 0
+    for i, ln in enumerate(lines):
+        stripped = ln.rstrip('\r\n').strip()
+        if fence < 2 and stripped == '---':
+            fence += 1
+            continue
+        if fence != 1 or ':' not in stripped:
+            continue
+        key = stripped.split(':', 1)[0].strip()
+        if key != 'last_verified':
+            continue
+        if stripped.split(':', 1)[1].strip() == today:
+            # 已是今天：**返回原始入参**（含原 BOM），不重新拼接。
+            # 早期写法是 `bom + raw`，会把 BOM 拼在已去 BOM 的正文前，
+            # 与调用方手里那份"带 BOM 原文"不是同一份 → 返回值不自洽。
+            # changed=False 时调用方不写盘，所以没造成实际损坏，但语义必须干净。
+            return original, False
+        indent = ln[:len(ln) - len(ln.lstrip())]
+        lines[i] = f"{indent}last_verified: {today}{line_ending(ln) or chr(10)}"
+        return bom + ''.join(lines), True
+    # 完全没有 last_verified 行：补在第一个 --- 之后，保证后续判定有戳可读
+    idx = None
+    for i, ln in enumerate(lines):
+        if ln.strip() == '---':
+            idx = i
+            break
+    if idx is None:
+        return bom + ''.join(lines), False
+    ending = line_ending(lines[idx]) or chr(10)
+    lines.insert(idx + 1, f"last_verified: {today}{ending}")
+    return bom + ''.join(lines), True
+
+
 def expiry_threshold(mtype) -> int:
     return EXPIRY_THRESHOLDS.get((mtype or '').strip().lower(), DEFAULT_THRESHOLD)
 
@@ -240,14 +297,24 @@ def scan_detail(detail_dir: Path):
             'status': status or 'unknown', 'last_verified': fields.get('last_verified') or '',
             'days': days, 'threshold': threshold, 'overdue': overdue,
             'last_hit': fields.get('last_hit') or '',
-            'body': body, 'raw': raw, 'action': None,
+            'body': body, 'raw': raw, 'action': None, 'refresh_lv': False,
         }
+        # v3.2.3：窗口内被用到 → 复核戳前进（"被使用即视为已验证"）。
+        # 只对**未超期**的条目做，避免与降级动作抢同一次写盘；
+        # 超期但被使用救回的条目仍按"暂缓"处理，复核戳留到下一轮（它这轮没被降级）。
+        if use_note and not overdue and rec['last_verified'] != TODAY.isoformat():
+            rec['refresh_lv'] = True
         if status == 'active' and overdue:
             rec['action'] = ('mark_dormant', reason)
         elif status == 'dormant' and overdue:
             rec['action'] = ('archive', reason)
         files.append(rec)
-        if rec['action']:
+        # v3.2.3：`refresh_lv` 的条目也要进 actions，否则 apply_detail_actions
+        # 收不到它 → 复核戳永远不前进（正是本条债的形态）。
+        # 兼容性：带 action 的条目形态完全不变（仍是有 action 的两元组），
+        # 只有"无 action 且需刷新"的条目是新增形态，调用方按 `r['action']` 取值的
+        # 地方都已改成先判空。
+        if rec['action'] or rec['refresh_lv']:
             actions.append(rec)
     return actions, files, failures
 
@@ -255,6 +322,24 @@ def scan_detail(detail_dir: Path):
 def apply_detail_actions(actions, archive_dir: Path, dry_run: bool) -> int:
     failures = 0
     for rec in actions:
+        # v3.2.3：窗口内被用到的条目——复核戳前进（无 action，只有 refresh_lv）。
+        # 这是"最活跃的记忆不先被归档"承诺的兑现处：不刷新的话，条目会一直靠
+        # 上一次命中反复从超期名单里被救回来，用户一旦停用超过阈值天数就被降级。
+        if rec.get('refresh_lv') and not rec['action']:
+            try:
+                if dry_run:
+                    print(f"  [refresh_lv] {rec['slug']} → last_verified 推进到今天"
+                          f"（窗口内有命中，{rec.get('last_hit') or '?'}）")
+                    continue
+                new_content, changed = refresh_last_verified(rec['raw'])
+                if changed:
+                    atomic_write(rec['path'], new_content)
+                    print(f"  [refresh_lv] {rec['slug']} last_verified→今天"
+                          f"（窗口内有命中，{rec.get('last_hit') or '?'}）")
+            except Exception as e:   # noqa: BLE001 - 单条失败不拖垮整轮复核
+                print(f"  ⚠️ refresh_lv 失败 {rec['slug']}: {e}")
+                failures += 1
+            continue
         act, reason = rec['action']
         p = rec['path']
         try:
@@ -407,7 +492,12 @@ def build_report(date_str, detail_actions, candidates, q_actions, files, failure
         "|---|---|---|---|---|---|---|",
     ]
     for r in detail_actions:
-        act, reason = r['action']
+        # v3.2.3：detail_actions 现在也含"只刷新复核戳、无降级动作"的条目，
+        # 直接解包 r['action'] 会 TypeError（独立审查抓到的崩溃点）。
+        if not r['action']:
+            act, reason = 'refresh_lv', '窗口内有命中 → last_verified 推进到今天'
+        else:
+            act, reason = r['action']
         lines.append(
             f"| {cell(r['slug'])} | {cell(r['type'])} | {cell(r['status'])} | "
             f"{cell(r['last_verified'])} | {days_display(r['days'])} | {act} | {cell(reason)} |"
@@ -520,9 +610,11 @@ def _run(args) -> int:
     detail_actions, files, f1 = scan_detail(detail_dir)
     total_failures += f1
     total_failures += apply_detail_actions(detail_actions, archive_dir, dry)
-    mark_count = sum(1 for r in detail_actions if r['action'][0] == 'mark_dormant')
-    arch_count = sum(1 for r in detail_actions if r['action'][0] == 'archive')
-    print(f"  过期复核：扫描 {len(files)} 条，降级 {mark_count} 条，归档 {arch_count} 条")
+    mark_count = sum(1 for r in detail_actions if r['action'] and r['action'][0] == 'mark_dormant')
+    arch_count = sum(1 for r in detail_actions if r['action'] and r['action'][0] == 'archive')
+    lv_count = sum(1 for r in detail_actions if not r['action'] and r.get('refresh_lv'))
+    print(f"  过期复核：扫描 {len(files)} 条，降级 {mark_count} 条，归档 {arch_count} 条，"
+          f"复核戳刷新 {lv_count} 条")
     print()
 
     print("—— 功能2 碎片合并候选 ——")
@@ -541,7 +633,11 @@ def _run(args) -> int:
 
     log_entries = []
     for r in detail_actions:
-        act, reason = r['action']
+        # 同 build_report：无 action 的条目是"只刷新复核戳"，也要进账本（可审计）。
+        if not r['action']:
+            act, reason = 'refresh_lv', '窗口内有命中 → last_verified 推进到今天'
+        else:
+            act, reason = r['action']
         log_entries.append((now_ts, act, r['slug'], reason))
     for c in candidates:
         log_entries.append(

@@ -555,6 +555,124 @@ def adaptive_top(query: str) -> int:
     return 5
 
 
+# ── 争议消费方（v3.2.3 / 销 ARCHITECTURE_TODO「disputed_by 无消费方」）───────
+# 债的原文：write_gate 在 DISPUTE 路径只给旧条目打 `disputed_by` / `disputed_at`
+# / `disputed_reason` 三个字段就结束，**没有任何地方读它们** → 冲突被检测出来却
+# 永远悬着，两条互相矛盾的记忆同时留在库里、都还能被检索到。
+#
+# 这里的定性（重要，别当"已经做完 LLM 复核"）：本模块补的是**消费方**——
+#   ① `list_disputes()`：把积压的争议**可见化**（谁被谁挑战、什么时候、为什么）；
+#   ② `resolve_dispute()`：人工终审后**清标记**并留痕（账本 action=dispute-resolve）。
+# 它**不做**自动裁决：谁对谁错需要人或 LLM 判断，代码不替你做决定。
+# 真正的 LLM 复核闭环属 ARCHITECTURE_TODO 的 a3 批次，本棒只保证"标记不再死掉"。
+
+DISPUTE_FIELDS = ("disputed_by", "disputed_at", "disputed_reason")
+
+
+def _is_plain_name(slug: str) -> bool:
+    """true = 可直接当作 `detail/` 下的条目名（不含路径分隔符 / `..` / 空）。
+
+    单列成函数是为了让"什么算合法条目名"只有一个口径，也便于测试直接打点。
+    """
+    if not slug or not isinstance(slug, str):
+        return False
+    if slug in (".", ".."):
+        return False
+    if "/" in slug or "\\" in slug or ".." in slug:
+        return False
+    if any(ch in slug for ch in ("\x00", "\n", "\r")):
+        return False
+    return True
+
+
+def list_disputes(detail_dir: Path | None = None) -> list[dict]:
+    """扫描 detail/ 下所有带 `disputed_by` 的条目，按 disputed_at 升序返回。
+
+    读的是 frontmatter 里的原始字段（用 parse_frontmatter_strict 的宽松版
+    `parse_frontmatter`），因为争议条目本身可能已被写坏——坏条目宁可漏报，
+    也不能让整个清点抛异常（对齐"损坏即隔离"的既有口径）。
+    """
+    detail_dir = detail_dir if detail_dir is not None else DETAIL_DIR
+    out: list[dict] = []
+    if not detail_dir.is_dir():
+        return out
+    for p in sorted(detail_dir.glob("*.md")):
+        try:
+            raw = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        fm, _ = parse_frontmatter(raw)
+        by = (fm.get("disputed_by") or "").strip()
+        if not by:
+            continue
+        out.append({
+            "slug": fm.get("name") or p.stem,
+            "disputed_by": by,
+            "disputed_at": (fm.get("disputed_at") or "").strip(),
+            "disputed_reason": (fm.get("disputed_reason") or "").strip(),
+            "status": (fm.get("status") or "").strip(),
+            "path": p,
+        })
+    out.sort(key=lambda r: (r["disputed_at"], r["slug"]))
+    return out
+
+
+def resolve_dispute(slug: str, keep: bool = True, reason: str = "",
+                    detail_dir: Path | None = None, db: Path | None = None
+                    ) -> tuple[bool, str]:
+    """人工终审后清掉争议标记（**不删内容**，符合"宁可重复，不可丢内容"）。
+
+    keep=True ：保留本条（判定本条是对的），只清三个 disputed_* 字段。
+    keep=False：本条被取代 —— 走 `forget()` 的**软**路径？不。这里只把
+                status 置 dormant/superseded 交给门④ 归档，不物理删除：
+                终审也不该动用不可逆操作，留给人显式 `--forget`。
+    两种都写一条 review_log(action=dispute-resolve) 留痕。
+    """
+    detail_dir = detail_dir if detail_dir is not None else DETAIL_DIR
+    db = db if db is not None else DB
+    # 防穿越（2026-10-29 实测确认）：slug 被直接拼成 `detail_dir / f"{slug}.md"`，
+    # 只要越界目标文件真实存在，`--resolve ../evil` 就会改写 detail/ 之外的任意 .md。
+    # 两道都必要：① 形态检查（早拒，报错清楚）；② 解析后路径归属检查（兜住软链等）。
+    if not _is_plain_name(slug):
+        return False, "非法的条目名 %r（不允许路径分隔符或 ..）" % (slug,)
+    target = detail_dir / ("%s.md" % slug)
+    try:
+        target.resolve().relative_to(detail_dir.resolve())
+    except ValueError:
+        return False, "非法的条目名 %r（解析后越出 detail 目录）" % (slug,)
+    if not target.exists():
+        return False, f"detail 未找到 {slug}.md"
+    raw = target.read_text(encoding="utf-8", errors="replace")
+    fm, body = parse_frontmatter(raw)
+    if not (fm.get("disputed_by") or "").strip():
+        return False, f"{slug} 上没有 disputed_by 标记（无需处理）"
+    loser = fm.get("disputed_by")
+    for k in DISPUTE_FIELDS:
+        fm.pop(k, None)
+    if not keep:
+        fm["status"] = "dormant"
+        fm["fate"] = "superseded"
+        fm["superseded_by"] = loser
+    fm["dispute_resolved_at"] = TODAY.isoformat()
+    fm["dispute_verdict"] = "kept" if keep else "superseded"
+    atomic_write(target, dump_frontmatter(fm, body))
+    note = (f"终审：{'判本条成立、清除争议标记' if keep else '判本条被取代、转 dormant/superseded'}"
+            f"（对方={loser}）{('；理由：' + reason) if reason else ''}")
+    try:
+        conn = connect_db(db)
+        try:
+            write_ledger(conn, "review_log",
+                         [(datetime.datetime.now().isoformat(timespec="seconds"),
+                           "dispute-resolve", slug, note)],
+                         ["ts", "action", "slug", "reason"])
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:      # noqa: BLE001 - 账本失败不该让终审白做
+        return True, f"✅ {slug} 争议已了结（账本写入失败: {e}）"
+    return True, f"✅ {slug} 争议已了结：{note}"
+
+
 def main(argv: list[str] | None = None) -> int:
     from lib.cli_base import bootstrap as _bootstrap  # v2.5.0：编码兜底
     _bootstrap()
@@ -581,7 +699,32 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-update", action="store_true", help="不回写 last_hit/use_count")
     ap.add_argument("--revive", nargs="?", const="__list__", default=None, metavar="SLUG",
                     help="无参数：列出今日复活候选；带 slug：执行复活（人工确认后使用）")
+    ap.add_argument("--disputes", action="store_true",
+                    help="列出所有带 disputed_by 标记的争议条目（write_gate 的 DISPUTE 产出）")
+    ap.add_argument("--resolve", metavar="SLUG", default=None,
+                    help="人工终审后清除该条争议标记；配合 --supersede 判本条被取代")
+    ap.add_argument("--supersede", action="store_true",
+                    help="与 --resolve 连用：判本条被取代（转 dormant/superseded），而非保留")
+    ap.add_argument("--why", default="", help="与 --resolve 连用：记入账本的理由")
     args = ap.parse_args(argv)
+
+    if args.disputes:
+        rows = list_disputes()
+        if not rows:
+            print(f"当前无未了结的争议标记（{DETAIL_DIR}）")
+            return 0
+        print(f"共 {len(rows)} 条待终审争议：")
+        for r in rows:
+            print(f"  · {r['slug']}（{r['disputed_at'] or '?'} 被 {r['disputed_by']} 挑战）")
+            if r["disputed_reason"]:
+                print(f"      理由：{r['disputed_reason']}")
+        print("\n终审：memory_query --resolve <slug> [--supersede] [--why \"...\"]")
+        return 0
+
+    if args.resolve:
+        ok, msg = resolve_dispute(args.resolve, keep=not args.supersede, reason=args.why)
+        print(msg)
+        return 0 if ok else 1
 
     if args.revive is not None:
         if args.revive == "__list__":
@@ -596,7 +739,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if ok else 1
 
     if not args.keyword:
-        ap.error("缺少检索关键词（或使用 --revive）")
+        ap.error("缺少检索关键词（或使用 --revive / --disputes / --resolve）")
         return 1
 
     terms = [norm(t) for t in args.keyword.split() if norm(t)]

@@ -3,17 +3,34 @@
 **让 agent 不再每次会话都失忆。**
 
 [![version](https://img.shields.io/badge/version-v3.2.2-2ea043?style=flat-square)](VERSION.md)
-[![python](https://img.shields.io/badge/python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)]()
-[![core deps](https://img.shields.io/badge/核心依赖-0-success?style=flat-square)]()
-[![local](https://img.shields.io/badge/数据-纯本地-007ec6?style=flat-square)]()
-[![deletion](https://img.shields.io/badge/物理删除-代码层禁用-8957e5?style=flat-square)]()
-[![hosts](https://img.shields.io/badge/宿主-dsh%20%7C%20Hermes%20%7C%20GUI%20%7C%20任意-8957e5?style=flat-square)]()
+[![python](https://img.shields.io/badge/python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/downloads/)
+[![core deps](https://img.shields.io/badge/核心依赖-0-success?style=flat-square)](#-完整上手)
+[![local](https://img.shields.io/badge/数据-纯本地-007ec6?style=flat-square)](#-当前边界与已知限制)
+[![deletion](https://img.shields.io/badge/物理删除-代码层禁用-8957e5?style=flat-square)](#-它是什么)
+[![hosts](https://img.shields.io/badge/宿主-dsh%20%7C%20Hermes%20%7C%20GUI%20%7C%20任意-8957e5?style=flat-square)](#-兼容什么)
 
 > 多数记忆方案在解决「**怎么召回**」；
 > 我们解决它前面那层——「**记忆的生命周期怎么治理**」。
 
 源自 [memory-ecology](https://github.com/Wind-Leaves-Echo-Guqin/memory-ecology)（Hermes 版）。
 本仓库把**可移植核心**与**宿主适配层**分离，让 Hermes 之外的 agent（当前：dsh）复用同一套记忆生命周期治理与经验笔记本。
+
+---
+
+## ⚡ 先跑起来（30 秒，纯 stdlib / 免安装）
+
+```bash
+git clone https://github.com/Wind-Leaves-Echo-Guqin/dsh-memory-ecology && cd dsh-memory-ecology/core/src
+python -m memory_ecology --root /tmp/eco-demo init
+python -m memory_ecology --root /tmp/eco-demo deposit --session s1 --text "用户偏好中文回复"
+python -m memory_ecology --root /tmp/eco-demo gate all      # 顺跑四门
+python -m memory_ecology --root /tmp/eco-demo search "中文"  # 检索（命中会回写 last_hit）
+python -m memory_ecology --root /tmp/eco-demo catalog       # 看目录（注入上下文的就是它）
+```
+
+跑完就能看到：条目进了 `detail/`，四门跑过一遍，检索按词面命中。
+**下面才是"它为什么这么设计"**——不读也能用，读了才知道边界在哪。
+各宿主的完整接法见 [🚀 完整上手](#-完整上手)。
 
 ---
 
@@ -104,7 +121,7 @@ flowchart TB
 
 ---
 
-## 🚀 30 秒上手
+## 🚀 完整上手
 
 ### 1) 只用核心 CLI（任何宿主/无宿主）
 
@@ -162,9 +179,15 @@ python integrations/gui/eco_gui.py
 
 | 前端目录 | 路由 | 状态 |
 |---|---|---|
-| `integrations/gui-v3/` | `/v3/` | **当前发布版（v3.2.0）** |
+| `integrations/gui-v3/` | `/v3/` | **当前发布版**（GUI 组件版本 **3.2.0**） |
 | `integrations/gui/`（static） | `/`（v0.3 静态版） | 历史版本，保留 |
 | `gui-v2` / `v2.1` / `v2.2` / `v2.3` | 各自路由 | 历史版本，不随发布物分发，按对应 tag checkout |
+
+> **关于两套版本号**（新人最容易懵的一处）：本仓库有**两个互不相干的版本轴**——
+> ① **产品/核心版本** = `3.2.2`（真源 `core/src/memory_ecology/__init__.py`）；
+> ② **GUI 组件版本** = `3.2.0`（真源 `integrations/gui-v3/package.json`）。
+> 它们刻意不对齐：GUI 是可选的人类观测界面，改动节奏与核心无关。
+> README 里凡是裸版本号若未带上下文，一律指①。
 
 纯离线、仅绑 `127.0.0.1`；写动作只有 5 个（圈配置 / 记忆包开关 / 维护 / 物化），
 全部转发核心 CLI 并走确认闸门，**没有任何删除记忆的动作**。
@@ -174,12 +197,12 @@ Hermes 专属动作（cron 重跑等）在未安装 Hermes 的机器上降级为
 
 ## 📦 仓库结构
 
-**v3.2.1 起两层并存**（`core/` 是唯一真源，`src/` 是历史线，尚未合并）：
+**v3.2.2 起两层并存**（`core/` 是唯一真源，`src/` 是历史线，**已冻结**，见下方"双树收敛计划"）：
 
 | 目录 | 是什么 | 版本 |
 |---|---|---|
-| **`core/`** | **v3.2.0 核心引擎（唯一真源）**：四道门 + 多生态圈 + 只读记忆包 + 检索，纯 stdlib；dsh 插件本体 `core/plugin/` 也在这里 | **3.2.1** |
-| `core/src/memory_ecology/` | 14 个模块：`gates.py` / `ledger.py` / `store.py` / `paths.py` / `retrieve.py` / `packs.py` / `config.py` / `root.py` / `similarity.py` / `measure.py` / `version.py` / `cli.py` | 3.2.1 |
+| **`core/`** | **核心引擎（唯一真源）**：四道门 + 多生态圈 + 只读记忆包 + 检索，纯 stdlib；dsh 插件本体 `core/plugin/` 也在这里 | **3.2.2** |
+| `core/src/memory_ecology/` | 14 个模块：`gates.py` / `ledger.py` / `store.py` / `paths.py` / `retrieve.py` / `packs.py` / `config.py` / `root.py` / `similarity.py` / `measure.py` / `version.py` / `cli.py` | 3.2.2 |
 | `core/tests/` | 核心 / 兼容与数据安全 / 并发 / 稳定性 / 变异（`run_tests.py` 7 组） | — |
 | `core/docs/` | `ARCHITECTURE.md`（含 7 blocker + 11 major 缺陷清单）、`OPS.md`（零运维手册） | — |
 | `src/memory_ecology/` | v3.1 治理核心（历史线，50 个 CLI 脚本）：写门/配额/蒸馏/复核/eco_note/向量缓存 | 3.1.0 |
@@ -193,7 +216,25 @@ Hermes 专属动作（cron 重跑等）在未安装 Hermes 的机器上降级为
 > **为什么要两层**：`core/` 是重写版（14 个模块，`gates.py`/`ledger.py`/`packs.py`），
 > 与 `src/` 下的 v3.1（50 个脚本，`write_gate.py`/`eco_quota.py`）**实现完全不同**，
 > 只有 `__init__.py` / `similarity.py` 同名。直接覆盖会毁掉 v3.1 的 50 个脚本以及依赖它们的
-> `integrations/hermes` / `integrations/dsh`，所以并存而非替换。迁移完成后再合并。
+> `integrations/hermes` / `integrations/dsh`，所以并存而非替换。
+
+### 双树收敛计划（**不是"永久并存"**）
+
+上面那段是**历史原因**，不是计划。真正的计划如下——写清楚是为了让读者不必猜：
+
+| 树 | 定位 | 现在能改吗 |
+|---|---|---|
+| **`core/`** | **唯一维护线**。所有新功能、缺陷修复只进这里 | ✅ 唯一入口 |
+| `src/`（v3.1，50 脚本） | **已冻结**：只接受安全修复，不再加功能 | ⚠️ 冻结 |
+| `integrations/hermes/` | 生产 cron 今天仍跑这一套（**v3.1 脚本**） | ⚠️ 冻结 |
+
+- **冻结判据（可验证）**：`tools/sync_trees_check.py` 报"双树漂移"时，若改动只发生在
+  `src/` 而 `core/` 无对应物，即视为**冻结线被误改**，需要解释。
+- **合并的唯一前置**：把生产 cron 从 v3.1 脚本切到 `core/`。**在这一步完成前，
+  合并两棵树都是不安全的**（会连带改掉正在跑的运维件）。
+- **截止承诺**：v3.1 线不再接受新功能（自本版本起即生效）；`src/` 的归档时间
+  取决于生产者切换，**不设虚假日期**——但切换完成当版本即删 `src/`。
+  <br>（此前版本 README 只写"迁移完成后再合并"，没有约束力，这是它的缺陷。）
 
 ---
 
@@ -244,7 +285,7 @@ Hermes 专属动作（cron 重跑等）在未安装 Hermes 的机器上降级为
 ## ✅ 测试
 
 ```bash
-# 核心引擎（v3.2.1，7 组全绿）
+# 核心引擎（3.2.2，7 组全绿）
 cd core && python run_tests.py
 
 # v3.1 历史线（cwd=src/memory_ecology）
@@ -273,7 +314,7 @@ node test_cordis.mjs                  # 官方桌面版：纯函数 + apply() �
 
 ## 📄 版本与历史
 
-- 当前版本 **v3.2.1**（2026-10-28）——版本唯一真源：`core/src/memory_ecology/__init__.py::__version__`
+- 当前版本 **v3.2.2**——版本唯一真源：`core/src/memory_ecology/__init__.py::__version__`
   （核心四处：`__init__.py` / `pyproject.toml` / `plugin/package.json` / `VERSION.md`，`python -m memory_ecology version` 校验）。
 - 版本要点：[VERSION.md](VERSION.md)（核心层另有 `core/VERSION.md`，两处需同步）；完整变更：[CHANGELOG.md](CHANGELOG.md)。
 - 历史版本用 **git 历史 + 标签**管理：`git checkout <tag>` 或 Releases 页下载任意版本。
