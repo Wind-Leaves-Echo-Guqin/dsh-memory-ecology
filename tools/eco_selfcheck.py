@@ -282,38 +282,95 @@ def repair_truncation(prod: Path, limit: int) -> list[str]:
 
 # ── A1 部署一致性 ───────────────────────────────────────────────────────────
 
+def _dev_script_dirs(dev: Path, prod: Path) -> list:
+    """探测 "dev 侧脚本目录 → 生产侧对应目录"，支持两种已知布局。
+
+    2026-10-29 的教训：A1 原来只认 `dev/scripts/`。发布树从 v3.2.x 起把同一批
+    脚本放在 `dev/src/memory_ecology/`（生成物布局），于是**公开树当 --dev 时
+    一个可比文件都找不到 → 永久红**。原注释把"检查跑不起来"当成了门禁结论，
+    但一条永远不可能变绿的检查等于没有检查，还会掩盖真实的部署漂移。
+
+    返回 [(dev 侧目录, 生产侧目录)]：
+      · 开发树布局：dev/scripts            → prod/scripts
+      · 发布树布局：dev/src/memory_ecology → prod/scripts
+      · 对应 lib：  dev/**/lib             → prod/scripts/lib
+    生产侧结构（scripts/ + scripts/lib/）不跟随发布树内部排布改名——生产是部署
+    目标，这条比对的意义正是"发布物内容有没有如实落到生产"。
+    """
+    pairs = []
+    for scripts, lib in ((dev / "scripts", dev / "scripts" / "lib"),
+                         (dev / "src" / "memory_ecology",
+                          dev / "src" / "memory_ecology" / "lib")):
+        if scripts.is_dir() and any(scripts.glob("*.py")):
+            pairs.append((scripts, prod / "scripts"))
+            if lib.is_dir():
+                pairs.append((lib, prod / "scripts" / "lib"))
+            break        # 两种布局不叠加：避免同名文件被比两遍
+    return pairs
+
+
+# ── 脱敏改写识别（2026-10-29）────────────────────────────────────────────
+#
+# A1 的第二个设计缺陷：**发布物是脱敏过的，生产是没脱敏的**。
+# 直接拿公开树 src/memory_ecology/ 去比生产 scripts/，必然"永久漂移"，但这些
+# 差异全是生成器的既定改写，不是部署事故。实测到的形态：
+#   .agent-index          → .memory-ecology     （路径去标识化）
+#   memory-ecology-compat  → memory-ecology-compat（目录名去中文）
+# 所以正确口径是"源 → 生产"，比较前先把源按同样规则归一。推荐用未脱敏的开发树
+# 源当 --dev；拿公开树当 --dev 时这层归一自动生效，避免把"脱敏"误报成"漂移"。
+_SANITIZE_EQUIV = (
+    (".agent-index", ".memory-ecology"),
+    ("memory-ecology-compat", "memory-ecology-compat"),
+    ("兼容版", "compat"),
+)
+
+# 发布树专属的布局文件：生成器为让它成为可 import 的包而新增，开发源与生产都
+# 没有对应物（生产 scripts/ 是扁平脚本目录，不靠 __init__ 也能直跑）。
+# 属于"布局差异"而非"部署漂移"，A1 不该报缺失。
+_LAYOUT_ONLY = {"__init__.py"}
+
+
+def _norm_for_deploy(text: str) -> str:
+    """把源文本归一到"其脱敏形态"，再与生产比对（只影响比较，不改文件）。"""
+    text = text.replace("\r\n", "\n")
+    for old, new in _SANITIZE_EQUIV:
+        text = text.replace(old, new)
+    return text
+
+
 def check_deploy(dev: Path, prod: Path) -> dict:
-    """逐文件比对 dev 的 scripts/ + scripts/lib/ 与生产同名文件（LF 归一）。
+    """逐文件比对 dev 的脚本目录与生产同名文件（LF 归一 + 脱敏归一）。
 
     比"只比 write_gate 一个文件"更强：能抓到"部署跑了一半"和"某次手工改回旧版"。
     只比对 dev 侧存在的文件 —— 生产独有的宿主胶水（dispatch/furina/index_daily…）
     本来就不在生态树里，不是漂移。
 
     fail-closed：一个可比对文件都没有时**不能判绿**。"检查无法执行"与"部署一致"
-    是两件事；后者是门禁唯一有资格输出的绿票。用公开树（compat 布局只有
-    src/memory_ecology/，没有 scripts/）当 --dev 时，也必须红。
+    是两件事；后者是门禁唯一有资格输出的绿票。但**两种已知布局都探测不到**才算
+    "无法执行"；只要一种能对上，就必须给出真实漂移结论（见 `_dev_script_dirs`）。
     """
     drift, missing, total = [], [], 0
-    pairs = [(dev / "scripts", prod / "scripts"), (dev / "scripts" / "lib", prod / "scripts" / "lib")]
-    for src_dir, dst_dir in pairs:
-        if not src_dir.is_dir():
-            continue
+    for src_dir, dst_dir in _dev_script_dirs(dev, prod):
         for src in sorted(src_dir.glob("*.py")):
+            if src.name in _LAYOUT_ONLY:
+                continue        # 布局文件不参与一致性（见 _LAYOUT_ONLY）
             total += 1
             dst = dst_dir / src.name
-            rel = f"{src_dir.name}/{src.name}" if src_dir.name != "lib" else f"lib/{src.name}"
+            rel = f"lib/{src.name}" if src_dir.name == "lib" else f"scripts/{src.name}"
             if not dst.is_file():
                 missing.append(rel)
-            elif sha256_norm(src) != sha256_norm(dst):
+            elif _norm_for_deploy(src.read_text(encoding="utf-8", errors="replace")) \
+                    != _norm_for_deploy(dst.read_text(encoding="utf-8", errors="replace")):
                 drift.append(rel)
     if total == 0:
-        # 没有任何可比的 scripts/*.py：红。total 记 1 表示"这一条检查本身失败"，
+        # 两种已知布局都没有可比的 .py：红。total 记 1 表示"这一条检查本身失败"，
         # 保持旧字段语义（总检查项）且让调用方无法把 0 误读成"零漂移"。
         return {
             "id": "deploy",
             "name": "A1 部署一致性",
             "ok": False,
-            "detail": "部署源没有可比的 scripts/*.py（检查无法执行 ≠ 部署一致）",
+            "detail": ("部署源没有可比的脚本（已探测 scripts/ 与 src/memory_ecology/ "
+                       "两种布局）——检查无法执行 ≠ 部署一致"),
             "drift": [],
             "missing": [],
             "total": 1,

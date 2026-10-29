@@ -319,6 +319,59 @@ node test_cordis.mjs                  # 官方桌面版：纯函数 + apply() �
 - 版本要点：[VERSION.md](VERSION.md)（核心层另有 `core/VERSION.md`，两处需同步）；完整变更：[CHANGELOG.md](CHANGELOG.md)。
 - 历史版本用 **git 历史 + 标签**管理：`git checkout <tag>` 或 Releases 页下载任意版本。
 
+---
+
+## 🧭 已知未完成项（如实登记，不是路线图口号）
+
+> 这一节存在的理由：本项目的债清单（[ARCHITECTURE_TODO.md](ARCHITECTURE_TODO.md)）一向"让债可见"，
+> 但有几件事**有明确结论、只是还没做**，散落在各处容易忘。集中登记在此。
+
+### 1. `src/` 与 `core/` 的合并 —— **现在不做，先对齐能力**
+
+**结论**：不合并成"一棵树"，而是让 `core/` 吸收 `src/` 的缺口，齐平后直接删 `src/`。
+
+**为什么不现在做**：两棵树差的是**能力面**，不是结构。`core/` 14 个模块 / 16 个子命令，
+`src/` 33 个模块 / 50 个脚本；`core/` 目前**没有** v3.1 的写入门（`write_gate`）、
+golden 评测链路、`eco_health_check` 等。直接合并 = 功能回退。
+
+**顺序（每步都可独立验证）**：
+1. 让 A1 自检恢复可用 —— **已完成**（双布局探测 + 脱敏归一，见下节"最近的修复"）；
+2. 把 v3.1 独有能力逐个搬进 `core/`，每搬一个补对等测试；
+3. 生产 cron 从 v3.1 脚本切到 `core/`，A1 连续通过一段时间；
+4. 删除 `src/`。
+
+**阻塞点**：第 2 步是主要工作量；第 3 步需要人工决策（生产切换有风险）。
+
+### 2. `disputed_by` 的自动裁决 —— **不做全自动，改半自动**
+
+**结论**：不做"LLM 自动判谁对谁错并删掉一条"。
+
+**为什么**：`disputed_by` 的语义是"两条矛盾记忆并存"。让 LLM 自动裁决并删除，
+违背本项目两条硬纪律——"物理删除在代码层禁用"与"宁可重复，不可丢内容"。
+判错即**不可逆地丢失用户记忆**。且实测生产库当前 **0 条 DISPUTE 标记**，
+在无真实数据的情况下做裁决无法评估准确率。
+
+**替代方案（待做）**：门③ 蒸馏时顺带为带 `disputed_by` 的条目产出**裁决建议**，
+写入 `pending/` 走既有的人工确认链路；`memory_query --disputes` 输出加一列建议。
+先把"建议"跑准（可做影子比对），再谈放开自动。
+
+### 3. v3.1 独立测试（`tests/`）尚未随发布物分发
+
+**现状**：发布树只发 `tests/fixtures/`（论文复现依赖）。源树 `tests/` 下另有
+27 个测试（含 `test_v31_security` / `test_pii_rules` / `test_round3_redteam` 这批
+安全与隐私测试）**没有随发**。
+
+**为什么没做完**：这批测试依赖开发树的 `scripts/`、`tools/`、`agent-hooks/` 三处布局
+（含 `subprocess` 里硬编码 `scripts/write_gate.py`、`ECO_SCRIPTS_DIR` 等），
+发布树布局不同。当晚实测：只补 `sys.path` 能到 201/222 通过，剩余 21 个缺
+`eco_evolve` / `check_shell_sync` / `eco_extract` 等未登记件。
+
+**为什么回退而不是硬发**：发一个"201/222 能跑"的测试目录，比不发更糟——
+会让人以为发布树可回归。要么补齐到全绿，要么不发。
+
+**要做的话**：给发布树加 `scripts` → `src/memory_ecology` 的布局兼容（实测软链可让
+201 通过），再补齐 `tools/` 与 `agent-hooks/` 的依赖件，最后要求 `pytest tests` 全绿。
+
 ## 📄 License
 
 MIT © 2026 Wind-Leaves-Echo-Guqin（沿用上游 memory-ecology 许可）
