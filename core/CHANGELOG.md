@@ -5,6 +5,71 @@
 
 ---
 
+## v3.2.2 —— 2026-10-29
+
+五条治理缺陷修复。全部**独立复核**（不采信模拟验收报告结论）：宿主根因从
+`app.asar` 里解出 `dsh-agent-loop` 源码核对，每个缺陷都写了可执行复现脚本实跑，
+修完再跑同一脚本确认"不再复现"。
+
+### 修了什么
+
+- **H1 门②③④ 结构性从不运行**（最严重）。根因是宿主调用顺序：
+  `turn()` 内部派发 `agent/turn-stopping` → turn 返回 → `kick().finally` 才切 idle，
+  所以事件处理器运行时 `phase.kind` 必然是 `running`；而
+  `runMaintenance(job)` 在非 idle 时**同步抛**。插件每轮必抛、catch 只写 debug，
+  于是 `gate all`（门②③④ 的唯一调用点）**从未执行**，三张账本恒为空。
+  → 不再抢 phase，直接 `enqueueMaintenance` 进插件串行链；catch 提升为 `warn`
+  （旧实现把所有失败都藏起来了）。实测 200 条 detail 上 `gate all` 0.27s。
+- **H2 损坏即隔离**。宽松解析对坏 frontmatter 返回 `({}, 全文)`，`scope` 因此回落
+  成 `"global"`——**最宽的取值**：损坏一个字节就把圈内机密单向放宽成全局可见；
+  紧接门④ 又拿"全文"当正文回写，造出两个 frontmatter 块与矛盾 `status`。
+  → `store.damage_reason()` 判定；损坏条目不进目录/检索/门，`root.item()` 拒绝读，
+  `health` 增加 `damaged[]` 并置 `warn`。口径刻意保守：只认"明确写了 frontmatter
+  但坏了"，无 frontmatter 的老文件不算损坏（既有合法形态，有用例钉住）。
+- **H3 `merged` 分支不消费候选**。候选指纹不进 `known` → 文件永远判"未消费"、
+  pending 永久卡住；且下次 reconcile 又把同一句话当未知再 `+1 occurrences`，
+  **不新增任何候选也能灌水**（实测 2→3→4→5），而门② 拿 occurrences 当提升判据
+  → `hits=0` 的条目照样进 L1。破坏了"幂等"这个已写进文档的承诺。
+  → `merged` 分支补 `known.add(fp)`；已消费文件指纹剔出 `known`；
+  新增 `store.candidate_lines()` 让"判重"与"判消费"共用同一口径。
+- **H4 冷路径无圈隔离**。核心 `--scope` 语义本来是对的，缺陷全在插件：
+  `memory_search` 只认 `args.scope`（省略即全库），`memory_load` 干脆不校验，
+  而插件在 `agent/created` 早已算出 `state.circle` 却没用。
+  → 两者都用 `state.circle` 兜底；显式 `scope=global` 仍放行（不误伤明确意图）；
+  跨圈 `load` 回"没有这条记忆"，不确认其存在，避免被用来探测圈名。
+- **新发现（报告与交接文档都没有）：`dormant` 永远回不到目录**。目录只收
+  `status == "active"`，而 `review()` 的 `used_recently` 分支只刷新
+  `last_verified`、**不改 status**；`bring_back()` 有实现却**没有任何 CLI 入口**。
+  三者合起来 = 记忆被反复使用仍不在上下文里，用户无恢复通道，目录单向收缩。
+  H1 长期不修把这问题掩埋了，H1 一修立刻暴露（实测降级后连检索 5 次仍是 dormant）。
+  → 被使用 → dormant 回 `active`（记 `review_log revive` 账）；新增 `bring-back`
+  命令；`archived` 保持终态，撤销需要显式意图而非一次偶然命中。
+
+### 升级须知
+
+门②③④ 开始真正运行后，**第一次 `gate all` 会按遗忘曲线降级一批久未使用的条目**
+（实测 10 条里降 5 条），它们不再出现在注入目录里。这是设计行为不是数据丢失：
+降级条目**仍可被 `memory_search` 命中、`memory_load` 读正文**，被再次使用会自动
+回到目录，也可以用 `python -m memory_ecology bring-back <id>` 手动恢复。
+
+### 测试
+
+- 修正三条把 bug 当成规格的用例：`test_corrupt_frontmatter_degrades_not_crashes`
+  （`detail` 1 → 0，并断言 `damaged[]`）、`test_isolation_three_circles`
+  （补 `search` 冷路径断言，原来只测 `catalog`）、`test_used_entry_is_not_archived`
+  （断言 `active`，原来断言 `dormant`）。
+- 新增：插件 T8d（冷路径隔离）/ T13（四门真跑）、`test_regressions.py` 7 条、
+  core 冷路径与 archived 终态各 1 条、mutation M9 对齐新结构 + M9b/M9c。
+- 纪律：每条新用例都在**旧代码**上验证过会红（5 red + 2 error），不是空断言。
+- 全量 7 组 7/7 通过；`publish_compat` 重建发布树通过（脱敏扫描 + 守卫）。
+
+### 明确未修
+
+检索词面化（路线结构性上限）、衰减/阈值调参（无真实问题集前调参只是换一组拍脑袋
+的数）、`core/` 与 `src/` 合并——都不是本轮工程缺陷。
+
+---
+
 ## v3.2.0 —— 2026-10-27
 
 **主题：把已经设计好的治理真正跑起来，并且不再需要 Hermes 才能跑。**
@@ -64,7 +129,7 @@
 
 ### 新增（Stage G · 观测舱 v2.3 接入 v3.2.0）
 
-**目标 GUI 是哪个，这里先说清**：是 `memory-ecology-兼容版/integrations/` 下的
+**目标 GUI 是哪个，这里先说清**：是 `memory-ecology-compat/integrations/` 下的
 **`gui/eco_gui.py`（8788 服务）+ `gui-v2.3/`（React 19 + TS + Vite 的 iOS 外壳）**，
 桌面快捷方式「生态观测舱v2」就指它。
 
@@ -160,7 +225,7 @@
 | `tests/test_gui_contract.py` | 9 | 兼容版 | 前端四处注册表一致 + 主屏不重名 + 不许出现 `v32` 写法 |
 | `tests/test_gui.py` | ~~38~~ | **已归档** | 那是错目标那套 GUI 的测试（`_archive/gui-wrong-target-v0.4/`） |
 
-> 两个仓库各自 `python run_tests.py`：**dsh-memory-ecology 7/7**、**memory-ecology-兼容版 57/57**，全绿。
+> 两个仓库各自 `python run_tests.py`：**dsh-memory-ecology 7/7**、**memory-ecology-compat 57/57**，全绿。
 
 **变异测试是这套测试体系的信任基础**：第一轮跑出 5 个存活 + 1 个无效，说明有 5 条断言是
 同义反复（比如"BOM 用例"用 `assertIn` 断言，BOM 残留时子串仍匹配，等于没测）。补强后

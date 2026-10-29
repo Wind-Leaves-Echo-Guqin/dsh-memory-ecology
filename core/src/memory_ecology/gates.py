@@ -116,6 +116,14 @@ def integrate(root, archive: bool = True, dry_run: bool = False,
 
             if same is not None:
                 merged += 1
+                # **H3：相似合并也算"这个候选被消费了"**。
+                # 旧实现在 `continue` 前什么都不记，于是：
+                #   · `unconsumed_in_file` 永远认为该候选还在 → pending 卡住不空；
+                #   · 下一次 reconcile 看到同一句话仍是"未知指纹" → 再 +1 occurrences。
+                # 结果是不新增任何候选也能无限灌水，而门② 拿 occurrences
+                # 当提升判据 → `hits=0` 的条目照样进 L1（实测 2→5 并 promote）。
+                # 指纹必须在这里进 `known`——它是"这个候选已落账"的唯一凭据。
+                known.add(fp)
                 if not dry_run:
                     fm = dict(same["fm"])
                     occ = _int(fm.get("occurrences")) + 1
@@ -125,6 +133,7 @@ def integrate(root, archive: bool = True, dry_run: bool = False,
                     fm["last_verified"] = paths.today()
                     fm["status"] = "active"
                     root.write_item(same["name"], fm, same["body"])
+                    same["fm"] = fm
                     ledger.gate_log(conn, "UPDATE", same["name"],
                                     "同源合并 score=%.3f from=%s session=%s"
                                     % (best_score, f.name, sess or session or "anon"))
@@ -173,6 +182,19 @@ def integrate(root, archive: bool = True, dry_run: bool = False,
                           if store.unconsumed_in_file(p, known, body_max,
                                                       pending_root=root.pending) == 0}
             n = store.mark_consumed(root.pending, only=consumable) if consumable else 0
+            # **H3 防回退**：已消费文件里的候选指纹，不能再留在 `known` 里参与判重。
+            # 否则同一句话只要被投递第二次（改标点就够），就会再次以 "dup" 身份
+            # 去 `+1 occurrences`，于是"不新增任何候选、连跑 reconcile"也能无限灌水
+            # （实测 2→3→4→5），而门② 拿 occurrences 当提升判据 → hits=0 也进 L1。
+            # 它们既已在 detail 里（走 known 会重复计数），也不该再进本轮统计，
+            # 所以直接剔除：等价于"这个文件已经彻底处理完，翻篇"。
+            if consumable:
+                for rel in consumable:
+                    the_file = root.pending / rel
+                    for text in store.candidate_lines(the_file):
+                        fp2, _ = store.candidate_fp(
+                            store.scope_of_file(the_file, root.pending), text, body_max)
+                        known.discard(fp2)
         else:
             n = 0
         if not dry_run:
@@ -824,6 +846,9 @@ def review(root, dry_run: bool = False) -> dict:
             threshold = days_epi if mtype == "episodic" else days_sem
             status = (fm.get("status") or "active").strip().lower()
             if status == "archived":
+                # 终态：**只能靠显式 `bring-back` 恢复**（那条路会留一笔账）。
+                # 一次偶然的检索命中不足以把已归档记忆自动拉回目录——
+                # 撤销系统的最终判断需要人的意图，不能是副作用。
                 continue
             last_hit = stats.get(it["name"], (0, ""))[1] or fm.get("last_hit") or ""
             verified = fm.get("last_verified") or fm.get("last_seen") or ""
@@ -833,13 +858,35 @@ def review(root, dry_run: bool = False) -> dict:
             used_recently = bool(use_window and age_h is not None and age_h <= threshold)
             if used_recently:
                 # 使用驱动：刷新 last_verified（这就是"最活跃的反被归档"的修法）
-                if (fm.get("last_verified") or "") != paths.today():
+                #
+                # **但只刷新 last_verified 是不够的**（2026-10-29 实测）：
+                # 条目一旦降级成 dormant，目录（`catalog_payload`）只收 active，
+                # 于是"被反复检索命中 → last_verified 天天刷新 → 却永远不在目录里"。
+                # 而 `bring_back()` 当时没有任何 CLI 入口，用户没有恢复通道 →
+                # 目录只会单向收缩。门④ 长期不跑（H1）时这个缺陷被掩埋，
+                # H1 修好立刻变成"记忆用着用着就消失了、还救不回来"。
+                # 所以"被使用"必须包含**复活**：dormant → active（退一步，可逆）。
+                revived = status == "dormant"
+                dirty = (fm.get("last_verified") or "") != paths.today() or revived
+                if dirty:
                     fm["last_verified"] = paths.today()
+                    if revived:
+                        fm["status"] = "active"
+                        fm["fate"] = "retained"
+                        fm["revived_at"] = paths.today()
+                        fm["revived_reason"] = "used-within-%dd-window" % threshold
                     if not dry_run:
                         root.write_item(it["name"], fm, it["body"])
-                    refreshed.append(it["name"])
+                        if revived:
+                            ledger.review_log(
+                                conn, "revive", it["name"],
+                                "被使用（%.0f 天内命中 %d 次）→ 回 active"
+                                % (age_h or 0, stats.get(it["name"], (0, ""))[0]))
+                    if not revived:
+                        refreshed.append(it["name"])
                 kept.append({"id": it["name"], "why": "used-within-window",
-                             "age_hit_days": round(age_h or 0, 1)})
+                             "age_hit_days": round(age_h or 0, 1),
+                             "revived": revived})
                 continue
             overdue = age_v is None or age_v > threshold
             if not overdue:

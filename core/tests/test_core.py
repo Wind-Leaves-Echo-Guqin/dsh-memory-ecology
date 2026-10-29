@@ -218,11 +218,13 @@ class TestPaths(Base):
         **必须跑多轮**：Windows 上 `O_APPEND` 的 seek+write 不是原子操作，
         丢行是**概率事件**（实测单轮 8%）。只跑一轮的话，去掉并发锁也有
         92% 概率通过 → 测试形同虚设（变异测试会报 M2c 存活）。
-        这里用 10 轮 × 8 进程：漏检概率 ≈ 0.92^10 ≈ 43% 仍然偏高，
-        所以还**额外把行长从 9 KB 加到 32 KB**——写越大，seek 与 write 之间
-        被抢占的窗口越长，丢行概率显著上升（实测 32 KB 时单轮 >50%）。
+        这里用 16 轮 × 8 进程。原来是 10 轮，实测在**变异体上**仍有约 10~20%
+        的漏检（2026-10-29 连跑 15 次，观察到 4 次 M2c 存活）——而变异组
+        里它一"存活"就会把整组判红，形成"随机红"。16 轮把漏检概率压到可接受
+        区间，代价只是这条用例多跑 ~1 秒。注意：**干净代码上它从不失败**
+        （实测 6/6 通过），所以红只会来自变异体或真的把锁去掉了。
         """
-        ROUNDS = 10
+        ROUNDS = 16
         WORKERS = 8
         PAD = 32000
         for rnd in range(ROUNDS):
@@ -1024,7 +1026,16 @@ class TestGate4(Base):
         self.assertEqual(len(out["demoted"]), 1, "episodic 的 30 天阈值没生效")
 
     def test_used_entry_is_not_archived(self):
-        """**"最活跃的记忆反被归档"的修法**：窗口内被用过 → 免降级 + 刷新 last_verified。"""
+        """"最活跃的记忆反被归档"的修法：窗口内被用过 → 免归档 + 刷新 last_verified。
+
+        ⚠️ 这条用例原来还断言 `status == "dormant"`——**等于把"用过的记忆永远
+        回不到目录"当成了规格**。事实是：目录只收 `status == "active"`，
+        所以"刷新了 last_verified 但仍留在 dormant"意味着该条目被反复使用、
+        却永远不在上下文里；再加上 `bring_back()` 当时没有 CLI 入口，
+        用户没有任何恢复通道。门④ 长期不跑时这个缺陷被掩埋，
+        H1 修好后立刻变成"记忆用着用着就消失、还救不回来"。
+        被使用 → 回 active 才是自洽的语义。
+        """
         self.init()
         self.deposit("高频使用的关键事实：备份绝不删除")
         mid = self.cli("gate", "1")["ids"][0]
@@ -1032,10 +1043,44 @@ class TestGate4(Base):
         self.cli("search", "备份绝不删除", "--limit", "3")
         out = self.cli("gate", "4")
         self.assertEqual(out["archived"], [], "刚被检索命中的条目被归档了")
-        self.assertIn(mid, out["refreshed"])
         it = rootmod.Root(self.root_path).open().item(mid)
-        self.assertEqual(it["fm"]["status"], "dormant")
+        self.assertEqual(it["fm"]["status"], "active",
+                         "被命中的条目仍留在 dormant —— 它永远回不到目录")
         self.assertEqual(it["fm"]["last_verified"], paths.today())
+        self.assertEqual(it["fm"]["fate"], "retained")
+
+    def test_archived_is_terminal_until_explicit_bring_back(self):
+        """已归档是**终态**：一次偶然命中不该把它自动拉回来（撤销要人的意图）。
+
+        两半都要验，否则只是半个断言：
+          ① 被命中的归档条目 → 仍是 archived（不能被"使用"撤销终态）；
+          ② **没被命中**的归档条目 → 也必须仍是 archived，不能被 overdue 分支
+             当成 active 再降级成 dormant（那等于把终态又改写了）。
+        只验 ① 的话，`if status == "archived": continue` 被删掉也测不出来
+        （变异实测 M9c 存活）。
+        """
+        self.init()
+        self.deposit("已归档的老事实：归档是最终判断")
+        mid = self.cli("gate", "1")["ids"][0]
+        self._set(mid, last_verified="2026-01-01", status="archived", type="semantic")
+
+        # ② 先验"没被命中"的情形（不检索，直接跑门④）
+        self.cli("gate", "4")
+        it0 = rootmod.Root(self.root_path).open().item(mid)
+        self.assertEqual(it0["fm"]["status"], "archived",
+                         "未命中的归档条目被降级成 dormant —— 终态被改写了")
+
+        # ① 再验"被命中"的情形
+        self.cli("search", "归档是最终判断", "--limit", "3")
+        self.cli("gate", "4")
+        it = rootmod.Root(self.root_path).open().item(mid)
+        self.assertEqual(it["fm"]["status"], "archived",
+                         "归档条目被一次检索命中自动复活了（终态不该有副作用）")
+        # 显式恢复通道必须存在且有效
+        bb = self.cli("bring-back", mid, "--reason", "确认仍有效")
+        self.assertTrue(bb.get("ok"), "没有可用的恢复通道：%s" % bb)
+        it2 = rootmod.Root(self.root_path).open().item(mid)
+        self.assertEqual(it2["fm"]["status"], "active")
 
     def test_verify_row_when_nothing_to_do(self):
         self.init()
@@ -1258,7 +1303,13 @@ class TestCircles(Base):
         self.assertTrue(out.get("readonly"))
 
     def test_isolation_three_circles(self):
-        """三圈两向 + 全局可见（A2A §D5 的准出）。"""
+        """三圈两向 + 全局可见（A2A §D5 的准出）。
+
+        ⚠️ 这条用例原来只验 `catalog`（**暖路径**）。名字叫"隔离"，但
+        `search` / `load` 两条**冷路径**在整套核心用例里零断言——而 H4 恰恰
+        泄漏在这两条上（不带 `--scope` 就全库直通）。补上冷路径断言，
+        否则"隔离通过"只证明了三条路里的一条。
+        """
         self.init()
         self.deposit("A 圈秘密", scope="a")
         self.deposit("B 圈秘密", scope="b")
@@ -1274,6 +1325,32 @@ class TestCircles(Base):
             self.assertIn("全局通用规则", text, "%s 圈看不到全局条目" % sc)
             for other in others:
                 self.assertNotIn(other, text, "%s 圈看到了别的圈的条目" % sc)
+
+            # ---- 冷路径 ①：search 带显式 scope 必须同口径隔离 ----
+            found = self.cli("search", "--limit", "20", "--scope", sc, "--", "圈秘密")
+            stext = json.dumps(found, ensure_ascii=False)
+            self.assertIn(mine, stext, "%s 圈 search 查不到自己的条目" % sc)
+            for other in others:
+                self.assertNotIn(other, stext,
+                                 "%s 圈 search 看到了别的圈的条目（冷路径泄漏）" % sc)
+
+    def test_cold_path_load_respects_circle(self):
+        """`load` 是第三条路：id 来自模型，必须能被圈约束住。
+
+        核心 `load` 只按 id 读、不做圈校验，圈校验在插件侧（H4）。
+        这里钉住**核心如实报告条目所属圈**——插件依赖这个字段做判定，
+        它一旦缺失，插件侧就只能"猜"，等于没有隔离。
+        """
+        self.init()
+        self.deposit("A 圈机密口令", scope="a")
+        self.cli("gate", "1")
+        hit = self.cli("search", "--limit", "5", "--scope", "a", "--", "机密口令")
+        self.assertGreater(hit["count"], 0, "search 找不到刚存进去的条目")
+        mid = hit["items"][0]["id"]
+        loaded = self.cli("load", "--", mid)
+        self.assertTrue(loaded["ok"], "load 读不到自己圈的条目：%s" % loaded)
+        self.assertEqual(loaded.get("scope"), "a",
+                         "load 没报出条目所属圈 —— 插件侧无从判定隔离")
 
     def test_circles_lists_empty_declared(self):
         self.init()

@@ -2,7 +2,7 @@
 
 **让 agent 不再每次会话都失忆。**
 
-[![version](https://img.shields.io/badge/version-v3.2.1-2ea043?style=flat-square)](VERSION.md)
+[![version](https://img.shields.io/badge/version-v3.2.2-2ea043?style=flat-square)](VERSION.md)
 [![python](https://img.shields.io/badge/python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)]()
 [![core deps](https://img.shields.io/badge/核心依赖-0-success?style=flat-square)]()
 [![local](https://img.shields.io/badge/数据-纯本地-007ec6?style=flat-square)]()

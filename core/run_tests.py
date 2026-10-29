@@ -58,7 +58,7 @@ GROUPS = [
     ("stability", [PY, str(REPO / "tests" / "test_stability.py")], REPO, 900, False),
     ("mutation", [PY, str(REPO / "tests" / "test_mutation.py")], REPO, 1800, False),
 ]
-# 观测舱测试**不在本仓库**：真实 GUI 是 `memory-ecology-兼容版/integrations/gui` + `gui-v2.3`，
+# 观测舱测试**不在本仓库**：真实 GUI 是 `memory-ecology-compat/integrations/gui` + `gui-v2.3`，
 # 它的断言在那边 `tests/test_gui_v32.py`（24 条，随那个仓库的 run_tests.py 跑）。
 # 这里曾经有一组 `gui` 指向本仓库的 `gui/`（我一度把服务端复制过来，目标错了），
 # 那份已归档到 `_archive/gui-wrong-target-v0.4/`，测试组同步移除——

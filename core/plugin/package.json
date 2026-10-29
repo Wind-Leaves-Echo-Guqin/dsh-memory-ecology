@@ -1,6 +1,6 @@
 {
   "name": "eco-memory-dsh",
-  "version": "3.2.1",
+  "version": "3.2.2",
   "description": "记忆生态 · dsh 独立插件：四道门（整合/巩固/蒸馏/复核）+ warm 目录 + 只读记忆包，事件驱动、零 cron、零配置。",
   "type": "module",
   "main": "index.js",

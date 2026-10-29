@@ -137,7 +137,13 @@ class Root:
             return None
         p = self.detail / (ident + ".md")
         if p.is_file():
-            fm, body = store.parse_frontmatter(paths.read_text(p))
+            text = paths.read_text(p)
+            why = store.damage_reason(text)
+            if why:
+                # 损坏条目**不假装可读**：返回 None → 上层给"没有这条记忆"。
+                # 否则门④ 会拿坏文件的"全文当正文"回写，造出两个 frontmatter 块。
+                return None
+            fm, body = store.parse_frontmatter(text)
             return {"path": p, "name": p.stem, "fm": fm, "body": body,
                     "type": store.norm_type(fm.get("type", "")),
                     "status": (fm.get("status") or "active").strip().lower(),

@@ -1,4 +1,33 @@
-# Memory Ecology Compat · 版本
+# dsh-memory-ecology · 版本
+
+- **v3.2.2**（2026-10-29）—— `core/` 五条治理缺陷修复（不采信验收报告，逐条独立复核）
+  - **H1 门②③④ 结构性从不运行**（最严重）：宿主 `turn()` 内部派发
+    `agent/turn-stopping`，而 `kick().finally` 才把 phase 切回 `idle`——所以处理器
+    运行时 phase 必然是 `running`，`runMaintenance` 非 idle 即抛，插件每轮必抛、
+    catch 只 `logger.debug`，于是 `gate all`（门②③④ 唯一调用点）**从未执行**。
+    改为直接 `enqueueMaintenance`，catch 提为 `warn`。
+  - **H2 损坏即隔离**：坏 frontmatter 让宽松解析返回 `({}, 全文)`，`scope` 回落
+    `"global"`（最宽取值）——损坏一个字节就把圈内机密单向放宽成全局可见；门④ 又把
+    全文当正文回写，造出两个 frontmatter 块 + 矛盾 status。现在损坏条目**不进目录/
+    检索/门**，`root.item()` 拒绝读，`health` 增加 `damaged[]` 并置 `warn`。
+  - **H3 `merged` 不消费候选** → `occurrences` 灌水（空跑 reconcile 也能 2→5）、
+    pending 永久卡住、`hits=0` 也被提升进 L1。`merged` 补 `known.add(fp)`，
+    已消费文件指纹剔出 `known`，判重与判消费共用 `candidate_lines()`。
+  - **H4 冷路径无圈隔离**：核心 `--scope` 语义本来是对的，缺陷在插件——`memory_search`
+    只认模型填的 scope（省略即全库）、`memory_load` 不校验圈。两者改用早已算出的
+    `state.circle` 兜底；显式 `scope=global` 仍放行；跨圈 load 回"没有这条记忆"。
+  - **新发现：`dormant` 永远回不到目录**。目录只收 `active`，而 `review()` 只刷新
+    `last_verified` 不改 `status`，`bring_back()` 又没有 CLI 入口 → 记忆被反复使用
+    仍不在上下文、用户无恢复通道、目录单向收缩。改为被使用即可回 `active`，
+    新增 `bring-back` 命令；`archived` 保持终态。
+  - **升级须知**：门②③④ 开始真跑后，首次 `gate all` 会按遗忘曲线降级一批久未使用
+    的条目（实测 10 条降 5 条）。这是设计行为不是丢失——降级条目仍可被
+    `memory_search` 命中、`memory_load` 读正文，再次使用会自动回目录，也可用
+    `bring-back <id>` 手动恢复。
+  - **测试**：修正三条"把 bug 当规格"的用例；新增插件 T8d/T13、regressions 7 条、
+    core 2 条、mutation M9 对齐 + M9b/M9c。每条新用例都在旧代码上验证过会红。
+  - 并发追加用例 10→16 轮（实测去锁后单轮丢行率约 28%，不是文档写的 >50%），
+    消除变异组"随机红"。`core/run_tests.py` **7/7 全绿**；发布流水线重建通过。
 
 - **v3.2.1**（2026-10-28）—— v3.2.0 核心引擎并入 `core/`（GitHub 上一直缺的就是它）
   - **`core/` 新增**：v3.2.0 重写版核心的**唯一真源**（14 个模块 / 纯 stdlib / 零宿主依赖）——

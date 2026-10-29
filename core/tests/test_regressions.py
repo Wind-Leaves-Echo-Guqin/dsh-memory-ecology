@@ -506,5 +506,160 @@ class TestConsistency(Base):
         self.assertIsNone(rows[0].get("eco_msgs"), "老行的 eco_msgs 应是 None 而不是 0")
 
 
+# ── H2/H3/H4 + 门④ 复活（2026-10-29 复核，全部实跑复现过）────────────
+
+class TestH2DamageIsolation(Base):
+    """**H2**：损坏一个字节（结束分隔符 `---` → `--x`）就能让圈内机密
+    单向放宽成全局可见——因为宽松解析给出 `fm={}`，`scope` 回落成 `"global"`，
+    而 `global` 是**最宽的取值**。方向反了：坏了应该更不可见，不是更可见。
+    """
+
+    def _make_damaged(self, scope="proja", secret="blue-green-7788"):
+        self.init()
+        self.dep("proja 的机密口令是 %s" % secret, scope=scope)
+        self.cli("gate", "1")
+        det = sorted((self.root_path / "memories" / "detail").glob("mem-*.md"))
+        f = det[0]
+        parts = f.read_text(encoding="utf-8").split("\n")
+        seen = 0
+        for i, line in enumerate(parts):
+            if line.strip() == "---":
+                seen += 1
+                if seen == 2:
+                    parts[i] = "--x"
+                    break
+        f.write_text("\n".join(parts), encoding="utf-8")
+        return f
+
+    def test_damaged_item_does_not_leak_to_global(self):
+        self._make_damaged()
+        self.assertEqual(self.cli("catalog", "--scope", "proja")["count"], 0,
+                         "损坏条目还留在本圈目录里（应隔离）")
+        self.assertEqual(self.cli("catalog", "--scope", "global")["count"], 0,
+                         "损坏条目泄漏进了 global —— scope 回落到了最宽取值")
+
+    def test_gate_does_not_promote_damaged_into_two_frontmatter_blocks(self):
+        f = self._make_damaged()
+        g = self.cli("gate", "all")
+        self.assertTrue(g["ok"])
+        after = f.read_text(encoding="utf-8")
+        self.assertEqual(after.count("\n---\n") + (1 if after.startswith("---\n") else 0),
+                         1, "写回后出现多个 frontmatter 块：\n%s" % after[:400])
+        import re
+        statuses = re.findall(r"(?m)^status:\s*(\S+)", after)
+        self.assertEqual(len(set(statuses)), 1, "写回后出现矛盾 status：%s" % statuses)
+
+    def test_health_reports_damaged(self):
+        self._make_damaged()
+        h = self.cli("health")
+        self.assertTrue(h["ok"], "health 不该被一条坏文件搞崩")
+        self.assertEqual(len(h["damaged"]), 1, "health 没报出损坏条目：%s" % h.get("damaged"))
+        self.assertEqual(h["status"], "warn")
+
+
+class TestH3MergedConsumesCandidate(Base):
+    """**H3**：`merged` 分支不消费候选 → 不新增任何候选、连跑 reconcile
+    也能让 `occurrences` 无限增长（实测 2→3→4→5），
+    而门② 拿 occurrences 当提升判据 → `hits=0` 的条目照样进 L1。
+
+    它破坏的是**幂等**这个已写进文档的承诺。
+    """
+
+    def test_repeated_reconcile_does_not_inflate_occurrences(self):
+        import re
+        self.init()
+        self.dep("跑测试请加 --fast 参数")
+        self.cli("reconcile")
+        self.dep("跑测试请加 --fast 参数！", session="s2")   # 相似 → merged
+        r2 = self.cli("reconcile")
+        self.assertEqual(r2["merged"], 1, "没走 merged 分支，用例前提没成立：%s" % r2)
+        self.assertEqual(r2["consumed_files"], 1,
+                         "merged 掉的候选文件没有被消费（pending 会永久卡住）")
+
+        f = sorted((self.root_path / "memories" / "detail").glob("mem-*.md"))[0]
+        occ_after_merge = re.search(r"(?m)^occurrences:\s*(\S+)",
+                                    f.read_text(encoding="utf-8")).group(1)
+
+        for i in range(3):
+            self.cli("reconcile")     # 不新增任何候选
+        occ_final = re.search(r"(?m)^occurrences:\s*(\S+)",
+                              f.read_text(encoding="utf-8")).group(1)
+        self.assertEqual(occ_final, occ_after_merge,
+                         "空跑 reconcile 仍在给 occurrences 灌水：%s → %s"
+                         % (occ_after_merge, occ_final))
+        self.assertEqual(self.cli("stats")["pending"], 0, "pending 没清空")
+
+    def test_gate2_does_not_promote_zero_hit_entry(self):
+        self.init()
+        self.dep("跑测试请加 --fast 参数")
+        self.cli("reconcile")
+        self.dep("跑测试请加 --fast 参数！", session="s2")
+        self.cli("reconcile")
+        for _ in range(3):
+            self.cli("reconcile")
+        g2 = self.cli("gate", "2")
+        promoted = (g2.get("gate2") or g2).get("promoted") or []
+        self.assertEqual(promoted, [],
+                         "hits=0 的条目被提升进 L1（occurrences 被灌水驱动）：%s" % promoted)
+
+
+class TestGate4Revival(Base):
+    """**门④ 复活通道**（H1 修复后才暴露出来的缺陷）。
+
+    H1 长期不修 → 门②③④ 从不运行 → 下面这个问题被掩埋。门④ 一旦真正跑起来：
+      1. 降级（dormant）是常态；
+      2. 目录只收 `status == "active"`；
+      3. `review()` 的 used_recently 分支只刷 `last_verified`、**不改 status**；
+      4. `bring_back()` 有实现但**没有 CLI 入口**。
+    合起来 = 记忆用着用着就消失、且用户没有任何恢复手段。目录只会单向收缩。
+    """
+
+    def _make_overdue(self):
+        import re
+        from datetime import date, timedelta
+        self.init()
+        self.dep("关键规矩：发布前必须跑全套测试 zeta-9911", kind="lesson")
+        self.cli("reconcile")
+        old = (date.today() - timedelta(days=200)).isoformat()
+        for f in (self.root_path / "memories" / "detail").glob("mem-*.md"):
+            t = f.read_text(encoding="utf-8")
+            t = re.sub(r"(?m)^last_verified:.*$", "last_verified: " + old, t)
+            t = re.sub(r"(?m)^last_seen:.*$", "last_seen: " + old, t)
+            f.write_text(t, encoding="utf-8")
+        self.cli("gate", "all")
+        return self.cli("stats")["by_status"]
+
+    def test_used_entry_returns_to_catalog(self):
+        status = self._make_overdue()
+        self.assertIn("dormant", status, "门④ 没把它降级，用例前提没成立：%s" % status)
+        self.assertEqual(self.cli("catalog", "--limit", "50")["count"], 0,
+                         "降级后仍在目录里（目录只收 active）")
+
+        for _ in range(3):
+            self.cli("search", "--limit", "10", "--", "zeta-9911")
+        self.cli("gate", "all")
+        self.assertGreater(self.cli("catalog", "--limit", "50")["count"], 0,
+                           "被反复检索命中后仍不在目录里 —— 使用驱动复活没生效")
+        self.assertIn("active", self.cli("stats")["by_status"])
+
+    def test_bring_back_has_a_cli_entry_point(self):
+        self._make_overdue()
+        det = sorted((self.root_path / "memories" / "detail").glob("mem-*.md"))
+        out = self.cli("bring-back", det[0].stem, "--reason", "手工恢复")
+        self.assertTrue(out.get("ok"), "bring-back 没有可用入口：%s" % out)
+        self.assertGreater(self.cli("catalog", "--limit", "50")["count"], 0,
+                           "bring-back 之后条目没回到目录")
+
+    def test_dormant_still_searchable_and_loadable(self):
+        """遗忘 ≠ 丢失：降级后仍必须能检索、能读正文。"""
+        self._make_overdue()
+        det = sorted((self.root_path / "memories" / "detail").glob("mem-*.md"))
+        found = self.cli("search", "--limit", "10", "--", "zeta-9911")
+        self.assertGreater(found["count"], 0, "dormant 条目检索不到了（等于丢失）")
+        loaded = self.cli("load", "--", det[0].stem)
+        self.assertTrue(loaded["ok"], "dormant 条目读不出正文")
+        self.assertEqual(loaded["status"], "dormant")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

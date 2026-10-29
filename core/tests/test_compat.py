@@ -177,6 +177,16 @@ class TestOldFormat(Base):
         self.assertEqual(items[0]["status"], "active", "无状态应视为 active")
 
     def test_corrupt_frontmatter_degrades_not_crashes(self):
+        """frontmatter 坏了不要崩——**而且不能因为"坏了"就变成全局可见**。
+
+        ⚠️ 这条用例原来断言 `out["detail"] == 1`，**等于把 H2 的 bug 当成了规格**：
+        宽松解析对坏 frontmatter 返回 `({}, 全文)`，`scope` 缺失于是回落成 `"global"`
+        —— 最宽的取值。只要损坏一个字节（把结束分隔符 `---` 写成 `--x`），
+        一条圈内机密就单向放宽成全局可见（实测复现）。
+
+        正确规格是**隔离**：解析失败 → 不进目录/检索/门（`detail` 不计数），
+        但必须如实报告在 `damaged[]` 里——"看不见"不等于"没发生"。
+        """
         self.init()
         d = self.root / "memories" / "detail"
         d.mkdir(parents=True, exist_ok=True)
@@ -184,7 +194,15 @@ class TestOldFormat(Base):
                                   encoding="utf-8")
         out = self.cli("stats")     # 不应崩
         self.assertTrue(out["ok"])
-        self.assertEqual(out["detail"], 1)
+        self.assertEqual(out["detail"], 0,
+                         "损坏的 detail 仍被计入目录 —— 它会以 scope=global 泄漏到所有圈")
+        health = self.cli("health")
+        self.assertTrue(health["ok"], "health 不该因为一条坏文件就崩")
+        self.assertEqual([x["id"] for x in health["damaged"]], ["bad"],
+                         "损坏文件没有出现在 health.damaged[] 里 —— 问题隐身了")
+        self.assertEqual(health["status"], "warn", "有损坏条目时 health 应给出 warn")
+        self.assertTrue(any("损坏" in n for n in health["notes"]),
+                        "notes 里没有说明损坏：%s" % health["notes"])
 
     def test_empty_body_skipped(self):
         self.init()

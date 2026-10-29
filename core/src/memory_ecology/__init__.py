@@ -19,7 +19,7 @@ distill_stage / eco_review）已改为对本包 `gates` 的薄包装。
   4. **根自证**：写前读 `.eco/root.json`，不匹配即只读降级并留痕，不抛错、不阻塞。
 """
 
-__version__ = "3.2.1"
+__version__ = "3.2.2"
 
 # 版本三处对齐（A2A §B5）由 scripts/check_version.py 校验；此处是唯一权威来源。
 VERSION = __version__

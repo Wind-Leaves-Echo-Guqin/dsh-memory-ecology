@@ -76,8 +76,8 @@ dsh plugin --profile <profile> add link:D:/work/dsh-memory-ecology/plugin
 ## 看（观测舱）
 
 ```powershell
-# GUI 在 companion 仓库 memory-ecology-兼容版：
-#   cd memory-ecology-兼容版 && python integrations/gui/eco_gui.py --eco-root <根>
+# GUI 在 companion 仓库 memory-ecology-compat：
+#   cd memory-ecology-compat && python integrations/gui/eco_gui.py --eco-root <根>
 ```
 
 八个视图：**四门实况**（哪个门死了、死了多久）/ 圈的视角 / 注入观测 / 成本面板 /

@@ -105,6 +105,18 @@ def cmd_gate(root, args) -> dict:
     return {"ok": False, "error": "unknown-gate", "gate": which}
 
 
+def cmd_bring_back(root, args) -> dict:
+    """把休眠/归档的条目显式恢复成 active（回目录）。
+
+    **为什么必须有 CLI 入口**：`gates.bring_back()` 一直存在，但没有任何命令
+    能调到它——等于"文档说有恢复通道，用户实际没有"。门④ 一旦真正运行
+    （H1 修复后），降级就是会发生的常态，没有恢复通道等于单向丢目录。
+    """
+    if root.readonly:
+        return root.readonly_payload()
+    return gates.bring_back(root, args.name, reason=args.reason or "")
+
+
 def cmd_catalog(root, args) -> dict:
     budget, limit = store.circle_budget(root.path, args.scope or "global")
     payload = retrieve.catalog_payload(
@@ -293,11 +305,23 @@ def cmd_health(root, args) -> dict:
     except Exception as exc:  # noqa: BLE001
         notes.append("detail 读取失败：%s" % str(exc)[:120])
         items = []
+    # **H2：损坏的 detail 必须可见**。它们已被排除在目录/检索/门外（不再以
+    # 「scope=global」身份泄漏），但"看不见"不等于"没发生"——不报出来就永远修不好。
+    try:
+        damaged = store.scan_damaged(root.detail)
+    except Exception as exc:  # noqa: BLE001
+        notes.append("损坏扫描失败：%s" % str(exc)[:120])
+        damaged = []
+    if damaged:
+        notes.append("%d 条 detail 损坏（已隔离，不进目录/检索）：%s"
+                     % (len(damaged), "、".join(d["id"] for d in damaged[:5])))
     status = "ok"
     for g in gate["gates"]:
         if g["dead"]:
             status = "warn"
             notes.append("%s 空转：%s" % (g["name"], g["reason"]))
+    if damaged:
+        status = "warn"
     try:
         mat = retrieve.read_materialized(root, "global")
     except Exception:  # noqa: BLE001
@@ -309,6 +333,9 @@ def cmd_health(root, args) -> dict:
             "readonly": root.readonly, "status": status, "notes": notes,
             "gates": gate, "inject": inject, "cost": cost,
             "detail": len(items),
+            # **增量字段，不改既有结构**：GUI 侧照旧读 detail/status/notes，
+            # 需要细看时再读 damaged[]。H2 的"隔离"在这里是**可观测的**。
+            "damaged": damaged,
             "materialized": mat is not None,
             "schema": rootmod.SCHEMA_VERSION}
 
@@ -461,6 +488,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("version", help="版本三处对齐自检")
     sub.add_parser("prune", help="账本/备份归档（不做物理删除记忆）")
 
+    bb = sub.add_parser("bring-back", help="把休眠/归档的条目恢复成 active（回目录）")
+    bb.add_argument("name", help="条目 id 或文件名")
+    bb.add_argument("--reason", default="", help="恢复原因（写进复核账）")
+
     cw = sub.add_parser("circles-write", help="写圈配置（GUI G4 通道）")
     cw.add_argument("--file", default=None, help="从文件读 JSON")
     cw.add_argument("--json", default=None, help="内联 JSON")
@@ -492,6 +523,7 @@ _DISPATCH = {
     "health": cmd_health,
     "version": cmd_version,
     "prune": cmd_prune,
+    "bring-back": cmd_bring_back,
     "circles-write": cmd_circles_write,
     "pack": cmd_pack,
 }

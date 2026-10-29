@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dsh-memory-ecology"
-version = "3.2.1"
+version = "3.2.2"
 description = "记忆生态 · 可移植核心：四道门（写入整合/配额巩固/画像蒸馏/复核降级）+ 圈 + 检索 + 只读记忆包。stdlib only，零宿主依赖。"
 readme = "README.md"
 license = { text = "MIT" }

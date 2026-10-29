@@ -137,6 +137,69 @@ def dump_frontmatter(fm: dict, body: str) -> str:
     return "\n".join(lines) + str(body).strip() + "\n"
 
 
+# ── 损坏判定（H2：解析失败必须隔离，不能当成"全局"）─────────────────────
+#
+# 为什么需要它：宽松版 `parse_frontmatter` 对坏 frontmatter 返回 `({}, 全文)`，
+# 于是 detail 的 scope 回落到 `"global"`——**最宽的取值**。一个字节的损坏
+# （比如把结束分隔符 `---` 写成 `--x`）就能把一条圈内机密单向放宽成全局可见；
+# 紧接着门④ 又拿"全文"当正文回写，落盘变成两个 frontmatter 块、`status`
+# 同时出现两个互相矛盾的值（实测复现）。
+#
+# 判定口径刻意保守：**只认"明确写了 frontmatter 但坏了"**。完全没有 frontmatter
+# 的老文件（`nofm.md`）不算损坏——那是既有合法形态，见
+# `tests/test_compat.py::test_missing_frontmatter_is_not_fatal`。
+
+def has_frontmatter_block(text: str) -> bool:
+    """文件是否**看起来想写** frontmatter：首行非空行以 `---` 开头。"""
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        return line.strip().startswith("---")
+    return False
+
+
+def damage_reason(text: str) -> str:
+    """→ "" 表示正常；否则是损坏原因（供 health / quarantine 用）。"""
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    if not has_frontmatter_block(text):
+        return ""
+    # 严格版要求"第一行**恰好是** `---`"，宽松版的 startswith("---") 会把
+    # `----` / `---x` 也吞掉，导致"看起来没坏其实没解析"。
+    first = ""
+    for line in text.splitlines():
+        if line.strip():
+            first = line.rstrip("\r\n").strip()
+            break
+    if first != "---":
+        return "frontmatter 起始行不是独立分隔符：%r" % first[:40]
+    fields, _body = parse_frontmatter_strict(text)
+    if fields is None:
+        return "frontmatter 缺结束分隔符"
+    if not any(k == "type" for k in fields):
+        # 有块但一个字段都没解析出来（例如全角冒号/缩进错位）→ 不可信
+        if not fields:
+            return "frontmatter 块内无可解析字段"
+    for dup in ("scope", "status", "type", "id"):
+        if sum(1 for ln in text.splitlines()
+               if ln.split(":", 1)[0].strip() == dup and ":" in ln
+               and ln.strip() and not ln.strip().startswith("#")) > 1 \
+                and _count_fm_blocks(text) > 1:
+            return "存在多个 frontmatter 块（%s 出现多值）" % dup
+    return ""
+
+
+def _count_fm_blocks(text: str) -> int:
+    """独立成行的 `---` 个数 → 近似 frontmatter 块数（2 个分隔符 = 1 块）。"""
+    n = 0
+    for line in text.splitlines():
+        if line.strip() == "---":
+            n += 1
+    return n // 2
+
+
 # ── L1（§ 分隔）───────────────────────────────────────────────────────
 
 _SECTION_RE = re.compile(r"(?m)^[ \t]*§[ \t]*\r?$")
@@ -170,7 +233,13 @@ def serialize_l1(entries, nl: str = "\n") -> str:
 # ── L2 detail ────────────────────────────────────────────────────────
 
 def load_detail(detail_dir: Path) -> list[dict]:
-    """读 detail 目录 → [{path, name, fm, body}]。空正文跳过（不是错误）。"""
+    """读 detail 目录 → [{path, name, fm, body}]。空正文跳过（不是错误）。
+
+    **损坏的文件不进返回值**（H2）：解析失败时宽松版会给出 `fm={}`，
+    而下游把缺失的 `scope` 归一成 `"global"`——损坏于是把"隔离"单向放宽成
+    "全局可见"。这里直接把它们排除在目录/检索/门的视野之外，
+    只通过 `scan_damaged()` 暴露成可诊断的清单（"不可见但可查"）。
+    """
     items = []
     d = Path(detail_dir)
     if not d.is_dir():
@@ -180,6 +249,9 @@ def load_detail(detail_dir: Path) -> list[dict]:
         fm, body = parse_frontmatter(text)
         if not body:
             continue
+        if damage_reason(text):
+            # 已损坏：不参与任何"可见性"计算。修法不是猜它的圈，而是如实报告。
+            continue
         items.append({
             "path": f, "name": f.stem, "fm": fm, "body": body,
             "type": norm_type(fm.get("type", "")),
@@ -187,6 +259,24 @@ def load_detail(detail_dir: Path) -> list[dict]:
             "scope": norm_scope(fm.get("scope")) if fm.get("scope") else "global",
         })
     return items
+
+
+def scan_damaged(detail_dir: Path) -> list[dict]:
+    """损坏的 detail 清单（**只诊断，不猜归属**）。"""
+    out = []
+    d = Path(detail_dir)
+    if not d.is_dir():
+        return out
+    for f in sorted(d.glob("*.md")):
+        try:
+            text = paths.read_text(f)
+        except OSError as exc:
+            out.append({"id": f.stem, "path": str(f), "why": "读不了：%s" % str(exc)[:80]})
+            continue
+        why = damage_reason(text)
+        if why:
+            out.append({"id": f.stem, "path": str(f), "why": why})
+    return out
 
 
 def detail_prefixes(items: list[dict], n: int = 30) -> dict:
@@ -279,6 +369,25 @@ def session_of_file(f: Path) -> str:
     return ""
 
 
+def candidate_lines(f: Path) -> list[str]:
+    """候选文件里的候选正文列表（剥 checkbox 前缀后的 group(2)）。
+
+    **判重与"是否消费"必须共用这一个口径**：`iter_candidates`（整合时判重）
+    与 `unconsumed_in_file`（判文件消费完没有）各自拼正则，一旦有偏差就会出现
+    "整合了但文件永远判未消费"（pending 无限堆积）或反过来"候选静默丢失"。
+    """
+    out = []
+    try:
+        text = paths.read_text(f)
+    except OSError:
+        return out
+    for raw in text.splitlines():
+        m = _CAND_RE.match(_CHECKBOX_RE.sub("- ", raw))
+        if m:
+            out.append(m.group(2))
+    return out
+
+
 def candidate_fp(scope: str, text: str, body_max: int = BODY_MAX) -> tuple[str, str]:
     """候选指纹的**唯一实现**。→ (指纹, 归一后的正文)
 
@@ -294,15 +403,17 @@ def candidate_fp(scope: str, text: str, body_max: int = BODY_MAX) -> tuple[str, 
 
 def unconsumed_in_file(f: Path, known: set, body_max: int = BODY_MAX,
                        pending_root: Path | None = None) -> int:
-    """该候选文件里尚未被整合的条目数（与 integrate 同口径，**含 scope**）。"""
+    """该候选文件里尚未被整合的条目数（与 integrate 同口径，**含 scope**）。
+
+    `known` 必须是**整合结束后的**指纹集合：其中要包含
+    · detail/candidate 里已有的指纹（按 `it["fm"]["fp"]`，而不是重新算正文指纹）
+    · 本轮 `merged` 分支命中的候选指纹
+    否则相似合并掉的文件会被判成"未消费"，pending 永远不空（实测复现）。
+    """
     scope = scope_of_file(f, pending_root)
     n = 0
-    for raw in paths.read_text(f).splitlines():
-        line = _CHECKBOX_RE.sub("- ", raw)
-        m = _CAND_RE.match(line)
-        if not m:
-            continue
-        fp, _ = candidate_fp(scope, m.group(2), body_max)
+    for text in candidate_lines(f):
+        fp, _ = candidate_fp(scope, text, body_max)
         if fp not in known:
             n += 1
     return n

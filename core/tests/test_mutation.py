@@ -7,7 +7,7 @@
 或者"测的是实现细节而不是行为"。变异测试是验证"测试有效性"的唯一手段——
 故意把被测代码改坏成**真实缺陷模式**，看测试是否报警。
 
-做法（与兼容版 `memory-ecology-兼容版/tests/test_mutation.py` 同类，但针对新核心）
+做法（与兼容版 `memory-ecology-compat/tests/test_mutation.py` 同类，但针对新核心）
 ------------------------------------------------------------------------------
 1. 把 `src/` + `tests/` + `plugin/` + `gui/` 整棵树复制到 `%TEMP%` 下的独立沙盒
    （排除 `__pycache__` / `*.pyc` / `.git`），并种一个诱饵 `.git`——本机红线：
@@ -50,7 +50,7 @@ SKIP_DIRS = ("__pycache__", ".git", ".pytest_cache", "_bak-archive", "node_modul
 # ── 被测目标 ─────────────────────────────────────────────────────────
 
 CORE = "tests/test_core.py"
-# 真实观测舱不在这里：`integrations/gui` + `gui-v2.3` 在 memory-ecology-兼容版 仓库，
+# 真实观测舱不在这里：`integrations/gui` + `gui-v2.3` 在 memory-ecology-compat 仓库，
 # 那边的 `tests/test_gui_v3_2_0.py` 自己守。本仓库的 `tests/test_gui.py` 已归档到
 # `_archive/gui-wrong-target-v0.4/`（一度把服务端复制过来的错误目标）。
 COMPAT = "tests/test_compat.py"
@@ -205,15 +205,40 @@ MUTANTS: list[dict] = [
     dict(
         name="M9  review 删掉 last_verified 刷新", group="gates",
         rel="src/memory_ecology/gates.py",
-        old='                if (fm.get("last_verified") or "") != paths.today():\n'
-            '                    fm["last_verified"] = paths.today()\n'
-            '                    if not dry_run:\n'
-            '                        root.write_item(it["name"], fm, it["body"])\n'
-            '                    refreshed.append(it["name"])\n',
-        new='                pass  # MUTANT: 不刷新 last_verified、不记 refreshed\n',
-        why="被使用不等于已验证 → refreshed 为空，下次仍会被降级",
+        # 2026-10-29：used_recently 分支重写（dormant 复活 + 刷新合并进 dirty 块），
+        # 原文片段随之变化，旧 old= 匹配 0 次会让变异体"失效"而非"被抓到"——
+        # 那是**测试基建失真**，不是代码变好。这里对齐新结构。
+        old='                    fm["last_verified"] = paths.today()\n'
+            '                    if revived:\n',
+        new='                    pass  # MUTANT: 不刷新 last_verified\n'
+            '                    if revived:\n',
+        why="被使用不等于已验证 → last_verified 不刷新，下次仍会被再次降级",
         runners=[P(CORE + "::TestGate4::test_used_entry_is_not_archived")],
-        hint="（若存活）补强：断言 last_verified == today 且 refreshed 含该 id。",
+        hint="（若存活）补强：断言 last_verified == today。",
+    ),
+    dict(
+        name="M9b review 删掉 dormant 复活", group="gates",
+        rel="src/memory_ecology/gates.py",
+        old='                revived = status == "dormant"\n',
+        new='                revived = False  # MUTANT: 被使用也不复活\n',
+        why="被反复使用却永远回不到目录（目录单向收缩）",
+        runners=[P(CORE + "::TestGate4::test_used_entry_is_not_archived")],
+        hint="（若存活）补强：断言 status 回到 active。",
+    ),
+    dict(
+        name="M9c review 让 archived 被普通命中自动复活", group="gates",
+        rel="src/memory_ecology/gates.py",
+        # 变异体必须**整块替换**（含 continue）。只替换到注释行会让 continue 留下，
+        # 等于什么都没改 —— 那种变异体会"存活"但其实是 INVALID（无效实验）。
+        old='            if status == "archived":\n'
+            '                # 终态：**只能靠显式 `bring-back` 恢复**（那条路会留一笔账）。\n'
+            '                # 一次偶然的检索命中不足以把已归档记忆自动拉回目录——\n'
+            '                # 撤销系统的最终判断需要人的意图，不能是副作用。\n'
+            '                continue\n',
+        new='            # MUTANT: 删掉「归档是终态」的短路（归档可被副作用改写）\n',
+        why="归档是终态，撤销它需要人的显式意图（bring-back），不能是检索副作用",
+        runners=[P(CORE + "::TestGate4::test_archived_is_terminal_until_explicit_bring_back")],
+        hint="（若存活）补强：断言 archived 不被自动复活。",
     ),
     dict(
         name="M10 distill 删掉交叉印证旁路", group="gates",
@@ -346,7 +371,7 @@ MUTANTS: list[dict] = [
             '                            "idle"),  # MUTANT: idle 也算有效动作\n',
         why="246 行 idle 把 52 行 extrude 淹了 → 门② 明明 0 promote 却显示『活着』",
         # GUI 那两条已随 `tests/test_gui.py` 归档（真实观测舱迁到
-        # memory-ecology-兼容版，那边有自己的 test_gui_v3_2_0.py）。
+        # memory-ecology-compat，那边有自己的 test_gui_v3_2_0.py）。
         # 核心这三条足以判定：effective 白名单一变，idle/selfcheck 立刻被算进去。
         runners=[P(CORE + "::TestGate2::test_idle_rows_never_count_as_effective",
                    CORE + "::TestGate2::test_selfcheck_rows_never_count_as_effective",

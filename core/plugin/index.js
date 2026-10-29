@@ -535,6 +535,15 @@ export async function apply(ctx, config = {}) {
         if (payload.error === 'not-found') return { result: `（没有这条记忆：${id}）` };
         return { result: `（记忆读取失败：${payload.error || 'unknown'}）` };
       }
+      // **H4：load 也要过圈。** `id` 是模型给的，而检索/目录都受圈约束；
+      // 唯独 load 直通，等于给了一条"知道 id 就能读任意圈"的旁路
+      // （跨圈泄漏实测：projb 会话 `memory_load` 能读出 proja 的口令正文）。
+      // 判定口径与核心 `retrieve` 一致：本圈 + global 可见，其余一律不返回正文。
+      const want = normScope(args?.scope) || normScope(state.circle);
+      const got = normScope(payload.scope || 'global');
+      if (want && want !== 'global' && got !== want && got !== 'global') {
+        return { result: `（没有这条记忆：${id}）` };   // 不确认它存在，避免探测圈名
+      }
       const kind = payload.kind ? ` [${payload.kind}]` : '';
       const status = payload.status && payload.status !== 'active' ? ` (${payload.status})` : '';
       return { result: `${id}${kind}${status}\n${payload.body}` };
@@ -566,7 +575,13 @@ export async function apply(ctx, config = {}) {
       if (!q) return { result: '（query 必填）' };
       const n = Math.max(1, Math.min(20, Number(args?.limit ?? 8) || 8));
       const argv = ['search', '--limit', String(n)];
-      const scopeArg = normScope(args?.scope);
+      // **H4：scope 必须有兜底，不能交给模型自己填。**
+      // 旧实现只认 `args.scope`，模型省略就是全库直通——圈内会话用一句话就能
+      // 检索到别的项目的机密（实测：projb 会话不带 scope 能命中 proja 的口令）。
+      // 插件在 `agent/created` 时**已经算出了 state.circle**（cwd → 圈，由核心
+      // 声明的前缀决定），直接用它是现成信息，不需要模型配合。
+      // 显式要 `global`（跨圈查）仍然放行——那是用户的明确意图，不是默认值。
+      const scopeArg = normScope(args?.scope) || normScope(state.circle);
       if (scopeArg && scopeArg !== 'global') argv.push('--scope', scopeArg);
       argv.push('--', q);
       const res = await call(argv);
@@ -614,24 +629,25 @@ export async function apply(ctx, config = {}) {
   // 是唯一"安全地做异步领域工作"的时点（宿主明令禁止在 agent/created 里 await
   // whenIdle()，那会死锁）。
   //
-  // `runMaintenance` 存在但**不是定时器**：只有 phase 是 idle 时能同步抢占，
-  // 否则**同步抛错**（already has active work）。所以这里必须 try/catch——
-  // 忙的时候不是错误，只是"这轮跳过"。抢不到也没关系：下一轮还会来，
-  // 而且四道门本身幂等（指纹 + 文件状态），漏一次可补。
-  ctx.on('agent/turn-stopping', async ({ agent } = {}) => {
+  // **H1（已实测确认根因）：这里不能用 `runMaintenance`。**
+  // 宿主 `dsh-agent-loop` 的调用顺序是
+  //   `turn()` 内部派发 `agent/turn-stopping` → turn 返回 → `kick().finally` 才切 idle
+  // 所以本处理器运行时 `phase.kind` **必然**是 `running`，而
+  //   `runMaintenance(job) { if (this.phase.kind !== "idle") throw ... }`
+  // 于是旧实现每一轮都**必抛**，落进 catch，而 catch 只 `logger.debug`。
+  // 后果是 `gate all`（门②③④ 的唯一调用点）结构性地从不执行：
+  // quota_log / distill_log / review_log 恒为空，"四道门"实际只有门①在跑。
+  //
+  // 正确做法：直接排进插件自己的串行链。`enqueueMaintenance` 内部已按
+  // `maintenanceIntervalMs` 门控，四门本身幂等（指纹 + 文件状态），漏一次可补；
+  // 且它不抢 phase，不会和宿主的 turn 生命周期打架。
+  ctx.on('agent/turn-stopping', async () => {
     if (!state.ready && !(await ensureReady())) return;
     try {
-      if (agent && typeof agent.runMaintenance === 'function') {
-        await agent.runMaintenance(async () => {
-          await enqueueMaintenance('turn-stopping');
-        });
-      } else {
-        // 没有 runMaintenance 的宿主：直接排进串行链（间隔门控保证不会每轮真跑）
-        await enqueueMaintenance('turn-stopping');
-      }
+      await enqueueMaintenance('turn-stopping');
     } catch (e) {
-      // "already has active work" 是正常路径，不是故障
-      ctx.logger.debug(`eco-memory: 维护跳过（agent 忙或不可用）: ${e?.message ?? e}`);
+      // 真正的异常要能被看见（旧实现一律 debug，等于把所有失败都藏了）
+      ctx.logger.warn(`eco-memory: 维护失败（本轮跳过，下轮会补）: ${e?.message ?? e}`);
     }
   });
 }

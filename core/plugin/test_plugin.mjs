@@ -226,16 +226,29 @@ await test('T14 物化文件 schema 不符时不注入（fail-open）', async ()
   }
 });
 
-await test('T13 turn-stopping：agent 忙（runMaintenance 抛错）时安全跳过', async () => {
+// **H1 回归**：旧实现把维护塞进 `agent.runMaintenance()`，而宿主在
+// `agent/turn-stopping` 派发时 phase **必然**是 running → `runMaintenance`
+// 必抛 → catch 只 debug → `gate all` 结构性从不执行（门②③④ 全哑）。
+// 这条用例原来断言"抛错时安全跳过"，**等于把 bug 当成了规格**。
+// 现在改为：即使宿主换了 API / 抛错，维护也必须真的排进串行链并跑完四门。
+await test('T13 turn-stopping：不再依赖 runMaintenance，四门必须真的跑', async () => {
   const h = cap.handlers['agent/turn-stopping'][0];
+  let called = 0;
   const busy = {
-    runMaintenance: () => { throw new Error('agent "x" already has active work'); },
+    runMaintenance: () => { called += 1; throw new Error('agent "x" already has active work'); },
   };
   await h({ agent: busy });   // 不应抛
-  const idle = {
-    runMaintenance: async (task) => task(new AbortController().signal),
-  };
-  await h({ agent: idle });   // 也不应抛
+  assert.equal(called, 0,
+    '仍在调用 agent.runMaintenance —— turn-stopping 时它必抛，门②③④ 会继续全哑');
+
+  // 四门的日志表必须真的出现行（这是"门在跑"的唯一硬证据）
+  const probe = execFileSync(PY, ['-c',
+    'import sqlite3,sys;c=sqlite3.connect(sys.argv[1]);'
+    + 'print(",".join("%s=%d" % (t, c.execute("select count(*) from "+t).fetchone()[0])'
+    + ' for t in ("quota_log","distill_log","review_log")));c.close()',
+    path.join(root, 'eco.db')], { encoding: 'utf8' }).trim();
+  assert.doesNotMatch(probe, /(quota_log|distill_log|review_log)=0\b/,
+    `turn-stopping 之后四门账本仍有空表：${probe}`);
 });
 
 // ── fail-open ───────────────────────────────────────────────────────────
@@ -340,6 +353,47 @@ await test('T8c 无 cwd 的 agent 不注册遮蔽段（降级为全局）', () =
   const c = fakeAgent('');
   cap.handlers['agent/created'][0]({ agent: c, source: 'startup' });
   assert.equal(c._box.reg, null);
+});
+
+// ── T8d 冷路径隔离（H4）────────────────────────────────────────────────
+// **这条必须在旧代码上红**：旧实现 `memory_search` 只认 `args.scope`，
+// 模型省略就是全库直通；`memory_load` 干脆不校验圈。核心的 `--scope` 语义
+// 本来就是对的，泄漏发生在插件"没把已算出的圈接上"这一层。
+await test('T8d 冷路径隔离：不带 scope 时按会话圈过滤（search + load）', async () => {
+  core(['deposit', '--session', 't', '--text', '项目甲：部署口令 blue-green-7788', '--kind', 'procedural', '--scope', 'proj-alpha'], root);
+  core(['gate', '1'], root);
+
+  // 让插件把 state.circle 算成 beta（真实路径：agent/created → circleOf(cwd)）
+  const beta = fakeAgent('D:/proj-beta');
+  cap.handlers['agent/created'][0]({ agent: beta, source: 'startup' });
+  await settle(400);
+
+  // ① search 不传 scope：必须按 beta 圈过滤，看不到 alpha 的口令
+  // 注意：断言不能直接 doesNotMatch(查询词)——未命中提示里会回显查询词
+  // （`（没有命中：blue-green-7788）`），那样写会让"正确隔离"被误判为泄漏。
+  const noScope = await cap.tools.memory_search.execute({ query: 'blue-green-7788', limit: 10 });
+  assert.match(noScope.result, /没有命中/,
+    `beta 会话不带 scope 检索到了 alpha 的口令（跨圈泄漏）：${noScope.result}`);
+
+  // ② 显式要 global 仍然放行（跨圈查是用户的明确意图，不是默认值）
+  const explicit = await cap.tools.memory_search.execute({ query: 'blue-green-7788', scope: 'global', limit: 10 });
+  assert.match(explicit.result, /blue-green-7788/,
+    '显式 scope=global 也查不到 —— 收紧过头会误伤"我要跨圈找"的正常意图');
+
+  // ③ load：知道 id 也不能读别的圈（id 是模型给的，必须能被圈约束）
+  const alphaId = core(['search', '--limit', '5', '--scope', 'proj-alpha', '--', 'blue-green-7788'], root)
+    .items?.[0]?.id;
+  assert.ok(alphaId, '取不到 alpha 圈的 id');
+  const leaked = await cap.tools.memory_load.execute({ id: alphaId });
+  assert.doesNotMatch(leaked.result, /blue-green-7788/,
+    `beta 会话用 id 直接读出了 alpha 的正文（load 旁路）：${leaked.result}`);
+  assert.match(leaked.result, /没有这条记忆/,
+    `跨圈 load 的提示不该暴露"它存在"：${leaked.result}`);
+
+  // ④ 本圈/全局照常可读（不能把功能一起关死）
+  const betaSelf = await cap.tools.memory_load.execute({ id: firstId });
+  assert.match(betaSelf.result, /第一条可检索的经验|第二条事实/,
+    `全局条目在自己圈里读不出来了：${betaSelf.result}`);
 });
 
 // ── T15 记忆包 mount 段 ────────────────────────────────────────────────
