@@ -8,4 +8,6 @@ experiences/
 .dsh_inject_state*.json
 
 _diagram.*
+*.db-shm
+*.db-wal
 
