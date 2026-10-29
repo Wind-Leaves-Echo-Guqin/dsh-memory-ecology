@@ -6,3 +6,6 @@ experiences/
 *.db
 .env
 .dsh_inject_state*.json
+
+_diagram.*
+
