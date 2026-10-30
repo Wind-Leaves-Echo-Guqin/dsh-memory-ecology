@@ -6,7 +6,7 @@
   <img alt="dsh-memory-ecology" src=".github/assets/hero-light.svg" width="840">
 </picture>
 
-[![version](https://img.shields.io/badge/version-v3.2.2-2ea043?style=flat-square)](VERSION.md) [![python](https://img.shields.io/badge/python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/downloads/) [![core deps](https://img.shields.io/badge/核心依赖-0-success?style=flat-square)](#-30-秒上手) [![tests](https://img.shields.io/badge/core%20tests-7%20组全绿-2ea043?style=flat-square)](#-测试) [![deletion](https://img.shields.io/badge/物理删除-代码层禁用-8957e5?style=flat-square)](#-两条硬纪律) [![hosts](https://img.shields.io/badge/宿主-dsh%20%7C%20Hermes%20%7C%20任意-8957e5?style=flat-square)](#-兼容什么)
+[![version](https://img.shields.io/badge/version-v3.2.2-2ea043?style=flat-square)](VERSION.md) [![python](https://img.shields.io/badge/python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/downloads/) [![core deps](https://img.shields.io/badge/%E6%A0%B8%E5%BF%83%E4%BE%9D%E8%B5%96-0-success?style=flat-square)](#-30-秒上手) [![tests](https://img.shields.io/badge/core%20tests-7%20%E7%BB%84%E5%85%A8%E7%BB%BF-2ea043?style=flat-square)](#-测试) [![deletion](https://img.shields.io/badge/%E7%89%A9%E7%90%86%E5%88%A0%E9%99%A4-%E4%BB%A3%E7%A0%81%E5%B1%82%E7%A6%81%E7%94%A8-8957e5?style=flat-square)](#-两条硬纪律) [![hosts](https://img.shields.io/badge/%E5%AE%BF%E4%B8%BB-dsh%20%7C%20Hermes%20%7C%20%E4%BB%BB%E6%84%8F-8957e5?style=flat-square)](#-兼容什么)
 
 **给 agent 的记忆做「生命周期治理」：四道门自动运转，零第三方依赖，永不物理删除。**
 
