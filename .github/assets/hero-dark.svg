@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="840" height="240" viewBox="0 0 840 240" role="img" aria-label="dsh-memory-ecology — 记忆生命周期治理">
+  <title>dsh-memory-ecology</title>
+
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0B1220"/>
+      <stop offset="100%" stop-color="#101A2E"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#34D399"/>
+      <stop offset="100%" stop-color="#22D3EE"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="840" height="240" rx="14" fill="url(#bg)"/>
+
+  <g stroke="#1E293B" stroke-width="1" opacity="0.5">
+    <path d="M0 60H840M0 120H840M0 180H840"/>
+    <path d="M140 0V240M280 0V240M420 0V240M560 0V240M700 0V240"/>
+  </g>
+
+  <g font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif">
+    <text x="64" y="58" fill="#E2E8F0" font-size="27" font-weight="600">dsh-memory-ecology</text>
+    <text x="64" y="82" fill="#64748B" font-size="13" letter-spacing="3"
+          font-family="ui-monospace,SFMono-Regular,Menlo,monospace">MEMORY GOVERNANCE FOR AGENTS</text>
+  </g>
+
+  <g transform="translate(64 112)">
+    <g stroke="url(#accent)" stroke-width="2.5" opacity="0.9" stroke-linecap="round">
+      <path d="M30 16H90"/>
+      <path d="M122 16H182"/>
+      <path d="M214 16H274"/>
+      <path d="M306 16H360"/>
+    </g>
+    <g fill="#0B1220" stroke="url(#accent)" stroke-width="2">
+      <circle cx="16" cy="16" r="15"/>
+      <circle cx="108" cy="16" r="15"/>
+      <circle cx="200" cy="16" r="15"/>
+      <circle cx="292" cy="16" r="15"/>
+    </g>
+    <g fill="url(#accent)" font-size="14" font-weight="700" text-anchor="middle"
+       font-family="ui-monospace,SFMono-Regular,Menlo,monospace">
+      <text x="16" y="21">1</text>
+      <text x="108" y="21">2</text>
+      <text x="200" y="21">3</text>
+      <text x="292" y="21">4</text>
+    </g>
+    <g fill="#64748B" font-size="11" text-anchor="middle"
+       font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',sans-serif">
+      <text x="16" y="50">写入</text>
+      <text x="108" y="50">配额</text>
+      <text x="200" y="50">蒸馏</text>
+      <text x="292" y="50">复核</text>
+    </g>
+    <g transform="translate(374 -8)">
+      <rect width="92" height="48" rx="9" fill="#0F172A" stroke="#334155"/>
+      <g fill="url(#accent)" opacity="0.9">
+        <rect x="12" y="13" width="50" height="3.5" rx="1.75"/>
+        <rect x="12" y="22" width="68" height="3.5" rx="1.75"/>
+        <rect x="12" y="31" width="40" height="3.5" rx="1.75"/>
+      </g>
+    </g>
+  </g>
+
+  <g font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',Helvetica,Arial,sans-serif">
+    <text x="64" y="200" fill="#94A3B8" font-size="15">别的方案在解决「怎么召回」，</text>
+    <text x="64" y="222" fill="#E2E8F0" font-size="15">我们治理它前面那层——记忆的生命周期。</text>
+  </g>
+
+  <g transform="translate(548 88)" font-family="ui-monospace,SFMono-Regular,Menlo,monospace">
+    <text x="0" y="0" fill="url(#accent)" font-size="19" font-weight="700">4</text>
+    <text x="30" y="0" fill="#64748B" font-size="12">道门 · 自动运转</text>
+    <text x="0" y="30" fill="url(#accent)" font-size="19" font-weight="700">0</text>
+    <text x="30" y="30" fill="#64748B" font-size="12">第三方依赖 · 纯 stdlib</text>
+    <text x="0" y="60" fill="url(#accent)" font-size="19" font-weight="700">0</text>
+    <text x="30" y="60" fill="#64748B" font-size="12">次物理删除 · 代码层禁用</text>
+  </g>
+
+  <text x="776" y="224" fill="#334155" font-size="11" text-anchor="end"
+        font-family="ui-monospace,SFMono-Regular,Menlo,monospace">v3.2.2</text>
+</svg>

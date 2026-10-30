@@ -1,10 +1,14 @@
-# dsh-memory-ecology — 记忆生态 · dsh 独立插件 v3.2.0
+# dsh-memory-ecology — 记忆生态 · dsh 独立插件 v3.2.2
 
 一套跑在 dsh 里的长期记忆治理系统：**四道门**（写入整合 / 配额巩固 / 画像蒸馏 / 复核降级）
 \+ 声明式生态圈 + 只读记忆包 + 观测舱。**零 cron、零配置、零第三方依赖、永不物理删除。**
 
 > 版本唯一权威来源：`src/memory_ecology/__init__.py: __version__`。
 > 校验：`python -m memory_ecology version`（四处一致才 ok）。
+>
+> 注意：本目录（`core/`）的产品版本跟随主仓库（当前 v3.2.2）；
+> `integrations/gui-v3/` 的 `package.json` 写的是 **GUI 组件版本 3.2.0**，属另一条独立的
+> 版本轴，两者刻意不对齐。
 
 ---
 
