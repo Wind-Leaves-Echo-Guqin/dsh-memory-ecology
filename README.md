@@ -202,6 +202,26 @@ cron 重跑 / cron 钉住 / 体检 / 索引重建 / 急救修复 / 圈配置 / �
 - **门④ 的"遗忘"是降级不是删除**：archived 条目文件一直在，可显式恢复。
 - **GUI 是可选件**，核心不依赖它，没装 node 也能用全部治理能力。
 - **只在 Windows 上做了真机验证**（生产环境是 Windows + 计划任务），Linux/macOS 未实测。
+### ⚠️ 从旧版本升级时必读：第一次 `gate all` 会降级一批条目
+
+**这不是数据丢失，但看起来像。**
+
+门②③④ 在旧版本里因 phase 竞态**从未真正执行过**（详见 `core/CHANGELOG.md` H1 条）。
+修好后第一次跑 `gate all`，会按遗忘曲线把久未使用的条目从 active 降为 dormant
+（实测样本：**10 条里降 5 条**）。
+
+这些条目**不再出现在注入目录**（目录只收 active），于是上下文里"突然少了一半记忆"。
+但它们并没有被删除：
+
+| 你想做什么 | 怎么做 |
+|---|---|
+| 确认条目还在 | `memory_query --revive`（无参数）列出今日复活候选 |
+| 把它恢复回目录 | `memory_query --revive <slug>`（v3.1 线）<br>或 `python -m memory_ecology bring-back <id>`（`core/` 线） |
+| 只是读正文 | `memory_query <关键词>` 仍能命中降级条目；`memory_load` 可读全文 |
+| 想避免被降级 | 升级后先跑 `gate 4 --dry-run` 看会降哪些，确认后再真跑 |
+
+> 两条线的恢复命令不同：**v3.1（生产当前在跑）= `memory_query --revive`**；
+> **`core/`（新引擎）= `bring-back` 子命令**。别拿一条线的命令去另一条线上用。
 
 ---
 

@@ -110,7 +110,7 @@
 | A 功能对等、语义不同 | 两份实现都能跑但结论不同 | 门② vs memstore 的 detail_prefixes/is_same_source | ✅ 已收编（memstore 对齐门②生产语义：active-only + 单向包含） |
 | B 公共库落后、本地更强 | 强行统一会丢能力 | lib/llm vs eco_note.llm_extract | ✅ 已升级 lib/llm.complete_json（重试/sentinel/三级 JSON 提取/usage）→ eco_note/eco_extract 收编 |
 | C 语义模糊、都不完整 | 三处各自实现同一机制 | 水位线推进（signals/extract/note） | ✅ 已抽 lib/watermark.py（(timestamp,id) 复合键，同 ts 截断跳窗根治；旧标量格式兼容读取） |
-| D 双源定义、互相矛盾 | 两个模块各自定义同一矩阵 | eco_state.VALID vs eco_health_check.LEGAL_MATRIX（candidate/retained） | ⏳ 未修：一行改动 `from eco_state import VALID`，待与 SKILL.md 实际数据核对后执行 |
+| D 双源定义、互相矛盾 | 两个模块各自定义同一矩阵 | eco_state.VALID vs eco_health_check.LEGAL_MATRIX（candidate/retained） | ✅ **已修（2026-10-30 补记销账）**：`eco_health_check` 改为 `from eco_state import VALID as _VALID_STATE_FATE` + 形状转换 `LEGAL_MATRIX = {pair: True for pair in _VALID_STATE_FATE}`。运行时实测 `h._VALID_STATE_FATE is s.VALID` → **True**，即同一对象派生，结构上不可能再漂移。生产已部署（A1 漂移清零）。<br>⚠️ 此前该行长期写「⏳ 未修」，实际代码在 2026-10-29 的 0480922 就改完了——**是文档没跟上，不是代码没改**。教训：销账要同时改代码与登记表，否则外部读者会误判 |
 | E 最弱版本拖垮整体 | 5+ 套 frontmatter 解析并存，最弱的不兼容 CRLF | eco_state（已修）/safeio/eco_health_check(PyYAML)/eco_eval/eco_note_index | ⏳ 部分修：CRLF 已修；完全收敛到 memstore 宽松/严格两版待做（eco_eval/eco_state/eco_health_check/eco_note_index 四处） |
 
 ## 二、"未来会统一"登记（4+ 处）
