@@ -97,7 +97,7 @@ python -m memory_ecology --root /tmp/eco-demo catalog       # 看目录：注入
 | `core/tests/` | 核心 / 兼容与数据安全 / 并发 / 稳定性 / 变异（`run_tests.py` 7 组） | — |
 | `src/memory_ecology/` | v3.1 治理核心（历史线，33 个 CLI 脚本 + 17 个测试）：写门/配额/蒸馏/复核/eco_note/向量缓存 | 3.1.0 |
 | `integrations/hermes/` | Hermes 参考实现（state.db / cron 耦合件） | — |
-| `integrations/dsh/` | dsh 适配器（`package/` = EAC；`package-cordis/` = 官方桌面版 cordis） | — |
+| `integrations/dsh/` | dsh 适配器（`package/` = EAC；`package-cordis/` = 官方桌面版 cordis）。**v3.1 旧线（eco-note 时代），已冻结，勿用于新装** | — |
 | `integrations/gui-v3/` | 观测舱 GUI 当前发布版（液态玻璃 / iOS 外壳，七新视图） | 3.2.0 |
 | `models/` | 本地 embedding 权重（按需 fetch，不入库） | — |
 | `tools/` | 运维与回填工具（自检 / 看门狗 / 双树比对 / scope 回填） | — |
@@ -230,12 +230,14 @@ cron 重跑 / cron 钉住 / 体检 / 索引重建 / 急救修复 / 圈配置 / �
 | 消费者 | 怎么用 | 入口 |
 |---|---|---|
 | **任意 Python 程序** | `python -m memory_ecology` 子命令，JSON 进 JSON 出 | `core/src/` |
-| **dsh**（DeepSeek Harness） | cordis 插件，只读 + fail-open，往 `pending/` 追加候选 | `integrations/dsh/package-cordis/` |
-| **EAC / Extension SDK** | 同上，走 EAC 协议 | `integrations/dsh/package/` |
+| **dsh**（DeepSeek Harness） | cordis 插件，只读 + fail-open，往 `pending/` 追加候选 | `core/plugin/`（唯一维护线） |
+| **EAC / Extension SDK** | 同上，走 EAC 协议（v3.1 旧线，已冻结） | `integrations/dsh/package/` |
 | **Hermes** | 参考实现：会话提取 + 注入 hook + cron | `integrations/hermes/` |
 | **观测舱 GUI** | 人类用：本机浏览器 / pywebview 原生窗口，仅绑 127.0.0.1 | `integrations/gui-v3/` |
 
-核心零改动即可接新宿主；接入步骤见 [integrations/dsh/README.md](integrations/dsh/README.md)。
+核心零改动即可接新宿主。**新装一律用 `core/plugin/`**（随发布树的 dsh 插件本体，v3.2.x，安装命令见上文「dsh 宿主」）；
+[integrations/dsh/README.md](integrations/dsh/README.md) 是 v3.1 旧线（eco-note 时代）适配器文档，
+已冻结，仅供维护旧部署时参考，**勿按它新装**。
 
 ---
 

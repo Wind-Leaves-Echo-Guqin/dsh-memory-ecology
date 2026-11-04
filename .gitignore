@@ -11,3 +11,19 @@ _diagram.*
 *.db-shm
 *.db-wal
 
+# 前端（gui-v3）：依赖 / 构建产物 / 构建缓存一律不入库
+node_modules/
+integrations/gui-v3/dist/
+integrations/gui-v3/.tsbuild/
+integrations/gui-v3/.vite-cache/
+
+# 观测舱图标是生成物（脚本见 integrations/gui/assets/make_app_icon.py）
+integrations/gui/assets/*.ico
+integrations/gui/assets/*.png
+
+# aicr 状态区（.aicr/pr 记录是状态，不是内容）
+.aicr/
+
+# 观测舱运行日志（不入库）
+integrations/gui/action_log.jsonl
+integrations/gui/gui_error.log
