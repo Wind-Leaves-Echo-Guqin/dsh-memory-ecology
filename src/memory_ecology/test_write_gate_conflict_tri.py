@@ -174,3 +174,63 @@ class TestSafeioSupersededAt(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestNoSameRoundResurrect(SupersedeTestBase):
+    """审计 04-P1-1（3.4.0）：同轮 CONFLICT 移走的目标，绝不被同轮
+    UPDATE/DISPUTE 用轮首快照「复活」。"""
+
+    def test_update_entry_gives_up_when_target_gone(self):
+        d = self._entry("旧条目")
+        target = wg.supersede_entry(d, "新条目", self.quarantine, reason="r")
+        self.assertFalse(d["path"].exists())          # 目标已被同轮动作移走
+        self.assertFalse(wg.update_entry(d),
+                         "update_entry 对已移走目标未放弃")
+        self.assertFalse(d["path"].exists(),
+                         "轮首快照被写回旧路径——条目复活了（04-P1-1）")
+
+    def test_mark_disputed_gives_up_when_target_gone(self):
+        d = self._entry("旧条目乙")
+        wg.supersede_entry(d, "新条目乙", self.quarantine, reason="r")
+        self.assertFalse(wg._mark_disputed(d, "s", "r"),
+                         "_mark_disputed 对已移走目标未放弃")
+        self.assertFalse(d["path"].exists(), "dispute 标记复活了条目")
+
+    def test_update_entry_still_works_on_live_target(self):
+        d = self._entry("活条目", body="正常正文")
+        self.assertTrue(wg.update_entry(d))
+        fm, _ = parse_frontmatter_strict(d["path"].read_text(encoding="utf-8"))
+        self.assertEqual(fm["occurrences"], "2")
+
+
+class TestCtypeClamp(SupersedeTestBase):
+    """审计 04-P1-2（3.4.0）：LLM 输出的 type 必须被白名单钳制。"""
+
+    def test_case_variant_normalized(self):
+        self.assertEqual(wg._clamp_ctype("Semantic", "x"), "semantic")
+        self.assertEqual(wg._clamp_ctype(" EPISODIC ", "x"), "episodic")
+
+    def test_out_of_enum_falls_back_to_rule(self):
+        self.assertIn(wg._clamp_ctype("Preference", "部署踩坑记录"), safeio.DETAIL_TYPES)
+        self.assertIn(wg._clamp_ctype(None, "部署踩坑记录"), safeio.DETAIL_TYPES)
+        self.assertIn(wg._clamp_ctype(12345, "部署踩坑记录"), safeio.DETAIL_TYPES)
+
+
+class TestIllegalActionFallback(SupersedeTestBase):
+    """审计 04-P1-7（3.4.0）：非法 action 回退必须走 rule_fallback_action
+    单源——同槽位换代特征在回退分支也要得到 DISPUTE（不得被 UPDATE 吸收）。"""
+
+    def test_fallback_single_source_generation_change(self):
+        d = self._entry("端口条目", body="服务监听端口是 5432")
+        sims = [{"detail": d, "ratio": 0.87}]   # ∈ [near, conflict_th) 且换代特征
+        act = wg.rule_fallback_action("服务监听端口是 6432", sims,
+                                      sim_near=0.80, sim_noop=0.95)
+        self.assertEqual(act, "DISPUTE",
+                         "换代特征在回退分支被 UPDATE 吸收（04-P1-7 复活）")
+
+    def test_exact_duplicate_still_noop(self):
+        d = self._entry("同文条目", body="完全一样的正文")
+        sims = [{"detail": d, "ratio": 0.97}]
+        act = wg.rule_fallback_action("完全一样的正文", sims,
+                                      sim_near=0.80, sim_noop=0.95)
+        self.assertEqual(act, "NOOP")

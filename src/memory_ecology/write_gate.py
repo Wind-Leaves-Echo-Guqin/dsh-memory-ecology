@@ -343,6 +343,16 @@ def escalate_polarity_flip(decision: dict, text: str, sims: list[dict]) -> dict:
                 f"（否定极性相反，不判重复、不销毁旧条目）"))
 
 
+def _clamp_ctype(ctype, text: str) -> str:
+    """LLM 输出的 type 白名单钳制（审计 04-P1-2，v3.4.0）。
+
+    枚举外的值（大小写变体即触发，如 "Preference"/"Semantic"）会被 safeio 的
+    DETAIL_TYPES 校验炸 ValueError → 候选每日重试、所在文件永不消费。
+    归一化小写；白名单外回退规则判定（temperature=0.1 下同一坏答案会反复出现）。"""
+    s = str(ctype or "").strip().lower()
+    return s if s in safeio.DETAIL_TYPES else rule_type(text)
+
+
 def rule_fallback_action(text: str, sims: list[dict],
                          sim_near: float | None = None,
                          sim_noop: float | None = None,
@@ -535,8 +545,12 @@ def add_entry(detail_dir: Path, text: str, fm_extra: dict) -> Path:
     return path
 
 
-def _mark_disputed(d: dict, new_slug: str, reason: str = "") -> None:
+def _mark_disputed(d: dict, new_slug: str, reason: str = "") -> bool:
     """给旧条目打"争议"标记，但**不销毁**（v2.5.5 DISPUTE 路径）。
+
+    v3.4.0（审计 04-P1-1）：返回 False = 目标文件已被同轮动作移走（如先被
+    CONFLICT supersede 进 quarantine）——此时**放弃**标记，绝不把轮首快照
+    （status=active）写回旧路径把已失效条目"复活"。
 
     与 supersede_entry 的关键区别：
       · status 保持 active（仍可被检索、仍参与注入）
@@ -553,6 +567,8 @@ def _mark_disputed(d: dict, new_slug: str, reason: str = "") -> None:
     today = datetime.date.today().isoformat()
     try:
         fm, body = parse_frontmatter(d["path"].read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False  # v3.4.0（审计 04-P1-1）：目标已被同轮动作移走——放弃，绝不复活
     except OSError:
         fm, body = dict(d["fm"]), d["body"]
     fm["disputed_by"] = new_slug
@@ -560,15 +576,24 @@ def _mark_disputed(d: dict, new_slug: str, reason: str = "") -> None:
     fm["disputed_reason"] = (reason or "")[:200]
     # 明确不碰 status：保持 active，两条并存可检索
     safeio.write_entry(d["path"], dump_frontmatter(fm, body), kind="detail")
+    return True
 
 
-def update_entry(d: dict) -> None:
+def update_entry(d: dict) -> bool:
     """近似重复：occurrences+1；跨天出现则 session_count+1；刷新 last_verified（防活跃记忆被误归档）。
     P1：同轮多条候选命中同一目标时，逐次从磁盘重读最新值再增补——入口快照会把
-    两次 +1 都写在同一基线上，实际只涨 1（丢失更新）。"""
+    两次 +1 都写在同一基线上，实际只涨 1（丢失更新）。
+
+    v3.4.0（审计 04-P1-1）：返回 False = 目标文件已被同轮动作移走（先被 CONFLICT
+    supersede 进 quarantine）——放弃增补，绝不把轮首快照写回旧路径"复活"已失效
+    条目（旧行为：except OSError 吞掉 FileNotFoundError → 用 status=active 的
+    轮首快照原子写回旧路径 → quarantine 里 superseded 副本与 detail 里 active
+    复活件并存，审计链与磁盘互相矛盾）。"""
     today = datetime.date.today().isoformat()
     try:
         fm, body = parse_frontmatter(d["path"].read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False  # 目标已被同轮动作移走：放弃，绝不复活
     except OSError:
         fm, body = dict(d["fm"]), d["body"]
     try:
@@ -583,6 +608,7 @@ def update_entry(d: dict) -> None:
     fm["last_seen"] = today
     fm["last_verified"] = today  # P1-1：活跃记忆持续复核，不被 eco_review 误归档
     safeio.write_entry(d["path"], dump_frontmatter(fm, body), kind="detail")
+    return True
 
 
 def supersede_entry(d: dict, new_slug: str, quarantine_dir: Path, reason: str = "") -> Path:
@@ -771,15 +797,13 @@ def _run(args) -> int:
 
         action = decision.get("action", "ADD")
         if action not in ACTIONS:
-            # LLM 输出了非法动作：回退规则判定（不写 NOOP 指纹，不静默丢弃）
-            ctype = rule_type(text)
-            if sims and sims[0]["ratio"] >= sim_near:
-                action = "NOOP" if sims[0]["ratio"] >= sim_noop else "UPDATE"
-                if SPLIT_UPDATES and action == "UPDATE" and norm(text) != norm(sims[0]["detail"]["body"]):
-                    action = "ADD"  # v2：同主路径
-            else:
-                action = "ADD"
-            decision = {"type": ctype, "action": action,
+            # LLM 输出了非法动作：回退规则判定（不写 NOOP 指纹，不静默丢弃）。
+            # v3.4.0（审计 04-P1-7）：回退此前是手写简化判定，漏掉「同槽位换代→
+            # DISPUTE」——非法 action + ratio∈[0.80,0.95) + 硬标记变化的组合下
+            # 新事实被 UPDATE 静默吸收（v2.5.4 修掉的「静默丢事实」在回退分支
+            # 复活）。直接复用主路径的 rule_fallback_action，单源不再漂移。
+            action = rule_fallback_action(text, sims, sim_near, sim_noop)
+            decision = {"type": rule_type(text), "action": action,
                         "target": sims[0]["detail"]["name"] if sims else "", "note": "非法action回退规则"}
         # LLM 在线时也可能对完全同文（≥noop）判 UPDATE——与规则兜底同口径钳制为 NOOP，
         # 防 occurrences 被同一文本反复膨胀（P1）
@@ -793,7 +817,7 @@ def _run(args) -> int:
         decision = escalate_noop_on_new_value(decision, text, sims)
         if decision.get("action") != _before_action:
             action = decision["action"]
-        ctype = decision.get("type", rule_type(text))
+        ctype = _clamp_ctype(decision.get("type", rule_type(text)), text)
         note = decision.get("note", "")
         target = ""
         try:
@@ -811,8 +835,13 @@ def _run(args) -> int:
                 if hit:
                     target = hit["name"]
                     if not args.dry_run:
-                        update_entry(hit)
-                    report.append(f"UPDATE   {text[:40]} → {target} (occurrences+1) {note}")
+                        if update_entry(hit):
+                            report.append(f"UPDATE   {text[:40]} → {target} (occurrences+1) {note}")
+                        else:
+                            report.append(f"SKIP     {text[:40]} → 目标 {target} 已被同轮动作移走，放弃增补（防复活）")
+                            log_gate(conn, fp, "NOOP", target, "目标已被同轮动作移走", args.dry_run)
+                            terminal.add(key)
+                            continue
                     log_gate(conn, fp, "UPDATE", target, note, args.dry_run)
                 else:
                     report.append(f"UPDATE   {text[:40]} → 无目标，按 ADD 处理")
@@ -849,6 +878,10 @@ def _run(args) -> int:
                         report.append(f"CONFLICT {text[:40]} → 新条目 {p.stem}，旧条目 {target} 已 superseded→quarantine "
                                       f"失效理由: {conflict_reason} {note}")
                         log_gate(conn, fp, "CONFLICT", target, f"new={p.stem} reason={conflict_reason} {note}", args.dry_run)
+                        # v3.4.0（审计 04-P1-1 主闸）：目标已在本轮失效——从轮首快照移除，
+                        # 后续候选的 sims 不再含它，杜绝「同轮 CONFLICT 后同轮 UPDATE/DISPUTE
+                        # 用旧快照把它复活」的竞态
+                        detail = [x for x in detail if x["path"] != hit["path"]]
                     else:
                         report.append(f"CONFLICT {text[:40]} → (dry-run) 旧条目 {target} 将失效"
                                       f"（理由: {conflict_reason}）")
@@ -872,13 +905,16 @@ def _run(args) -> int:
                     p = add_entry(args.detail, text, {"type": ctype, "origin_session_id": origin,
                                                           "scope": c["file"]})
                     target = p.stem
+                    dispute_marked = None
                     if hit:
                         try:
-                            _mark_disputed(hit, p.stem, dispute_reason)
+                            dispute_marked = _mark_disputed(hit, p.stem, dispute_reason)
                         except Exception as e:
                             print(f"⚠️ 争议标记写入失败（不影响入库）: {e}")
+                    _disputed_note = ("目标已被同轮动作移走，放弃标记（防复活）"
+                                      if dispute_marked is False else "仅标记 disputed（未销毁）")
                     report.append(f"DISPUTE  {text[:40]} → 新条目 {target} 已入库；"
-                                  f"旧条目 {(hit or {}).get('name', '(无)')} 仅标记 disputed（未销毁）"
+                                  f"旧条目 {(hit or {}).get('name', '(无)')} {_disputed_note}"
                                   f" 理由: {dispute_reason} {note}")
                     log_gate(conn, fp, "DISPUTE",
                              (hit or {}).get("name", ""),
