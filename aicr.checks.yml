@@ -1,0 +1,12 @@
+# aicr 检查白名单 —— open PR 时只能从这里"选"，不能"造"（checks 在 open 时冻结）。
+# 注意：仓库根裸跑 pytest 有 21 个 collection errors，src 线只能在 src/ 目录内跑。
+version: 1
+checks:
+  - id: core-tests
+    cmd: python run_tests.py
+    cwd: core
+    timeout: 900
+  - id: src-tests
+    cmd: python -m pytest
+    cwd: src
+    timeout: 900
