@@ -1517,6 +1517,8 @@ class TestVersion(Base):
                          "版本号不是 X.Y.Z 形式：%r" % rep["version"])
         # 四处必须全部等于版本号本身（这才是"对齐"的含义）
         for place, val in (rep.get("places") or {}).items():
+            if place == "run_tests.py" and val == "dynamic":
+                continue  # R7 扩面：动态化横幅是防回潮标记，不是版本号
             self.assertEqual(val, rep["version"],
                              "%s 的版本号 %r 与主版本 %r 不一致"
                              % (place, val, rep["version"]))
