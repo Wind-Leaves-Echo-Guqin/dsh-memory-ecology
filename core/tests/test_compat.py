@@ -20,6 +20,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -212,6 +213,122 @@ class TestOldFormat(Base):
         self.assertEqual(len(rootmod.Root(self.root).open().items()), 0)
 
 
+# ── 四门 kind/计数语义回归（历史证据的永生形态，3.4.0 判红方案 A）─────
+
+class TestGateStatusSemantics(Base):
+    """把原 test_old_ledger_readonly_open 的**历史证据**改钉在合成账本上。
+
+    背景：原断言把「门② 挤出 52 次、0 提升」「门③ 89 候选、0 晋升」写死成
+    对**活生产库**的 expected_count==0。2026-10-31 H1 修复让门②③④ 真跑
+    之后生产库开始 promote（gate2=(67,2)、gate3=(4,4)），快照断言必然过期
+    （判红结论：断言过期，非产品缺陷）。
+
+    本类用同形状的合成数据把判定语义永久钉住：
+    - effective>0 且期望动作（promote/demote/ADD）计数为 0 → kind="starved"
+      （"一直在挤出、从来没提升"的病态不能判成健康——v3.2.0 立项依据）；
+    - 期望动作恢复后 → kind="ok"（H1 后的生产现实 (67,2)/(4,4)）；
+    - 账本全空 → kind="dead"；久无动作 → kind="stale"。
+    """
+
+    def _seed(self, table: str, cols: tuple[str, ...], rows: list[tuple]) -> None:
+        conn = ledger.open_rw(self.root / "eco.db")
+        try:
+            conn.executemany(
+                "INSERT INTO %s(%s) VALUES (%s)"
+                % (table, ",".join(cols), ",".join("?" * len(cols))), rows)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _gate(self, key: str, stale_days: float | None = None) -> dict:
+        conn = ledger.open_ro(self.root / "eco.db")
+        try:
+            gs = ledger.gate_status(conn, stale_days=stale_days)
+        finally:
+            conn.close()
+        return {g["gate"]: g for g in gs["gates"]}[key]
+
+    def test_gate2_all_extrude_no_promote_is_starved(self):
+        """历史证据 · 门②：挤出 52 次、0 提升 → starved，不是健康。"""
+        self.init()
+        ts = paths.now()
+        self._seed("quota_log", ("ts", "action", "slug", "reason"),
+                   [(ts, "extrude", "e-%02d" % i, "挤出") for i in range(52)])
+        g2 = self._gate("gate2")
+        self.assertEqual(g2["effective"], 52)
+        self.assertEqual(g2["expected_count"], 0)
+        self.assertEqual(g2["kind"], "starved",
+                         "挤出 52 次 0 提升，却没被判成 starved")
+        self.assertTrue(g2["dead"])
+
+    def test_gate2_promote_resumed_is_ok(self):
+        """历史证据 · 门② 续：H1 后生产现实 (67,2) —— 有提升是 ok，不得误报。"""
+        self.init()
+        ts = paths.now()
+        rows = [(ts, "extrude", "e-%02d" % i, "挤出") for i in range(65)]
+        rows += [(ts, "promote", "p-1", ""), (ts, "promote", "p-2", "")]
+        self._seed("quota_log", ("ts", "action", "slug", "reason"), rows)
+        g2 = self._gate("gate2")
+        self.assertEqual((g2["effective"], g2["expected_count"]), (67, 2))
+        self.assertEqual(g2["kind"], "ok", "有 promote 的门被误判：%s" % g2)
+        self.assertFalse(g2["dead"])
+
+    def test_gate3_actions_without_promote_is_starved_then_ok(self):
+        """历史证据 · 门③：89 候选 0 晋升 → starved；晋升恢复 → ok（生产 (4,4)）。"""
+        self.init()
+        ts = paths.now()
+        # merge/demote 在 effective 集内但不是期望动作 promote → starved
+        self._seed("distill_log", ("ts", "action", "target", "note"),
+                   [(ts, "merge", "m-%02d" % i, "") for i in range(89)])
+        g3 = self._gate("gate3")
+        self.assertEqual((g3["effective"], g3["expected_count"]), (89, 0))
+        self.assertEqual(g3["kind"], "starved")
+        # 恢复晋升 → ok
+        self._seed("distill_log", ("ts", "action", "target", "note"),
+                   [(ts, "promote", "p-%d" % i, "") for i in range(4)])
+        g3 = self._gate("gate3")
+        self.assertEqual((g3["effective"], g3["expected_count"]), (93, 4))
+        self.assertEqual(g3["kind"], "ok")
+
+    def test_gate4_zero_demote_despite_verify_is_starved(self):
+        """门④同语义：只有 verify（有效动作）但从未 demote（期望动作）→ starved。"""
+        self.init()
+        ts = paths.now()
+        self._seed("review_log", ("ts", "action", "slug", "reason"),
+                   [(ts, "verify", "v-%02d" % i, "") for i in range(5)])
+        g4 = self._gate("gate4")
+        self.assertEqual(g4["kind"], "starved")
+
+    def test_empty_ledger_is_dead(self):
+        """账本一行都没有 → dead（根本没跑），不是 idle-spin。"""
+        self.init()
+        g1 = self._gate("gate1")
+        self.assertEqual(g1["effective"], 0)
+        self.assertEqual(g1["kind"], "dead")
+        self.assertTrue(g1["dead"])
+
+    def test_heartbeat_only_is_idle_spin(self):
+        """有行但全是心跳/自检（不在 effective 集）→ idle-spin：进程活着没产出。"""
+        self.init()
+        ts = paths.now()
+        self._seed("gate_log", ("ts", "fingerprint", "action", "target", "note"),
+                   [(ts, "fp-%d" % i, "idle", "idle", "heartbeat 零动作") for i in range(3)])
+        g1 = self._gate("gate1")
+        self.assertEqual((g1["total"], g1["effective"]), (3, 0))
+        self.assertEqual(g1["kind"], "idle-spin")
+
+    def test_quiet_gate_beyond_stale_days_is_stale(self):
+        """最后一次有效动作超出 stale_days → stale（曾经的产出，现在停了）。"""
+        self.init()
+        old = (datetime.now() - timedelta(days=30)).isoformat(timespec="seconds")
+        self._seed("quota_log", ("ts", "action", "slug", "reason"),
+                   [(old, "promote", "p-old", "")])
+        g2 = self._gate("gate2", stale_days=7)
+        self.assertEqual((g2["effective"], g2["expected_count"]), (1, 1))
+        self.assertEqual(g2["kind"], "stale")
+        self.assertTrue(g2["dead"])
+
+
 # ── 真实生产根：只读断言 ──────────────────────────────────────────────
 
 class TestProductionReadOnly(unittest.TestCase):
@@ -226,14 +343,29 @@ class TestProductionReadOnly(unittest.TestCase):
             self.skipTest("本机没有旧生产根（干净机器上跳过是对的）")
 
     def _fingerprint(self) -> dict:
+        """生产根只读指纹：memories/ 子树全部文件 + 账本主文件。
+
+        S35 修正：原来只扫 memories/，「只读打开不碰生产」的断言文案比
+        实现宽。现在把 eco.db / eco.db-wal 也纳入指纹（mode=ro 绝不写它们）。
+        **-shm 是显式例外**：只读连接打开 WAL 库也必须映射共享内存索引，
+        -shm 的 mtime 必然被触碰（S35 实测确认）——它可随时重建、不含任何
+        已提交数据，排除后断言文案才与实现同宽。
+        """
         out = {}
-        for p in (self.prod / "memories").rglob("*"):
+        roots = [self.prod / "memories"]
+        for name in ("eco.db", "eco.db-wal"):
+            p = self.prod / name
             if p.is_file():
-                try:
-                    st = p.stat()
-                    out[str(p)] = (st.st_size, st.st_mtime_ns)
-                except OSError:
-                    pass
+                roots.append(p)
+        for p in roots:
+            files = p.rglob("*") if p.is_dir() else [p]
+            for f in files:
+                if f.is_file():
+                    try:
+                        st = f.stat()
+                        out[str(f)] = (st.st_size, st.st_mtime_ns)
+                    except OSError:
+                        pass
         return out
 
     def test_old_detail_parses(self):
@@ -242,7 +374,10 @@ class TestProductionReadOnly(unittest.TestCase):
             text = paths.read_text(f)
             fm, body = store.parse_frontmatter(text)
             self.assertIsInstance(fm, dict)
+            self.assertTrue(fm or body.strip(),
+                            "%s：frontmatter 与正文全空（解析退化）" % f.name)
             n += 1
+        self.assertGreater(n, 0, "生产 detail 一篇都没解析出来")
         print("\n    旧库 detail 可解析：%d 篇" % n)
 
     def test_old_l1_parses(self):
@@ -256,6 +391,20 @@ class TestProductionReadOnly(unittest.TestCase):
             print("    %s: %d 条 / %d 字符" % (name, len(entries), store.chars_of(entries)))
 
     def test_old_ledger_readonly_open(self):
+        """旧库账本**只读**打开 + 结构性断言（3.4.0 判红重写）。
+
+        历史背景（交接雷②）：本用例曾把「门② 挤出 52 次、0 提升」「门③
+        89 候选、0 晋升」两条**历史快照**写死成 expected_count==0 的断言。
+        2026-10-31 H1 修复让门②③④ 真正跑起来后，生产库开始 promote
+        （实测 gate2=(67,2)、gate3=(4,4)）——断言随生产演化必然过期，
+        判定结论：**断言过期，非产品缺陷**。
+
+        修复方式（判红结论拍板的方案 A「冻结 fixture」实现形态）：
+        - 历史证据的语义（starved/ok/dead 判定）改在**合成账本**上永久
+          回归 → 见 TestGateStatusSemantics；
+        - 生产库只保留**结构性只读**断言（四门齐全、计数非负、kind 合法、
+          只读指纹不变）——生产库是活的，只对它断言"不变式"，不断言"快照"。
+        """
         db = self.prod / "eco.db"
         if not db.is_file():
             self.skipTest("无 eco.db")
@@ -266,25 +415,29 @@ class TestProductionReadOnly(unittest.TestCase):
         finally:
             conn.close()
         self.assertEqual(len(gs["gates"]), 4)
-        by = {g["gate"]: g for g in gs["gates"]}
-        print("\n    旧库四门：%s" % {k: (v["effective"], v["expected_count"])
-                                     for k, v in by.items()})
-        # 这两条是本项目的**历史证据**，也是 v3.2.0 存在的理由：
-        #   门② 挤出过 52 次，但**从未提升过任何条目**（L1 是净流出系统）
-        #   门③ 产过 89 个候选，但**从未晋升过一条**（上游在产、下游从不合流）
-        self.assertEqual(by["gate2"]["expected_count"], 0,
-                         "旧库门② 居然有 promote —— 请重新核对历史结论")
-        self.assertEqual(by["gate3"]["expected_count"], 0,
-                         "旧库门③ 居然有 promote —— 请重新核对历史结论")
-        # 而"有动作"不等于"健康"：门② 的 effective 是 56（52 挤出 + 3 手挤 + 1 回滚），
-        # **判死不能只看 effective>0** —— 这正是 starved 这个 kind 存在的理由。
-        self.assertGreater(by["gate2"]["effective"], 0)
-        self.assertEqual(by["gate2"]["kind"], "starved",
-                         "门② 挤出 56 次 0 提升，却没被判成 starved")
-        self.assertTrue(by["gate2"]["dead"])
+        valid_kinds = {"ok", "idle-spin", "dead", "starved", "stale"}
+        for g in gs["gates"]:
+            self.assertIsInstance(g["effective"], int)
+            self.assertIsInstance(g["expected_count"], int)
+            self.assertGreaterEqual(g["effective"], 0)
+            self.assertGreaterEqual(g["expected_count"], 0)
+            self.assertIn(g["kind"], valid_kinds,
+                          "门 %s 的 kind 越界：%r" % (g["gate"], g["kind"]))
+            # 不变式：dead ⟺ kind != "ok"（ledger.gate_status 的两级红灯语义）
+            self.assertEqual(g["dead"], g["kind"] != "ok",
+                             "门 %s 的 dead/kind 不一致：%s" % (g["gate"], g))
+        print("\n    旧库四门（结构性断言，快照断言已随 H1 作废）：")
+        for g in gs["gates"]:
+            print("      %s: effective=%d promote=%d kind=%s dead=%s"
+                  % (g["gate"], g["effective"], g["expected_count"], g["kind"], g["dead"]))
 
     def test_readonly_scan_does_not_touch_files(self):
-        """**核心断言**：只读扫描前后，生产根所有文件的 size/mtime 必须一字不差。"""
+        """**核心断言**：只读扫描前后，生产根文件的 size/mtime 必须一字不差。
+
+        覆盖面（S35 修正）：memories/ 子树 + eco.db + eco.db-wal。
+        -shm 被显式排除——mode=ro 打开 WAL 库必然触碰其 mtime（可重建的
+        映射，不含已提交数据）；除此之外任何变化都是本测试的失败。
+        """
         before = self._fingerprint()
         # 只读动作
         for f in (self.prod / "memories" / "detail").glob("*.md"):
