@@ -12,6 +12,7 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
 
 SCRIPTS = Path(__file__).parent
@@ -19,6 +20,13 @@ sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(SCRIPTS / "lib"))
 
 import eco_retrieval_report as rr
+
+
+def _day(k: int = 0) -> str:
+    """相对今天的日期串（3.4.0 判红修复：写死 2026-10-06/07 的用例随 30 天
+    窗口滚动必然过期——11-05 起越界、11-06 起直接 KeyError。合成数据一律
+    相对 today 生成，语义不变、永不再随日历漂移。"""
+    return (date.today() - timedelta(days=k)).isoformat()
 
 
 class TestLoadRecords(unittest.TestCase):
@@ -45,35 +53,35 @@ class TestAggregate(unittest.TestCase):
 
     def test_daily_counts_and_rates(self):
         recs = [
-            self._rec("2026-10-07T10:00:00", "备份", ["a", "b"]),
-            self._rec("2026-10-07T11:00:00", "不存在", []),
-            self._rec("2026-10-06T09:00:00", "Vue 迁移", []),
-            self._rec("2026-10-06T10:00:00", "缓存", ["c"]),
+            self._rec(_day() + "T10:00:00", "备份", ["a", "b"]),
+            self._rec(_day() + "T11:00:00", "不存在", []),
+            self._rec(_day(1) + "T09:00:00", "Vue 迁移", []),
+            self._rec(_day(1) + "T10:00:00", "缓存", ["c"]),
         ]
         agg = rr.aggregate(recs, days=30, top=5)
         self.assertEqual(agg["total_queries"], 4)
         self.assertEqual(agg["zero_queries"], 2)
         self.assertEqual(agg["zero_rate"], 0.5)
         days = {d["date"]: d for d in agg["by_day"]}
-        self.assertEqual(days["2026-10-07"]["total"], 2)
-        self.assertEqual(days["2026-10-07"]["avg_hits"], 1.0)
-        self.assertEqual(days["2026-10-06"]["zero_rate"], 0.5)
+        self.assertEqual(days[_day()]["total"], 2)
+        self.assertEqual(days[_day()]["avg_hits"], 1.0)
+        self.assertEqual(days[_day(1)]["zero_rate"], 0.5)
 
     def test_window_filters_old(self):
         recs = [
-            self._rec("2026-10-07T10:00:00", "新查询", []),
-            self._rec("2026-01-01T10:00:00", "老查询", []),
+            self._rec(_day(1) + "T10:00:00", "新查询", []),
+            self._rec(_day(40) + "T10:00:00", "老查询", []),
         ]
         agg = rr.aggregate(recs, days=30, top=5)
         self.assertEqual(agg["total_queries"], 1)
-        self.assertEqual(agg["by_day"][0]["date"], "2026-10-07")
+        self.assertEqual(agg["by_day"][0]["date"], _day(1))
 
     def test_top_zero_queries_grouped_by_stripped_query(self):
         recs = [
-            self._rec("2026-10-07T10:00:00", " Vue 迁移 ", []),
-            self._rec("2026-10-07T11:00:00", "Vue 迁移", []),
-            self._rec("2026-10-07T12:00:00", "别的词", []),
-            self._rec("2026-10-07T13:00:00", "有命中的", ["x"]),
+            self._rec(_day() + "T10:00:00", " Vue 迁移 ", []),
+            self._rec(_day() + "T11:00:00", "Vue 迁移", []),
+            self._rec(_day() + "T12:00:00", "别的词", []),
+            self._rec(_day() + "T13:00:00", "有命中的", ["x"]),
         ]
         agg = rr.aggregate(recs, days=30, top=5)
         top = agg["top_zero_queries"]
