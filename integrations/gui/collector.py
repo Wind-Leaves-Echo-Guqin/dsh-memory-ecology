@@ -204,7 +204,26 @@ def scan_l2() -> list[dict]:
 
 
 def detail_body(slug: str) -> dict | None:
-    p = data_root() / "memories" / "detail" / f"{slug}.md"
+    """单条记忆的 frontmatter + 正文详情。
+
+    v3.4.0 安全加固（审计 05-P0-1 / REVIEW S14）：slug 来自 HTTP 查询参数。
+    同文件的 candidate_detail / skill_md / report_by_name 都有路径校验，
+    唯独这里漏了——构成任意 .md 读取原语（..、反斜杠、绝对路径实测全通）。
+    双道防护：
+    ① 成分校验（与 candidate_detail 同款：禁路径分隔符/盘符/..）；
+    ② resolve 后必须仍在 memories/detail 内（commonpath 纵深防御，
+       与 _serve_file 同口径）。
+    """
+    if not slug or slug in (".", ".."):
+        return None
+    if any(ch in slug for ch in '\\/:*?"<>|') or ".." in slug:
+        return None
+    base = (data_root() / "memories" / "detail").resolve()
+    p = (base / f"{slug}.md").resolve()
+    try:
+        p.relative_to(base)
+    except ValueError:
+        return None
     if not p.is_file():
         return None
     fm, body = parse_fm(_read(p))
