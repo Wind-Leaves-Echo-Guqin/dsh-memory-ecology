@@ -409,11 +409,27 @@ def revive(slug: str, detail_dir: Path | None = None, archive_dir: Path | None =
            db: Path | None = None) -> tuple[bool, str]:
     """人工确认后的复活执行：dormant/superseded → active（原地）；
     archived → 移回 detail 再 active。写 review_log 留痕。
-    （路径默认 None=调用时取模块属性，理由同 scan_memory_dirs。）"""
+    （路径默认 None=调用时取模块属性，理由同 scan_memory_dirs。）
+
+    v3.4.0 两处修复（审计 04）：
+    - 04-P1-4：--revive 是 forget/resolve 之外唯一漏修路径校验的入口——
+      `--revive ../x` 可改写 detail 外任意带 status 行的 .md；`--revive '*'
+      经 rglob 模式拼接匹配到任意归档文件复活第一个命中。补与 --resolve
+      同款双道（形态 + resolve 归属），并拒 glob 元字符。
+    - 04-P2-9：archive→detail 先移动后校验——rewrite_status 未命中/写盘
+      失败时文件滞留 detail 且状态仍是 archived（混合态，无回滚）。改为
+      先校验可激活再移动，失败把文件留在 archive。"""
     detail_dir = detail_dir if detail_dir is not None else DETAIL_DIR
     archive_dir = archive_dir if archive_dir is not None else ARCHIVE_DIR
     db = db if db is not None else DB
+    slug = str(slug or "").strip()
+    if not _is_plain_name(slug) or any(ch in slug for ch in "*?["):
+        return False, "非法的条目名 %r（不允许路径分隔符 / .. / glob 元字符）" % (slug,)
     target = detail_dir / f"{slug}.md"
+    try:
+        target.resolve().relative_to(detail_dir.resolve())
+    except ValueError:
+        return False, "非法的条目名 %r（解析后越出 detail 目录）" % (slug,)
     from_archive = False
     if not target.exists():
         cands = [p for p in archive_dir.rglob(f"{slug}.md")] if archive_dir.is_dir() else []
@@ -422,8 +438,13 @@ def revive(slug: str, detail_dir: Path | None = None, archive_dir: Path | None =
         target = cands[0]
         from_archive = True
     raw = target.read_text(encoding="utf-8", errors="replace")
+    new_content, changed = rewrite_status(raw, "active", refresh_lv=True)
+    if not changed:
+        # 04-P2-9：校验失败不动文件——archive 来的留在 archive，不再产生混合态
+        where = "（文件留在 archive）" if from_archive else ""
+        return False, f"{target.name} frontmatter 无 status 行，未修改{where}"
     if from_archive:
-        # 先移回 detail（重名加后缀），再激活
+        # 校验通过后再移回 detail（重名加后缀）
         dest = detail_dir / target.name
         n = 2
         while dest.exists():
@@ -432,10 +453,6 @@ def revive(slug: str, detail_dir: Path | None = None, archive_dir: Path | None =
         detail_dir.mkdir(parents=True, exist_ok=True)
         target.rename(dest)
         target = dest
-        raw = target.read_text(encoding="utf-8", errors="replace")
-    new_content, changed = rewrite_status(raw, "active", refresh_lv=True)
-    if not changed:
-        return False, f"{target.name} frontmatter 无 status 行，未修改"
     # v2.3.0 证据链：复活清空蒸馏状态位——源复活 → 既有蒸馏结论待重蒸馏（可逆闭环）
     fm2, body2 = parse_frontmatter(new_content)
     if str(fm2.get("distilled_at", "")).strip():

@@ -406,6 +406,41 @@ class TestDisputeConsumer(MemoryQueryBase):
         self.assertEqual(outside.read_text(encoding="utf-8"), before,
                          "detail/ 之外的文件被改写了 —— 路径穿越")
 
+    def test_revive_refuses_path_traversal(self):
+        """审计 04-P1-4（3.4.0）：--revive 是 forget/resolve 之外唯一漏修
+        路径校验的入口——越界文件**真的带 status 行**（否则旧代码会因
+        rewrite_status 未命中而拒绝，测试假绿）。"""
+        outside = self.root / "outside.md"
+        outside.write_text(
+            "---\nname: evil\nstatus: dormant\n---\n危险内容\n", encoding="utf-8")
+        before = outside.read_text(encoding="utf-8")
+        for bad in ("../outside", "..\\outside", "a/../../outside"):
+            ok, _msg = mq.revive(bad, detail_dir=self.detail, db=self.db)
+            self.assertFalse(ok, "%r 竟然被接受了" % bad)
+        self.assertEqual(outside.read_text(encoding="utf-8"), before,
+                         "detail/ 之外的文件被改写了 —— revive 路径穿越")
+
+    def test_revive_refuses_glob_metachars(self):
+        """审计 04-P1-4：'*' 曾经 rglob 模式拼接匹配到任意归档文件并复活
+        第一个命中——glob 元字符必须早拒。"""
+        for bad in ("*", "ev*l", "a?c", "x[y]"):
+            ok, _msg = mq.revive(bad, detail_dir=self.detail, db=self.db)
+            self.assertFalse(ok, "glob 元字符 %r 竟然被接受了" % bad)
+
+    def test_revive_archive_failure_leaves_file_in_archive(self):
+        """审计 04-P2-9（3.4.0）：archive→detail 必须先校验可激活再移动——
+        无 status 行的归档文件校验失败后必须留在 archive（不产生
+        「位置在 detail、状态是 archived」的混合态）。"""
+        arch = self.root / "archive"
+        (arch / "2026-01-01").mkdir(parents=True, exist_ok=True)
+        f = arch / "2026-01-01" / "nostatus.md"
+        f.write_text("没有 frontmatter status 行的归档文件\n", encoding="utf-8")
+        ok, msg = mq.revive("nostatus", detail_dir=self.detail,
+                            archive_dir=arch, db=self.db)
+        self.assertFalse(ok)
+        self.assertTrue(f.exists(), "校验失败后归档文件被移动了（04-P2-9 混合态）")
+        self.assertFalse((self.detail / "nostatus.md").exists())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
