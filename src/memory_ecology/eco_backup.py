@@ -193,8 +193,29 @@ def drill() -> bool:
     return ok
 
 
+def _sweep_orphans() -> None:
+    """清扫崩溃残留的明文中转 / 演练临时目录（审计 04-P1-8，v3.4.0）。
+
+    backup_one 的 .plain-* 中转与 drill 的 .tmp-drill-* 在进程被杀/断电时
+    会永久残留——加密备份体系的**明文旁路**（index.db/MEMORY.md/USER.md
+    全文落盘），rotate 与 drill 都不认这两个前缀。这里只按本工具自有的
+    两个前缀清扫，绝不 glob 到任何记忆文件；删除前逐个打印（可审计）。
+    """
+    for pat in (".plain-*", ".tmp-drill-*"):
+        for f in BACKUP_DIR.glob(pat):
+            age_hours = (__import__("time").time() - f.stat().st_mtime) / 3600
+            if age_hours < 1:
+                continue  # 1 小时内的新文件可能是并发正在写的备份，不动
+            try:
+                f.unlink()
+                print(f"  清扫崩溃残留: {f.name}")
+            except OSError as e:
+                print(f"  ⚠️ 残留清理失败（下次再试）: {f.name}: {e}")
+
+
 def main():
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    _sweep_orphans()
     if "--drill" in sys.argv:
         sys.exit(0 if drill() else 1)
     if "--rederive" in sys.argv:

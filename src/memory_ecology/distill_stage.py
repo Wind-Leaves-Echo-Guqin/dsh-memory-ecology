@@ -332,10 +332,11 @@ def _run(args) -> int:
                         bak.unlink()
                     continue
                 c["path"].rename(c["path"].with_suffix(".promoted.md"))
-                promoted += 1
                 if bak:
                     report.append(f"  备份: {bak.name}")
             promoted += 1  # dry-run 也计数：PROMOTE_MAX 上限在预览中同样生效
+            # v3.4.0（审计 04-P1-3）：删掉 dry_run 块内的第二个 += 1——晋升一条曾计 2，
+            # PROMOTE_MAX=3 实际每轮只能晋升 2 条，预览与实跑不一致
             report.append(f"REPLACE {conflict[:30]} → {c['body'][:40]}（同义整块替换，旧条目入 quarantine）")
             log_distill(conn, "replace", conflict, f"new={c['name']}", args.dry_run)
         else:
@@ -343,7 +344,6 @@ def _run(args) -> int:
                 bak = _backup_user(args.user)
                 _append_user_entry(args.user, c["body"])
                 c["path"].rename(c["path"].with_suffix(".promoted.md"))
-                promoted += 1
                 if bak:
                     report.append(f"  备份: {bak.name}")
             promoted += 1  # dry-run 也计数：PROMOTE_MAX 上限在预览中同样生效
@@ -355,7 +355,10 @@ def _run(args) -> int:
     # 幂等：所有候选（含已 promoted/rejected）按 source 去重，一个 detail 源只允许一个候选
     cand_sources: set[str] = set()
     if args.cand.exists():
-        for f in args.cand.glob("*.md"):
+        # v3.4.0（审计 04-P1-6）：漏掉 *.md.approved——人工确认候选等待期间
+        # 同源候选被重复生成，之后两份先后晋升（USER.md 重复特质）。
+        # 与 load_candidates(:101) 同口径。
+        for f in sorted(set(args.cand.glob("*.md")) | set(args.cand.glob("*.md.approved"))):
             try:
                 fm, _ = parse_frontmatter(f.read_text(encoding="utf-8"))
             except OSError:

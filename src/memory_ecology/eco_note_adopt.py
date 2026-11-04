@@ -203,12 +203,18 @@ def main() -> int:
 
 
 def _is_accepted_line(pending_path: Path, trigger: str) -> bool:
-    """该 trigger 所在行是否已被标记接纳（<!-- accepted ... --> 前缀）。"""
+    """该 trigger 所在行是否已被标记接纳（<!-- accepted ... --> 前缀）。
+
+    v3.4.0（审计 04-P1-5）：原来是子串匹配（`trigger in line`）——短 trigger
+    会被长 trigger 的已接纳标记行误杀（"备份" 撞上 "备份判据" 的标记行），
+    候选被静默永久跳过、无痕丢失。改为与 mark_accepted 同口径的精确标记
+    `**{trigger}**` 匹配。"""
     if not trigger:
         return False
+    marker = f"**{trigger}**"
     try:
         for line in pending_path.read_text(encoding="utf-8-sig", errors="replace").splitlines():   # v2.5.0：吃 BOM
-            if trigger in line and line.lstrip().startswith("<!--"):
+            if marker in line and line.lstrip().startswith("<!--"):
                 return True
     except OSError:
         pass
