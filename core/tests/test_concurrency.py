@@ -163,6 +163,7 @@ def main() -> int:
             if b:
                 made.append(b)
         uniq = {b.name for b in made}
+        check(len(made) == 6, "6 次写应各产生一个备份文件（实得 %d 个，0 = 备份功能整体失效）" % len(made))
         check(len(uniq) == len(made),
               "6 次连续备份产生 %d 个不同文件（同名覆盖 = 只剩一份）" % len(uniq))
 
@@ -170,12 +171,10 @@ def main() -> int:
         print("\n[5] 写探针 pid 唯一")
         probe_dir = Path(root) / ".eco"
         results = []
-        for pid_hint in range(3):
-            p = probe_dir / (".write-probe.%d" % (os.getpid() + pid_hint))
-            p.write_text("1", encoding="utf-8")
-            results.append(p.exists())
-            p.unlink()
-        check(all(results), "不同 pid 的探针互不干扰")
+        # S34 修正：原来自己写探针再断言自己写的存在（恒真）。改为调用
+        # paths.probe_writable 真实现——探针失败/残留都会真红。
+        ok_probe = pk.probe_writable(Path(root))
+        check(ok_probe, "probe_writable 在可写根上应返回 True")
         left = list(probe_dir.glob(".write-probe*"))
         check(left == [], "探针已清理（残留 %d）" % len(left))
 
@@ -189,6 +188,20 @@ def main() -> int:
         return 0
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_concurrency_suite() -> None:
+    """S33：本文件是脚本式套件（main + sys.exit），pytest 曾收集 0 条——
+    并发只追加的全部断言对任何 pytest CI 不存在，「167 passed」因此缺了这一块。
+    包装入口让 pytest 收集并执行同一个 main()：失败 = 返回非 0，断言消息附
+    完整输出。脚本直跑入口（if __name__）保持不变。
+    """
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        rc = main()
+    assert rc == 0, "suite failed (exit=%d), output: %s" % (rc, buf.getvalue())
 
 
 if __name__ == "__main__":

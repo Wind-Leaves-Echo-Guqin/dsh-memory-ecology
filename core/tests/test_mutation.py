@@ -7,7 +7,7 @@
 或者"测的是实现细节而不是行为"。变异测试是验证"测试有效性"的唯一手段——
 故意把被测代码改坏成**真实缺陷模式**，看测试是否报警。
 
-做法（与兼容版 `memory-ecology-compat/tests/test_mutation.py` 同类，但针对新核心）
+做法（与兼容版 `memory-ecology-兼容版/tests/test_mutation.py` 同类，但针对新核心）
 ------------------------------------------------------------------------------
 1. 把 `src/` + `tests/` + `plugin/` + `gui/` 整棵树复制到 `%TEMP%` 下的独立沙盒
    （排除 `__pycache__` / `*.pyc` / `.git`），并种一个诱饵 `.git`——本机红线：
@@ -50,7 +50,7 @@ SKIP_DIRS = ("__pycache__", ".git", ".pytest_cache", "_bak-archive", "node_modul
 # ── 被测目标 ─────────────────────────────────────────────────────────
 
 CORE = "tests/test_core.py"
-# 真实观测舱不在这里：`integrations/gui` + `gui-v2.3` 在 memory-ecology-compat 仓库，
+# 真实观测舱不在这里：`integrations/gui` + `gui-v2.3` 在 memory-ecology-兼容版 仓库，
 # 那边的 `tests/test_gui_v3_2_0.py` 自己守。本仓库的 `tests/test_gui.py` 已归档到
 # `_archive/gui-wrong-target-v0.4/`（一度把服务端复制过来的错误目标）。
 COMPAT = "tests/test_compat.py"
@@ -371,7 +371,7 @@ MUTANTS: list[dict] = [
             '                            "idle"),  # MUTANT: idle 也算有效动作\n',
         why="246 行 idle 把 52 行 extrude 淹了 → 门② 明明 0 promote 却显示『活着』",
         # GUI 那两条已随 `tests/test_gui.py` 归档（真实观测舱迁到
-        # memory-ecology-compat，那边有自己的 test_gui_v3_2_0.py）。
+        # memory-ecology-兼容版，那边有自己的 test_gui_v3_2_0.py）。
         # 核心这三条足以判定：effective 白名单一变，idle/selfcheck 立刻被算进去。
         runners=[P(CORE + "::TestGate2::test_idle_rows_never_count_as_effective",
                    CORE + "::TestGate2::test_selfcheck_rows_never_count_as_effective",
@@ -658,13 +658,13 @@ def fmt(name: str, result: str, note: str, width: int) -> str:
                                  result, note)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="记忆生态 v3.2.0 变异测试")
     ap.add_argument("-k", default="", help="只跑名字/组名含该串的变异体")
     ap.add_argument("--timeout", type=float, default=180.0, help="单变异体预算（秒）")
     ap.add_argument("--no-baseline", action="store_true", help="跳过基线校验（不推荐）")
     ap.add_argument("--keep", action="store_true", help="保留沙盒（排障用）")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -758,6 +758,20 @@ def main() -> int:
     print("\n" + ("全部变异体被抓到 ✅" if not bad
                   else "有 %d 个未被抓到 —— 测试集在这些缺陷上无效 ❌" % len(bad)))
     return 0 if not bad else 1
+
+
+def test_mutation_suite() -> None:
+    """S33：本文件是脚本式套件（main + sys.exit），pytest 曾收集 0 条——
+    变异（证明前几套真能抓 bug）的全部断言对任何 pytest CI 不存在，「167 passed」因此缺了这一块。
+    包装入口让 pytest 收集并执行同一个 main()：失败 = 返回非 0，断言消息附
+    完整输出。脚本直跑入口（if __name__）保持不变。
+    """
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        rc = main([])
+    assert rc == 0, "suite failed (exit=%d), output: %s" % (rc, buf.getvalue())
 
 
 if __name__ == "__main__":

@@ -537,17 +537,28 @@ class TestGate1(Base):
         self.assertEqual(self.cli("stats")["detail"], 0)
 
     def test_uncounted_candidate_files_stay(self):
-        """未被整合的候选留在 pending（防静默吞掉）。"""
+        """未被整合的候选留在 pending（防静默吞掉）。
+
+        S34 修正：原来的 try/finally 空块注释说「手工塞一条已整合的指纹，
+        模拟半消费」，实际 `pass` 什么都没做——恒真空壳（变异实证存活）。
+        现在用真实形态模拟半消费：gate 1 消费后把一个 .done.md 改回未消费名，
+        重跑时该文件的候选必须走 dup 分支（occurrences+1）而不是重新计 new——
+        这同时钉住 S17 的「limit 中断重扫灌水」家族。
+        """
         self.init()
         self.deposit("一")
         self.deposit("二")
-        conn = sqlite3.connect(self.root_path / "eco.db")
-        try:  # 手工塞一条"已被整合"的指纹，模拟半消费
-            pass
-        finally:
-            conn.close()
         out = self.cli("gate", "1")
         self.assertEqual(out["new"], 2)
+        pending = self.root_path / "memories" / "pending"
+        done = sorted(pending.glob("*.done.md"))
+        self.assertTrue(done, "gate 1 后没有 .done.md——消费标记形态变了")
+        first = done[0]
+        orig = first.parent / (first.name[:-len(".done.md")] + ".md")
+        first.rename(orig)          # 半消费：文件回到未消费形态
+        out2 = self.cli("gate", "1")
+        self.assertEqual(out2["new"], 0,
+                         "半消费重扫把已整合候选重复记 new（S17 灌水路径复活）")
 
 
 # ── 门② ──────────────────────────────────────────────────────────────
@@ -1225,7 +1236,7 @@ class TestCatalog(Base):
         ts = retrieve.terms("deploy 部署 tag")
         self.assertIn("deploy", ts)
         self.assertIn("部署", ts)
-        self.assertIn("部署", ts)
+        self.assertIn("tag", ts)   # S34 修正：原第二遍 assertIn("部署") 是复制粘贴残留，"tag" 从未被断言
 
 
 # ── 圈 ────────────────────────────────────────────────────────────────
@@ -1447,8 +1458,10 @@ class TestPacks(Base):
         self.assertEqual(len(mounted["entries"]), 2)
         # 本库 detail 仍为空
         self.assertEqual(self.cli("stats")["detail"], 0, "mount 把内容写进本库了")
-        self.assertFalse((self.root_path / "memories" / "detail").glob("*.md").__next__
-                         if False else False)
+        # S34 修正：原断言是 `... .__next__ if False else False` 恒假空壳，
+        # 改成真的断言 mount 不产生任何 detail 文件
+        self.assertEqual(list((self.root_path / "memories" / "detail").glob("*.md")),
+                         [], "mount 往本库 detail 写了文件")
 
     def test_integrate_feeds_pending_then_gate1(self):
         self.init()
@@ -1593,7 +1606,12 @@ class TestSafety(Base):
             # 没有 zstandard 时读 .zstd 会话应返回空列表（不抛）
             self.assertEqual(meas.read_session_lines(SRC / "no-such.jsonl.zstd"), [])
             # 没有 onnx 时应返回 None（不抛）
-            self.assertIsNone(sim._onnx_embedding("测试") if hasattr(sim, "_onnx_embedding") else None)
+            # S34 修正：原来 `if hasattr(...) else None` 在属性不存在时退化成
+            # assertIsNone(None) 恒真——现在直接调用，函数缺失/行为变化都会真红
+            # S34 修正：原断言引用了根本不存在的 sim._onnx_embedding 属性，
+            # 且 hasattr 分支把它退化成 assertIsNone(None) 恒真。
+            # 真实接口是 _embedding_ratio（惰性、缺依赖返回 None、绝不抛）。
+            self.assertIsNone(sim._embedding_ratio("测试", "测试"))
         finally:
             builtins.__import__ = real_import
             for m, v in saved.items():
@@ -1603,8 +1621,7 @@ class TestSafety(Base):
 
     def test_no_unlink_of_memories_anywhere(self):
         """红线 1 的机制保证：核心包里**不许出现**删除记忆文件的调用。"""
-        banned = ("detail").__class__  # 占位，避免 lint 报警
-        del banned
+        # S34 修正：删掉 `banned = ("detail").__class__; del banned` 死代码占位
         src = (SRC / "memory_ecology").glob("*.py")
         offenders = []
         for f in src:

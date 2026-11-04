@@ -132,7 +132,7 @@ def s2(tmp: Path) -> None:
     retrieve.materialize(root)
     h3 = digest_tree(root.catalog_dir)
     check("S2a 三次物化产物一致", h1 == h2 == h3, "%s / %s / %s" % (h1[:8], h2[:8], h3[:8]))
-    check("S2b 物化覆盖每个圈", set(d1["scopes"]) >= {"global"}, str(d1["scopes"]))
+    check("S2b 物化圈集合精确（本根只有 global）", set(d1["scopes"]) == {"global"}, str(d1["scopes"]))
 
     # 渲染文本在两次读取之间字节稳定（成本命门）
     t1 = retrieve.render_catalog_text(retrieve.read_materialized(root, "global"))
@@ -166,7 +166,7 @@ def s3(tmp: Path) -> None:
     check("S3c MEMORY 备份受控（%d 份 ≤ 8）" % len(baks), len(baks) <= 8,
           "超期备份应在 _bak-archive/ 里")
     # 条目守恒：30 轮后条目数不应比第一轮少（没丢记忆），也不应无限增长
-    check("S3d 条目数守恒（%d）" % n_items, n_items >= 15 - 15 and n_items <= 15 + 60,
+    check("S3d 条目数守恒（%d）" % n_items, n_items >= 15 and n_items <= 15 + 60,
           "既不该丢、也不该无界增长")
     # detail 文件数 = 条数（没有孤儿文件）
     files = list(root.detail.glob("*.md"))
@@ -263,7 +263,7 @@ def s5(tmp: Path) -> None:
 GROUPS = {"S1": s1, "S2": s2, "S3": s3, "S4": s4, "S5": s5}
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     for s in (sys.stdout, sys.stderr):
         try:
             s.reconfigure(encoding="utf-8", errors="replace")
@@ -271,11 +271,12 @@ def main() -> int:
             pass
     ap = argparse.ArgumentParser()
     ap.add_argument("-k", default="", help="只跑名字含该串的组")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     tmp = Path(tempfile.mkdtemp(prefix="eco-stab-"))
     print("=" * 72)
-    print("记忆生态 v3.2.0 · 稳定性测试")
+    from memory_ecology import __version__ as _eco_ver
+    print("记忆生态 v%s · 稳定性测试" % _eco_ver)
     print("=" * 72)
     try:
         for name, fn in GROUPS.items():
@@ -299,6 +300,20 @@ def main() -> int:
         print("  ✗ %s  %s" % (n, d))
     print("全部通过 ✅" if not bad else "有失败 ❌")
     return 0 if not bad else 1
+
+
+def test_stability_suite() -> None:
+    """S33：本文件是脚本式套件（main + sys.exit），pytest 曾收集 0 条——
+    稳定性的全部断言对任何 pytest CI 不存在，「167 passed」因此缺了这一块。
+    包装入口让 pytest 收集并执行同一个 main()：失败 = 返回非 0，断言消息附
+    完整输出。脚本直跑入口（if __name__）保持不变。
+    """
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        rc = main([])
+    assert rc == 0, "suite failed (exit=%d), output: %s" % (rc, buf.getvalue())
 
 
 if __name__ == "__main__":
