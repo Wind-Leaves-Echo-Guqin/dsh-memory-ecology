@@ -6,7 +6,7 @@
   <img alt="dsh-memory-ecology" src=".github/assets/hero-light.svg" width="840">
 </picture>
 
-[![version](https://img.shields.io/badge/version-v3.2.2-2ea043?style=flat-square)](VERSION.md) [![python](https://img.shields.io/badge/python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/downloads/) [![core deps](https://img.shields.io/badge/%E9%9B%B6%E4%BE%9D%E8%B5%96-%E7%BA%AF%20stdlib-success?style=flat-square)](#-30-秒上手) [![tests](https://img.shields.io/badge/core%20tests-7%20%E7%BB%84%E5%85%A8%E7%BB%BF-2ea043?style=flat-square)](#-测试) [![deletion](https://img.shields.io/badge/%E7%89%A9%E7%90%86%E5%88%A0%E9%99%A4-%E4%BB%A3%E7%A0%81%E5%B1%82%E7%A6%81%E7%94%A8-8957e5?style=flat-square)](#-两条硬纪律) [![hosts](https://img.shields.io/badge/%E5%AE%BF%E4%B8%BB-dsh%20%7C%20Hermes%20%7C%20%E4%BB%BB%E6%84%8F-8957e5?style=flat-square)](#-兼容什么)
+[![version](https://img.shields.io/badge/version-v3.4.0-2ea043?style=flat-square)](VERSION.md) [![python](https://img.shields.io/badge/python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/downloads/) [![core deps](https://img.shields.io/badge/%E9%9B%B6%E4%BE%9D%E8%B5%96-%E7%BA%AF%20stdlib-success?style=flat-square)](#-30-秒上手) [![tests](https://img.shields.io/badge/core%20tests-7%20%E7%BB%84%E5%85%A8%E7%BB%BF-2ea043?style=flat-square)](#-测试) [![deletion](https://img.shields.io/badge/%E7%89%A9%E7%90%86%E5%88%A0%E9%99%A4-%E4%BB%A3%E7%A0%81%E5%B1%82%E7%A6%81%E7%94%A8-8957e5?style=flat-square)](#-两条硬纪律) [![hosts](https://img.shields.io/badge/%E5%AE%BF%E4%B8%BB-dsh%20%7C%20Hermes%20%7C%20%E4%BB%BB%E6%84%8F-8957e5?style=flat-square)](#-兼容什么)
 
 **给 agent 的记忆做「生命周期治理」：四道门自动运转，零第三方依赖，永不物理删除。**
 
@@ -88,17 +88,17 @@ python -m memory_ecology --root /tmp/eco-demo catalog       # 看目录：注入
 
 ## 📦 仓库结构
 
-从 `v3.2.2` 起是**两层并存**（`core/` 是唯一维护线，`src/` 是已冻结的历史线）：
+从 `v3.4.0` 起是**两层并存**（`core/` 是唯一维护线，`src/` 是已冻结的历史线）：
 
 | 目录 | 是什么 | 版本 |
 |---|---|---|
-| **`core/`** | **核心引擎（唯一维护线）**：四道门 + 多生态圈 + 只读记忆包 + 检索，纯 stdlib；dsh 插件本体 `core/plugin/` 也在这里 | **3.2.2** |
+| **`core/`** | **核心引擎（唯一维护线）**：四道门 + 多生态圈 + 只读记忆包 + 检索，纯 stdlib；dsh 插件本体 `core/plugin/` 也在这里 | **3.4.0** |
 | `core/src/memory_ecology/` | 14 个模块：`gates.py` / `ledger.py` / `store.py` / `paths.py` / `retrieve.py` / `packs.py` / `config.py` / `root.py` / `similarity.py` / `measure.py` / `version.py` / `cli.py` / `__init__.py` / `__main__.py` | 3.2.2 |
 | `core/tests/` | 核心 / 兼容与数据安全 / 并发 / 稳定性 / 变异（`run_tests.py` 7 组） | — |
 | `src/memory_ecology/` | v3.1 治理核心（历史线，33 个 CLI 脚本 + 17 个测试）：写门/配额/蒸馏/复核/eco_note/向量缓存 | 3.1.0 |
 | `integrations/hermes/` | Hermes 参考实现（state.db / cron 耦合件） | — |
 | `integrations/dsh/` | dsh 适配器（`package/` = EAC；`package-cordis/` = 官方桌面版 cordis）。**v3.1 旧线（eco-note 时代），已冻结，勿用于新装** | — |
-| `integrations/gui-v3/` | 观测舱 GUI 当前发布版（液态玻璃 / iOS 外壳，七新视图） | 3.2.0 |
+| `integrations/gui-v3/` | 观测舱 GUI 当前发布版（液态玻璃 / iOS 外壳，七新视图） | 3.4.0（并入产品版本线） |
 | `models/` | 本地 embedding 权重（按需 fetch，不入库） | — |
 | `tools/` | 运维与回填工具（自检 / 看门狗 / 双树比对 / scope 回填） | — |
 
@@ -163,7 +163,7 @@ cron 健康告警 / 基因库快照），展示如何把核心接到"有会话�
 
 ### 4) 观测舱 GUI（可选，人类宿主）
 
-**当前发布版 = `integrations/gui-v3/`**（GUI 组件版本 **3.2.0**，液态玻璃 / iOS 外壳），
+**当前发布版 = `integrations/gui-v3/`**（GUI 组件版本 **3.4.0**，液态玻璃 / iOS 外壳），
 在原有九视图之外新增七个：四门实况 / 圈的视角 / 注入观测 / 记忆包 / 圈管理 / 成本面板 / 急救箱。
 
 ```bash
@@ -182,7 +182,7 @@ python integrations/gui/eco_gui.py
 | `gui-v2` / `v2.1` / `v2.2` / `v2.3` | 各自路由 | 历史版本，不随发布物分发，按对应 tag checkout |
 
 > **关于两套版本号**（新人最容易懵的一处）：本仓库有**两个互不相干的版本轴**——
-> ① **产品/核心版本** = `3.2.2`（真源 `core/src/memory_ecology/__init__.py`）；
+> ① **产品/核心版本** = `3.4.0`（真源 `core/src/memory_ecology/__init__.py`）；
 > ② **GUI 组件版本** = `3.2.0`（真源 `integrations/gui-v3/package.json`）。
 > 它们刻意不对齐：GUI 是可选的人类观测界面，改动节奏与核心无关。
 > README 里凡裸版本号若未带上下文，一律指①。
