@@ -118,9 +118,12 @@ class TestQuerySideSuperseded(SupersedeTestBase):
     def test_text_output_shows_reason(self):
         self._write_superseded()
         buf = io.StringIO()
+        # GATE_LOG_DIR 必须一并隔离：main() 在 --no-log 下仍会调 propose_revive，
+        # 不 patch 就会把夹具 revive 写进真实仓库根 memories/gate_log（2026-10-31 事故）。
         with mock.patch.object(mq, "DETAIL_DIR", self.detail), \
              mock.patch.object(mq, "ARCHIVE_DIR", self.root / "archive"), \
              mock.patch.object(mq, "HITS_LOG", self.root / "hits.jsonl"), \
+             mock.patch.object(mq, "GATE_LOG_DIR", self.root / "gate_log"), \
              redirect_stdout(buf):
             rc = mq.main(["旧世界", "--no-log", "--no-update"])
         self.assertEqual(rc, 0)
@@ -132,9 +135,11 @@ class TestQuerySideSuperseded(SupersedeTestBase):
     def test_json_output_carries_reason(self):
         self._write_superseded()
         buf = io.StringIO()
+        # 同上：GATE_LOG_DIR 一并隔离，防夹具 revive 泄漏到真实仓库根。
         with mock.patch.object(mq, "DETAIL_DIR", self.detail), \
              mock.patch.object(mq, "ARCHIVE_DIR", self.root / "archive"), \
              mock.patch.object(mq, "HITS_LOG", self.root / "hits.jsonl"), \
+             mock.patch.object(mq, "GATE_LOG_DIR", self.root / "gate_log"), \
              redirect_stdout(buf):
             rc = mq.main(["旧世界", "--format", "json", "--no-log", "--no-update"])
         self.assertEqual(rc, 0)

@@ -58,10 +58,13 @@ SPLIT_UPDATES = os.environ.get("MEMORY_ECOLOGY_GATE1_SPLIT_UPDATES", "") == "1"
 # 超限时正文尾追加 TRUNC_MARK —— 截断必须**可见**：审计实测 22 篇正文恰好 200 字且
 # 断在词中间（`…HMAC-SHA256(secret,`），词面检索下后半句的关键词根本不存在，
 # 而用户从落盘内容上看不出被截过。
-from lib.config import TRUNC_MARK, gate_max_body
+from lib.config import TRUNC_MARK, gate_max_body, gate_max_output
 
 MAX_BODY = gate_max_body(200)
-MAX_OUTPUT = 8       # 单次最多处理候选条数
+# 门①单次处理候选上限（2026-10-31 配置化：env MEMORY_ECOLOGY_GATE_MAX_OUTPUT
+# > configs/eco.toml [gate] max_output > 8。云端回流复活曾长期占满按字典序取前
+# 的 8 条造成队头饥饿，上限需按实例可调；默认仍 8，行为不变。）
+MAX_OUTPUT = gate_max_output(8)
 # v2.5.5：DISPUTE = 「疑似同槽位冲突但规则层无权销毁」
 # 新条目照常入库、旧条目只标 disputed_by 留在 detail，两条都能被检索到。
 ACTIONS = ("ADD", "UPDATE", "NOOP", "CONFLICT", "DISPUTE")

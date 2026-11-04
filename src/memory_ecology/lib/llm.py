@@ -124,7 +124,7 @@ def _extract_json(content: str):
 
 
 def complete_json(prompt: str, *, system: str | None = None, client=None,
-                  model: str = DEFAULT_MODEL, base_url: str = DEFAULT_BASE_URL,
+                  model: str | None = None, base_url: str | None = None,
                   api_key: str | None = None, max_tokens: int = 800,
                   temperature: float = 0.1, timeout: int = DEFAULT_TIMEOUT,
                   retries: int = 2, require=None, on_usage=None) -> list | dict:
@@ -135,6 +135,12 @@ def complete_json(prompt: str, *, system: str | None = None, client=None,
     - HTTP 200 但 body 非 JSON / choices 空 / content 非字符串 → MalformedResponseError
     - on_usage(resp)：成功请求的 usage 回调（记账用；无 usage 字段自动跳过）
     require：期望类型（list/dict），解析结果不符按未提取处理（返回 None 语义 → 触发截断判定）。
+
+    2026-10-31 修复（401 断流根因）：model/base_url 默认值此前是 DEFAULT_* 常量
+    （truthy），resolve_* 只对 None 生效 → 不传参的调用方（eco_extract/eco_note）
+    永远打到 api.deepseek.com 官方，带着第三方网关的 key → 401；10-24 切 faro
+    relay 改的 eco.toml 从未生效。现与 complete() 同口径：默认 None + 入口强制
+    resolve（显式参数 > 环境变量 > configs/eco.toml > DEFAULT）。
     """
     if client is not None:
         content = client(prompt, model=model, max_tokens=max_tokens, temperature=temperature)
@@ -145,6 +151,8 @@ def complete_json(prompt: str, *, system: str | None = None, client=None,
             raise MalformedResponseError("client 返回内容无法解析为期望 JSON 结构")
         return parsed
 
+    model = resolve_model(model)
+    base_url = resolve_base_url(base_url)
     key = (api_key or os.environ.get("MEMORY_ECOLOGY_API_KEY")
            or config.env_key("DEEPSEEK_API_KEY"))
     messages = ([{"role": "system", "content": system}] if system else []) + \

@@ -111,6 +111,31 @@ def gate_max_body(default: int = 200) -> int:
     return default
 
 
+def gate_max_output(default: int = 8) -> int:
+    """门①单次处理候选上限的**唯一**解析入口（2026-10-31，配 MAX_OUTPUT）。
+
+    优先级：环境变量 MEMORY_ECOLOGY_GATE_MAX_OUTPUT
+          > configs/eco.toml [gate] max_output
+          > default
+    非法值（非整数 / < 1）一律回默认 —— 吞吐上限是安全阀，不能因配置手误变 0。
+    背景：云端回流复活会占满按字典序取前的 8 条（队头饥饿），上限需可按实例调。
+    """
+    for raw in (os.environ.get("MEMORY_ECOLOGY_GATE_MAX_OUTPUT"),
+                cfg("gate", "max_output", None)):
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        try:
+            value = int(text)
+        except (TypeError, ValueError):
+            continue
+        if value >= 1:
+            return value
+    return default
+
+
 def hermes_root() -> Path:
     """生态根目录（生产=hermes；环境变量可覆盖）。"""
     return Path(_ENV_OVERRIDE) if _ENV_OVERRIDE else _HERMES
@@ -164,6 +189,7 @@ REQUIRED_CONFIG = {
     ("quota", "memory_limit"): (3000, "L1 MEMORY 配额"),
     ("quota", "memory_trigger"): (2550, "L1 触发线"),
     ("gate", "max_body"): (800, "正文上限（审计 P0-2）"),
+    ("gate", "max_output"): (8, "门①单次处理候选上限（2026-10-31 配置化）"),
 }
 
 
