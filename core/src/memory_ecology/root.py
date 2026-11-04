@@ -154,10 +154,24 @@ class Root:
         return None
 
     def write_item(self, name: str, fm: dict, body: str) -> Path:
-        """写一条 detail。**同样校验 name**（它会变成文件名）。"""
+        """写一条 detail。**同样校验 name**（它会变成文件名）。
+
+        两档放行（2026-10-31 修「跑一次四门」全灭）：
+        - 新建：名字必须整体匹配 _SAFE_ID（ASCII），模型/数据永远造不出
+          带分隔符或中文的新文件名；
+        - 存量重写：旧版 slug 允许中文（本机 detail 274 条里 233 个中文名，
+          实测门②挤出到一条 2026-10-17 的中文条目就整场 ValueError）。对
+          **已存在**的同名文件允许原位重写——名字来自遍历现有条目而非模型
+          输入，且无路径分隔符、不新建路径，威胁面（load 拼 path 读任意文件）
+          与新建校验完全不同。分隔符 / `..` / 空名仍然无条件拒绝。
+        """
         name = str(name or "").strip()
         if not _SAFE_ID.fullmatch(name):
-            raise ValueError("不安全的条目名：%r" % name)
+            unsafe = (not name or name in (".", "..")
+                      or "/" in name or "\\" in name or "\x00" in name)
+            p = self.detail / (name + ".md")
+            if unsafe or not p.is_file():
+                raise ValueError("不安全的条目名：%r" % name)
         p = self.detail / (name + ".md")
         paths.write_atomic(p, store.dump_frontmatter(fm, body))
         return p
