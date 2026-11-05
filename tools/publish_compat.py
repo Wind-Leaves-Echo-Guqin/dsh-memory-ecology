@@ -28,7 +28,7 @@ SCRIPTS_DIR = (pathlib.Path(os.environ["ECO_SCRIPTS_DIR"]) if os.environ.get("EC
                else (SRC / "scripts"))
 DEFAULT_OUT = pathlib.Path(r"C:\Users\qy160\dsh-memory-ecology-release")
 
-# v3.2.1：v3.2.0 重写版核心（14 模块，纯 stdlib）的唯一真源在**另一个**本地仓库
+# v3.2.1：v3.2.0 重写版核心（现 15 模块，纯 stdlib）的唯一真源在**另一个**本地仓库
 # D:\work\dsh-memory-ecology（含自己的 .git，remote 指向已删除的 dsh-memory-ecology-plugin）。
 # 发布树把它整体放在 core/ 子目录，与 src/ 下的 v3.1 历史线并存。
 # 可用环境变量 ECO_CORE_SRC 覆盖（另一台机器上没有 D:\work 时用）。
@@ -469,8 +469,9 @@ def build(out: pathlib.Path) -> list[str]:
 
     # ── core/：v3.2.0 重写版核心（唯一真源）──────────────────────────────
     # v3.2.1 起随发。它来自另一个本地仓库（CORE_SRC），与 src/ 下的 v3.1
-    # 历史线**实现完全不同**（只有 __init__.py / similarity.py 同名），
-    # 所以并存而非替换——直接覆盖会毁掉 v3.1 的 33 个 CLI 脚本（另有 17 个测试文件）。
+    # 历史线**实现完全不同**（同层仅 __init__.py 重名；similarity.py 在 src/ 那侧
+    # 位于 lib/ 子目录，实现也不同），所以并存而非替换——直接覆盖会毁掉 v3.1 的
+    # 54 个 CLI 脚本（另有 21 个测试文件）。
     core_pub_src = CORE_SRC
     if not core_pub_src.is_dir():
         raise SystemExit(f"❌ core 源树不存在：{core_pub_src}"
@@ -631,7 +632,7 @@ python -m memory_ecology --root /tmp/eco-demo catalog       # 看目录：注入
 | 超限 | 挤出到 L2 层，**绝不丢** | 截断或丢弃最旧 |
 | 删除 | **代码层禁用**，只能降级 | 通常可删 |
 | 依赖 | **0**（纯 stdlib） | 向量库 / embedding 模型 |
-| 实测体量 | 核心 3,784 行 / 测试 3,626 行 | — |
+| 实测体量 | 核心 5,515 行 / 测试 5,209 行（2026-11-05 实测，`core/` 下 .py 逐文件统计） | — |
 
 > **什么场景下你不该选它**：如果你要的是"把十万篇文档塞进去做语义检索"，本项目帮不上
 > 忙——它的检索只有词面匹配，`README` 里也明说"召回质量不是卖点"。它是给**单个 agent
@@ -641,17 +642,17 @@ python -m memory_ecology --root /tmp/eco-demo catalog       # 看目录：注入
 
 ## 📦 仓库结构
 
-从 `v3.2.2` 起是**两层并存**（`core/` 是唯一维护线，`src/` 是已冻结的历史线）：
+从 `v3.4.0` 起是**两层并存**（`core/` 是唯一维护线，`src/` 是已冻结的历史线）：
 
 | 目录 | 是什么 | 版本 |
 |---|---|---|
 | **`core/`** | **核心引擎（唯一维护线）**：四道门 + 多生态圈 + 只读记忆包 + 检索，纯 stdlib；dsh 插件本体 `core/plugin/` 也在这里 | **__ECO_VERSION__** |
-| `core/src/memory_ecology/` | 14 个模块：`gates.py` / `ledger.py` / `store.py` / `paths.py` / `retrieve.py` / `packs.py` / `config.py` / `root.py` / `similarity.py` / `measure.py` / `version.py` / `cli.py` / `__init__.py` / `__main__.py` | __ECO_VERSION__ |
+| `core/src/memory_ecology/` | 15 个模块：`gates.py` / `ledger.py` / `store.py` / `paths.py` / `retrieve.py` / `packs.py` / `config.py` / `root.py` / `proclock.py` / `similarity.py` / `measure.py` / `version.py` / `cli.py` / `__init__.py` / `__main__.py` | __ECO_VERSION__ |
 | `core/tests/` | 核心 / 兼容与数据安全 / 并发 / 稳定性 / 变异（`run_tests.py` 7 组） | — |
-| `src/memory_ecology/` | v3.1 治理核心（历史线，33 个 CLI 脚本 + 17 个测试）：写门/配额/蒸馏/复核/eco_note/向量缓存 | 3.1.0 |
+| `src/memory_ecology/` | v3.1 治理核心（历史线，54 个 CLI 脚本 + 21 个测试）：写门/配额/蒸馏/复核/eco_note/向量缓存 | 3.1.0 |
 | `integrations/hermes/` | Hermes 参考实现（state.db / cron 耦合件） | — |
 | `integrations/dsh/` | dsh 适配器（`package/` = EAC；`package-cordis/` = 官方桌面版 cordis）。**v3.1 旧线（eco-note 时代），已冻结，勿用于新装** | — |
-| `integrations/gui-v3/` | 观测舱 GUI 当前发布版（液态玻璃 / iOS 外壳，七新视图） | 3.2.0 |
+| `integrations/gui-v3/` | 观测舱 GUI 当前发布版（液态玻璃 / iOS 外壳，18 视图） | __ECO_VERSION__（并入产品版本线） |
 | `models/` | 本地 embedding 权重（按需 fetch，不入库） | — |
 | `tools/` | 运维与回填工具（自检 / 看门狗 / 双树比对 / scope 回填） | — |
 
@@ -660,7 +661,7 @@ python -m memory_ecology --root /tmp/eco-demo catalog       # 看目录：注入
 | 树 | 定位 | 现在能改吗 |
 |---|---|---|
 | **`core/`** | **唯一维护线**。新功能、缺陷修复只进这里 | ✅ 唯一入口 |
-| `src/`（v3.1，33 脚本） | **已冻结**：只接受安全修复，不再加功能 | ⚠️ 冻结 |
+| `src/`（v3.1，54 个脚本） | **已冻结**：只接受安全修复，不再加功能 | ⚠️ 冻结 |
 | `integrations/hermes/` | 生产 cron 今天仍跑这一套（v3.1 脚本） | ⚠️ 冻结 |
 
 - **冻结判据（可验证）**：`tools/sync_trees_check.py` 报双树漂移时，若改动只发生在 `src/`
@@ -668,9 +669,9 @@ python -m memory_ecology --root /tmp/eco-demo catalog       # 看目录：注入
 - **合并的唯一前置**：把生产 cron 从 v3.1 脚本切到 `core/`。在这一步完成前，合并两棵树
   都是不安全的（会连带改掉正在跑的运维件）。
 
-> 两棵树为什么并存：`core/` 是重写版（14 模块），与 `src/` 下 v3.1（33 脚本）**实现完全
-> 不同**，只有 `__init__.py` / `similarity.py` 同名。直接覆盖会毁掉 v3.1 那 33 个脚本以及
-> 依赖它们的 `integrations/hermes` / `integrations/dsh`。
+> 两棵树为什么并存：`core/` 是重写版（15 模块），与 `src/` 下 v3.1（54 个脚本）**实现完全
+> 不同**（同层仅 `__init__.py` 重名；`similarity.py` 在 `src/` 那侧位于 `lib/` 子目录，实现也不同）。
+> 直接覆盖会毁掉 v3.1 那 54 个脚本以及依赖它们的 `integrations/hermes` / `integrations/dsh`。
 
 ---
 
@@ -716,8 +717,9 @@ cron 健康告警 / 基因库快照），展示如何把核心接到"有会话�
 
 ### 4) 观测舱 GUI（可选，人类宿主）
 
-**当前发布版 = `integrations/gui-v3/`**（GUI 组件版本 **3.2.0**，液态玻璃 / iOS 外壳），
-在原有九视图之外新增七个：四门实况 / 圈的视角 / 注入观测 / 记忆包 / 圈管理 / 成本面板 / 急救箱。
+**当前发布版 = `integrations/gui-v3/`**（GUI 组件版本 **__ECO_VERSION__**，液态玻璃 / iOS 外壳，
+**18 个视图**：原九视图 + 四门实况 / 圈的视角 / 注入观测 / 记忆包 / 圈管理 / 成本面板 /
+急救箱 / 副圈详情）。
 
 ```bash
 # gui-v3 是 vite 工程，dist 不入库，首次用需构建：
@@ -730,19 +732,33 @@ python integrations/gui/eco_gui.py
 
 | 前端目录 | 路由 | 状态 |
 |---|---|---|
-| `integrations/gui-v3/` | `/v3/` | **当前发布版**（GUI 组件版本 **3.2.0**） |
+| `integrations/gui-v3/` | `/v3/` | **当前发布版**（GUI 组件版本 **__ECO_VERSION__**） |
 | `integrations/gui/`（static） | `/`（v0.3 静态版） | 历史版本，保留 |
 | `gui-v2` / `v2.1` / `v2.2` / `v2.3` | 各自路由 | 历史版本，不随发布物分发，按对应 tag checkout |
 
-> **关于两套版本号**（新人最容易懵的一处）：本仓库有**两个互不相干的版本轴**——
-> ① **产品/核心版本** = `__ECO_VERSION__`（真源 `core/src/memory_ecology/__init__.py`）；
-> ② **GUI 组件版本** = `3.2.0`（真源 `integrations/gui-v3/package.json`）。
-> 它们刻意不对齐：GUI 是可选的人类观测界面，改动节奏与核心无关。
-> README 里凡裸版本号若未带上下文，一律指①。
+> **版本号自 v3.4.0 起已统一**：GUI 组件版本 = 产品版本 = `__ECO_VERSION__`，两者同源递增
+> （真源分别是 `core/src/memory_ecology/__init__.py` 与 `integrations/gui-v3/package.json`，
+> `python -m memory_ecology version` 会把**两处一起校验**，漂移即红）。
+> 此前（≤3.2.x）GUI 是独立版本轴、与核心刻意不对齐，那段历史口径已废止。
 
 纯离线、仅绑 `127.0.0.1`；写动作共 **14 个**（配额挤出 / 写入门整合 / 经验采纳 / 技能繁育 /
 cron 重跑 / cron 钉住 / 体检 / 索引重建 / 急救修复 / 圈配置 / 记忆包开 / 记忆包关 /
 核心维护 / 物化），全部转发核心 CLI 并走确认闸门，**没有任何删除记忆的动作**。
+
+### 5) 生态体检与评分模型 v4
+
+`src/memory_ecology/eco_health_check.py` 是只读体检器，产出报告 + 评分历史。
+**评分模型 v4（2026-11-05 重做）**的口径：
+
+- **连续扣分**：每项用 `权重 × (1 - e^(-n/尺度))`，缺陷从 1 个到 25 个给**不同**分数
+  （v3 的硬阈值会给出相同分，导致"病情加重"和"原地不动"看不出区别）
+- **权重表显式化**：全部系数集中在 `SCORE_V4_WEIGHTS`，改权重只改一处
+- **正向维度**：缓存命中率 / 检索就绪 / 记忆活跃三项加分，**上限 8 分封顶**
+  （防止刷正向项盖过真实缺陷）
+- 报告明细带正负号，加分被封顶时注明原始值
+- `eco_score_history.json` 每条带 `model` 字段，**v3 与 v4 不混算趋势**
+
+> 跨模型分数不可比：v3 时代的 75 分与 v4 的分值不是同一把尺子。
 
 ---
 
@@ -788,7 +804,7 @@ cron 重跑 / cron 钉住 / 体检 / 索引重建 / 急救修复 / 圈配置 / �
 | **Hermes** | 参考实现：会话提取 + 注入 hook + cron | `integrations/hermes/` |
 | **观测舱 GUI** | 人类用：本机浏览器 / pywebview 原生窗口，仅绑 127.0.0.1 | `integrations/gui-v3/` |
 
-核心零改动即可接新宿主。**新装一律用 `core/plugin/`**（随发布树的 dsh 插件本体，v3.2.x，安装命令见上文「dsh 宿主」）；
+核心零改动即可接新宿主。**新装一律用 `core/plugin/`**（随发布树的 dsh 插件本体，v__ECO_VERSION__，安装命令见上文「dsh 宿主」）；
 [integrations/dsh/README.md](integrations/dsh/README.md) 是 v3.1 旧线（eco-note 时代）适配器文档，
 已冻结，仅供维护旧部署时参考，**勿按它新装**。
 
@@ -834,8 +850,8 @@ node test_cordis.mjs  # 官方桌面版：纯函数 + apply() 端到端
 
 **结论**：不合并成"一棵树"，而是让 `core/` 吸收 `src/` 的缺口，齐平后直接删 `src/`。
 
-**为什么不现在做**：两棵树差的是**能力面**，不是结构。`core/` 14 个模块 / 17 个子命令，
-`src/` 33 个 CLI 脚本（另有 17 个测试）；`core/` 目前**没有** v3.1 的写入门（`write_gate`）、
+**为什么不现在做**：两棵树差的是**能力面**，不是结构。`core/` 15 个模块 / 22 个子命令，
+`src/` 54 个 CLI 脚本（另有 21 个测试）；`core/` 目前**没有** v3.1 的写入门（`write_gate`）、
 golden 评测链路、`eco_health_check` 等。直接合并 = 功能回退。
 
 **顺序（每步都可独立验证）**：
@@ -856,19 +872,19 @@ golden 评测链路、`eco_health_check` 等。直接合并 = 功能回退。
 `pending/` 走既有的人工确认链路；`memory_query --disputes` 输出加一列建议。先把"建议"
 跑准（可做影子比对），再谈放开自动。
 
-### 3. v3.1 独立测试（`tests/`）尚未随发布物分发
+### 3. v3.1 独立测试（`tests/`）已收敛到 5 个
 
-**现状**：发布树只发 `tests/fixtures/`（论文复现依赖）。源树 `tests/` 下另有 27 个测试
-（含 `test_v31_security` / `test_pii_rules` / `test_round3_redteam` 这批安全与隐私测试）
-**没有随发**。
+**现状（2026-11-05 实测）**：仓库根 `tests/` 共 5 个测试文件——
+`test_gui_contract.py` / `test_gui_security.py` / `test_gui_v3_2_0.py` /
+`test_health_score_v4.py` / `test_publish_rollback.py`，全部随仓库分发，
+`python -m pytest tests` 一次跑完（58 条）。
 
-**为什么没做完**：这批测试依赖开发树的 `scripts/`、`tools/`、`agent-hooks/` 三处布局
-（含 `subprocess` 里硬编码 `scripts/write_gate.py`、`ECO_SCRIPTS_DIR` 等）。实测：只补
-`sys.path` 能到 201/222 通过，剩余 21 个缺 `eco_evolve` / `check_shell_sync` / `eco_extract`
-等未登记件。
-
-**为什么回退而不是硬发**：发一个"201/222 能跑"的测试目录，比不发更糟——会让人以为发布树
-可回归。要么补齐到全绿，要么不发。
+**历史**：这里一度有 27 个测试（含 `test_v31_security` / `test_pii_rules` /
+`test_round3_redteam` 这批安全与隐私测试），它们依赖开发树的 `scripts/`、`tools/`、
+`agent-hooks/` 三处布局（含 `subprocess` 里硬编码 `scripts/write_gate.py`、
+`ECO_SCRIPTS_DIR` 等），只补 `sys.path` 也只能到 201/222 通过。
+**按"要么补齐到全绿，要么不发"的口径，那批没有随发布物分发**；后续 v3.1 线冻结、
+治理能力迁到 `core/`，它们已不是当前的回归路径。
 
 ### 4. 门④ 的调度频率与"使用驱动"缺数据源（**生产侧，本仓库不含**）
 
@@ -914,9 +930,10 @@ golden 评测链路、`eco_health_check` 等。直接合并 = 功能回退。
 
 ## 📄 版本与历史
 
-- 当前版本 **v__ECO_VERSION__**——版本唯一真源：`core/src/memory_ecology/__init__.py::__version__`
-  （核心四处：`__init__.py` / `pyproject.toml` / `plugin/package.json` / `VERSION.md`，
-  `python -m memory_ecology version` 校验）。
+- 当前版本 **v__ECO_VERSION__**——版本唯一真源：`core/src/memory_ecology/__init__.py::__version__`。
+  `python -m memory_ecology version` 校验 **8 处**：`__init__.py` / `pyproject.toml` /
+  `plugin/package.json` / `VERSION.md` / `CHANGELOG.md` 首条 / `run_tests.py` 横幅
+  （允许动态读取）/ `integrations/gui-v3/package.json` / `integrations/gui-v3/index.html` 标题。
 - 版本要点：[VERSION.md](VERSION.md)；完整变更：[CHANGELOG.md](CHANGELOG.md)；
   架构待办与已知裂缝：[ARCHITECTURE_TODO.md](ARCHITECTURE_TODO.md)。
 - 历史版本用 **git 历史 + 标签**管理：`git checkout <tag>` 或 Releases 页下载任意版本。
