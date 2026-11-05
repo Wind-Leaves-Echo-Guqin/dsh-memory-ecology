@@ -1,14 +1,16 @@
-# dsh-memory-ecology — 记忆生态 · dsh 独立插件 v3.2.2
+# dsh-memory-ecology — 记忆生态 · dsh 独立插件 v3.4.1
 
 一套跑在 dsh 里的长期记忆治理系统：**四道门**（写入整合 / 配额巩固 / 画像蒸馏 / 复核降级）
 \+ 声明式生态圈 + 只读记忆包 + 观测舱。**零 cron、零配置、零第三方依赖、永不物理删除。**
 
 > 版本唯一权威来源：`src/memory_ecology/__init__.py: __version__`。
-> 校验：`python -m memory_ecology version`（四处一致才 ok）。
+> 校验：`python -m memory_ecology version`（**八处**一致才 ok：核心 / pyproject /
+> plugin/package.json / VERSION.md / CHANGELOG 首条 / run_tests 横幅 /
+> gui-v3 的 package.json 与 index.html 标题）。
 >
-> 注意：本目录（`core/`）的产品版本跟随主仓库（当前 v3.2.2）；
-> `integrations/gui-v3/` 的 `package.json` 写的是 **GUI 组件版本 3.2.0**，属另一条独立的
-> 版本轴，两者刻意不对齐。
+> 注意：本目录（`core/`）的产品版本跟随主仓库（当前 **v3.4.1**）；
+> **GUI 组件版本自 v3.4.0 起已并入同一版本轴**（不再是与核心刻意不对齐的独立轴，
+> 那是 ≤3.2.x 的历史口径），`version` 自检会把两处一起校验。
 
 ---
 
@@ -162,4 +164,4 @@ python -m memory_ecology --root <R> pack list|install|enable|disable|uninstall|m
 
 - `docs/ARCHITECTURE.md` —— 分层、数据布局、四道门的判据与"为什么旧实现空转"、被枪毙的方案
 - `docs/OPS.md` —— 零运维手册：出问题怎么查、怎么回滚、配置项
-- `CHANGELOG.md` —— v3.2.0 完整变更（含迁移注意事项）
+- `CHANGELOG.md` —— 完整变更记录（最新 v3.4.1，含迁移注意事项）

@@ -683,7 +683,7 @@ def cmd_health(root, args) -> dict:
 
 
 def cmd_version(root, args) -> dict:
-    """版本自检：三处版本号必须一致（A2A §B5 从纪律变成检查）。"""
+    """版本自检：**八处**版本位必须一致（A2A §B5 从纪律变成检查）。"""
     from . import version as vmod
     return vmod.report(root)
 
@@ -853,7 +853,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("stats", help="统计")
     sub.add_parser("health", help="健康快照（GUI/G2 用）")
-    sub.add_parser("version", help="版本三处对齐自检")
+    sub.add_parser("version", help="版本八处对齐自检")
     sub.add_parser("prune", help="账本/备份归档（不做物理删除记忆）")
 
     bb = sub.add_parser("bring-back", help="把休眠/归档的条目恢复成 active（回目录）")
