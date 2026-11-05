@@ -141,7 +141,6 @@ def measure_session(p: Path, needle: str = "记忆目录") -> dict:
 
 def measure_root(root, record: bool = True, limit: int = 5, needle: str = "记忆目录") -> dict:
     """量最近 N 个有内容的会话 + 本库目录成本；按需落 `cost` 账。
-
     `catalog` 字段取**物化视图的真实字符数**（不是估算）——GUI G6 与插件注入看到的
     是同一个文件的同一个数，不可能漂移。
 
@@ -152,6 +151,13 @@ def measure_root(root, record: bool = True, limit: int = 5, needle: str = "记�
     （实测：同一会话里本插件 1 条 / 368 字符，而全量注入是 19 条 / 92k 字符——
     全算进来等于永远超标）。`total_*` 字段仍然如实报告全量，只是不参与 `over_kpi`。
     """
+    # v3.4.0（审计 01-P2-7 / REVIEW S13）：曾绕过 Root 只读自证——readonly 标记
+    # 不是闸门，schema-mismatch/未 init 的根照样被建出 eco.db 并写 cost 账
+    #（实测 R5b），违反 root.py 契约「只读时所有写命令返回 readonly 3」。这里
+    # 在账务入口降级：只读根一律 record=False（度量照跑，零写面）。
+    if record and getattr(root, "readonly", False):
+        record = False
+
     sess: list[dict] = []
     for p in iter_session_files(limit=60):
         m = measure_session(p, needle=needle)

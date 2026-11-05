@@ -100,15 +100,143 @@ def hit_stats(conn) -> dict:
         return {}
 
 
+# ── L1 常驻段（第三轮审查：L1 写入了但 catalog/search 全都不读它）──────
+#
+# L1（memories/MEMORY.md / USER.md）是门② promote 的落点。修复前它是
+# "单向漏斗"：写进去之后 catalog 只吃 detail、search 只扫 detail、插件只
+# 注入物化目录——L1 写了等于没写，门② 三重空转。本节把 L1 变成
+# **可读的一等公民**。
+#
+# 圈（scope）语义：L1 属于 **global 圈**（MEMORY.md 在根 memories/ 下，不在
+# 圈子目录）。与 global 条目同口径——global 条目在任何圈的目录里都可见，
+# L1 常驻段同理出现在每个圈的 catalog 载荷里。
+
+def _l1_section_payload(sections: list[str]) -> list[dict]:
+    """§ 分段 → [{text, hash}]。hash 供插件做"变更才注入"的增量判断。"""
+    return [{"text": s, "hash": paths.fingerprint("l1sec", paths.norm_key(s))[:16]}
+            for s in sections]
+
+
+def l1_resident(root) -> dict:
+    """读 L1（MEMORY.md / USER.md）→ 常驻段载荷。
+
+    全仓唯一 L1 入口是 `root.memory_md` / `root.user_md`（root.py），
+    解析口径唯一来自 `store.parse_l1`。**只读**，文件缺失按空处理（L1 尚未
+    建立是常态，不是错误）。
+    """
+    mem_raw = paths.read_text(root.memory_md)
+    mem_sections, _ = store.parse_l1(mem_raw)
+    user_raw = paths.read_text(root.user_md)
+    user_sections, _ = store.parse_l1(user_raw)
+    mem_chars = store.chars_of(mem_sections)
+    user_chars = store.chars_of(user_sections)
+    return {
+        "source": "L1",
+        "scope": "global",
+        "memory": {
+            "exists": bool(mem_raw.strip()),
+            "file": str(root.memory_md),
+            "entries": len(mem_sections),
+            "chars": mem_chars,
+            "lines": [paths.norm_text(s)[:CATALOG_LINE_MAX] for s in mem_sections],
+            "sections": _l1_section_payload(mem_sections),
+        },
+        "user": {
+            "exists": bool(user_raw.strip()),
+            "file": str(root.user_md),
+            "entries": len(user_sections),
+            "chars": user_chars,
+            # 一行摘要：USER.md 是画像，逐条太长；拼前 3 条各 40 字符
+            "summary": "；".join(paths.norm_text(s)[:40] for s in user_sections[:3]),
+            "sections": _l1_section_payload(user_sections),
+        },
+        "total_chars": mem_chars + user_chars,
+    }
+
+
+def l1_search_hits(l1: dict, query: str) -> list[dict]:
+    """L1 段的词面命中（来源=L1）。
+
+    L1 是常驻层：命中**不参与 hit 记账**（没有可 load 的 id，也不该影响
+    门② 的"使用证据"统计——它已经在每轮上下文里了，命中与否不产生新信息）。
+    """
+    ts = terms(query)
+    if not ts:
+        return []
+    out = []
+    for part, kind in (("memory", "resident"), ("user", "profile")):
+        for sec in (l1.get(part, {}) or {}).get("sections", []):
+            s = score(sec["text"], ts)
+            if s <= 0:
+                continue
+            out.append({
+                "id": "L1", "kind": kind, "source": "L1",
+                "scope": "global", "score": round(s, 4),
+                "line": paths.norm_text(sec["text"])[:CATALOG_LINE_MAX],
+                "chars": len(sec["text"]),
+            })
+    out.sort(key=lambda x: -x["score"])
+    return out
+
+
+def render_l1_injection(l1: dict, budget: int) -> tuple[str, bool, int]:
+    """L1 载荷 → 插件首轮注入文本（MEMORY.md 全文 + USER.md 摘要）。
+
+    预算按字符（与目录段 600 字符同一哲学）；超限**按 § 段从最旧端丢弃**
+    并显式标注（L1 是 append-only，尾部是最新条目，保新弃旧）。
+    → (文本, 是否截断, 丢弃段数)。空 L1 → ("", False, 0)。
+    """
+    mem_secs = [s["text"] for s in (l1.get("memory", {}) or {}).get("sections", [])]
+    user_secs = [s["text"] for s in (l1.get("user", {}) or {}).get("sections", [])]
+    if not mem_secs and not user_secs:
+        return "", False, 0
+
+    def build(kept: list[str]) -> str:
+        parts = []
+        if kept:
+            parts.append("L1 常驻记忆（memories/MEMORY.md，%d/%d 段）："
+                         % (len(kept), len(mem_secs)))
+            parts.append("\n§\n".join(kept))
+        if user_secs:
+            parts.append("用户画像（memories/USER.md 摘要，%d 条）：" % len(user_secs))
+            parts.append("；".join(paths.norm_text(s)[:40] for s in user_secs))
+        return "\n".join(parts)
+
+    text = build(mem_secs)
+    if len(text) <= budget:
+        return text, False, 0
+    kept = list(mem_secs)
+    omitted = 0
+    # **截断标注行本身也要算进预算**（质量门①审查 P2）：旧写法先按 budget
+    # 收缩、再追加标注行——最终文本系统性超出预算几十字符。
+    note = "\n（超预算截断：省略最早 %d 段，全文在 memories/MEMORY.md）"
+    note_budget = max(60, budget - (len(note % 0) + 8))
+    while kept and len(build(kept)) > note_budget:
+        kept.pop(0)   # 丢最旧（L1 尾部是最新）
+        omitted += 1
+    text = build(kept)
+    if len(text) > note_budget:   # 极端：光 USER 摘要也超 → 硬截断兜底
+        text = text[:note_budget] + "…"
+    if omitted:
+        text += note % omitted
+    if len(text) > budget:   # 最终保险丝：无论如何不超预算
+        text = text[:budget]
+    return text, True, omitted
+
+
 # ── 目录载荷 ─────────────────────────────────────────────────────────
 
 def catalog_payload(items: list[dict], limit: int = CATALOG_DEFAULT,
                     scope: str | None = None, budget_chars: int = 0,
-                    stats: dict | None = None) -> dict:
-    """→ {count, total, used_chars, items[]}。
+                    stats: dict | None = None, l1: dict | None = None) -> dict:
+    """→ {count, total, used_chars, items[], l1?}。
 
     排序：**命中次数降序 → 更新时间降序**。刻意不按类型分组：旧条目不该因为类型被挤掉。
     `status != active` 的条目不进目录（降级/归档的条目只能靠 search 取回）。
+
+    `l1`（`l1_resident()` 的输出）作为**L1 常驻段**附加在载荷上：它有自己的
+    配额（门② 管），**不占目录的字符预算、不进 items 排序**——L1 是常驻层，
+    目录是按预算截断的滚动层，两者不是一个池子。
     """
     stats = stats or {}
     rows = []
@@ -140,16 +268,20 @@ def catalog_payload(items: list[dict], limit: int = CATALOG_DEFAULT,
     total = len(rows)
     shown, used = [], 0
     for it in rows[:max(1, limit)]:
-        if scope:
-            cost = len(it["id"]) + 3 + len(it["kind"]) + 3 + len(it["line"]) + 3
-        else:
-            cost = len(it["id"]) + 3 + len(it["kind"]) + 3 + len(it["line"]) + 3
+        # 行成本 = id + kind + 摘要 + 三段分隔（二轮审查 P2：原来的 if/else
+        # 两分支逐字符相同，是死代码）
+        cost = len(it["id"]) + 3 + len(it["kind"]) + 3 + len(it["line"]) + 3
         if budget_chars > 0 and shown and used + cost > budget_chars:
             break
         shown.append({k: v for k, v in it.items() if k != "_sort"})
         used += cost
     return {"ok": True, "count": len(shown), "total": total,
-            "used_chars": used, "budget_chars": budget_chars, "items": shown}
+            "used_chars": used, "budget_chars": budget_chars, "items": shown,
+            # **L1 常驻段**（修复"L1 无人读"）：有内容才附，空根不带噪音。
+            # 空段也要能区分"没传 l1"与"传了但为空"——用 exists 字段表达。
+            **({"l1": l1} if l1 is not None and
+               (l1.get("memory", {}).get("exists") or l1.get("user", {}).get("exists"))
+               else {})}
 
 
 def _neg_time(value: str) -> float:
@@ -177,6 +309,9 @@ def materialize(root, limit: int = CATALOG_DEFAULT, budget_chars: int = 0,
     stats = hit_stats(conn) if conn is not None else {}
     if conn is not None:
         conn.close()
+    # L1 常驻段：每个圈的物化载荷都带上（global 圈语义——global 条目在哪个
+    # 圈都可见，L1 同理）。读一次，逐圈复用同一份。
+    l1 = l1_resident(root)
 
     if scopes is None:
         scopes = ["global"]
@@ -198,7 +333,7 @@ def materialize(root, limit: int = CATALOG_DEFAULT, budget_chars: int = 0,
         # 显式传入的预算优先（调用方/测试），否则用圈自己的预算
         payload = catalog_payload(
             items, limit=limit or c_limit, scope=sc,
-            budget_chars=budget_chars or c_budget, stats=stats)
+            budget_chars=budget_chars or c_budget, stats=stats, l1=l1)
         payload["schema"] = CATALOG_SCHEMA
         payload["scope"] = sc
         payload["generated_at"] = paths.now()

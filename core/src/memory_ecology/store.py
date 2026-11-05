@@ -178,6 +178,13 @@ def damage_reason(text: str) -> str:
     fields, _body = parse_frontmatter_strict(text)
     if fields is None:
         return "frontmatter 缺结束分隔符"
+    # v3.4.0（审计 01-P2-9 / REVIEW S4 残留）：H2 修的是块级损坏，值级
+    # 损坏（scope 键存在但值为空）仍单向放宽成 global——圈内机密因全角
+    # 冒号解析不出 scope 或手工清空值后变成全局可见（实测 R5a）。归属
+    # 不可信 = 损坏，fail-closed 隔离（health 可见，不猜圈）。键不存在
+    # 仍是合法默认（旧库无 scope 字段 → global）。
+    if fields and "scope" in fields and not str(fields.get("scope") or "").strip():
+        return "scope 键存在但值为空（圈归属不可信）"
     if not any(k == "type" for k in fields):
         # 有块但一个字段都没解析出来（例如全角冒号/缩进错位）→ 不可信
         if not fields:
@@ -482,7 +489,14 @@ def circle_file(root: Path) -> Path:
 
 
 def load_circles(root: Path) -> dict:
-    """读 `<root>/circles.json`；缺失/损坏 → 空配置（fail-open，不抛）。"""
+    """读 `<root>/circles.json`；缺失/损坏 → 空配置（fail-open，不抛）。
+
+    读侧归一（与 save_circles 同口径，但更宽——手改文件绕过了写侧校验）：
+      - 非 dict 条目**丢弃**（`{"circles":[1,2,3]}` 这类坏形状回落空圈，
+        而不是让下游 AttributeError 冒成 internal——安全测试探测 9）
+      - `attachable` 只认真布尔语义；字符串/数字等模糊形态一律按**不可挂**
+        处理（fail-closed：类型混淆不能变成挂载授权——安全测试探测 2）
+    """
     p = circle_file(root)
     if not p.is_file():
         return {"schema_version": CIRCLE_SCHEMA, "global_budget_chars": CIRCLE_DEFAULT_BUDGET,
@@ -497,7 +511,24 @@ def load_circles(root: Path) -> dict:
     data.setdefault("schema_version", CIRCLE_SCHEMA)
     data.setdefault("global_budget_chars", CIRCLE_DEFAULT_BUDGET)
     circles = data.get("circles")
-    data["circles"] = circles if isinstance(circles, list) else []
+    norm: list[dict] = []
+    if isinstance(circles, list):
+        for c in circles:
+            if not isinstance(c, dict):
+                continue
+            if "attachable" in c:
+                # **严格 fail-closed**（二轮审查 P2：旧写法 "true"/1/"nope" 等
+                # 模糊形态归一成可挂，与"字符串/数字按不可挂"的自述相悖）——
+                # 非 bool 一律按不可挂处理；要授权就写真正的布尔
+                v = c["attachable"]
+                c["attachable"] = v is True
+            norm.append(c)
+    if len(norm) > 200:
+        # 手改文件绕过写侧校验时的兜底（安全测试探测 5）：超额截断并落 warn，
+        # materialize 扇出不受限比报错更糟
+        norm = norm[:200]
+        data["warn"] = "circles 超过上限 200，读侧截断（手改文件请走 circles-write）"
+    data["circles"] = norm
     return data
 
 
@@ -518,11 +549,19 @@ def save_circles(root: Path, data: dict) -> Path:
     for c in data.get("circles", []):
         out["circles"].append({
             "id": norm_scope(c.get("id")),
-            "display_name": str(c.get("display_name") or c.get("id") or "")[:80],
+            # 控制字符/换行清洗（漏洞扫描低#8）：display_name 会进 GUI 清单与
+            # 插件 memory_circle_list 的单行输出——内嵌换行可伪造清单行
+            "display_name": re.sub(r"[\x00-\x1f\x7f]+", " ",
+                                   str(c.get("display_name") or c.get("id") or ""))[:80],
             "match": {"cwd_prefix": [str(x) for x in (c.get("match", {}) or {}).get("cwd_prefix", [])]},
             "budget_chars": int(c.get("budget_chars") or CIRCLE_DEFAULT_BUDGET),
             "catalog_limit": int(c.get("catalog_limit") or CIRCLE_DEFAULT_LIMIT),
             "readonly": bool(c.get("readonly", False)),
+            # 多生态圈：挂载授权（设计文档 §4）。缺省 true——声明圈即授权挂载，
+            # `attachable: false` 显式退出（机密项目"可写不可挂"）。归一成显式
+            # 布尔：语义不依赖"键缺不缺"，GUI/插件读到的配置没有隐式态。
+            # 非 bool 类型已被 validate_circles 拒绝，这里是最后一道归一。
+            "attachable": bool(c.get("attachable", True)),
             # 3.3.0 的只读挂载源声明（本轮只存不用，A2A 决策 D1）
             "sources": [str(x) for x in (c.get("sources") or [])],
         })
@@ -547,6 +586,10 @@ def validate_circles(data: dict) -> list[str]:
     circles = data.get("circles", [])
     if not isinstance(circles, list):
         return errs + ["circles 必须是数组"]
+    if len(circles) > 200:
+        # 上限依据：每个声明圈都会物化一个目录文件并参与路由表——
+        # 安全测试探测 5 实测 5000 圈 = materialize 扇出 5000 文件
+        errs.append("circles 数量超过上限 200（实际 %d）" % len(circles))
     seen = set()
     for i, c in enumerate(circles):
         if not isinstance(c, dict):
@@ -558,6 +601,11 @@ def validate_circles(data: dict) -> list[str]:
         if cid in seen:
             errs.append("circles[%d] id 重复：%s" % (i, cid))
         seen.add(cid)
+        if "attachable" in c and not isinstance(c["attachable"], bool):
+            # 类型混淆 = 授权语义漂移（"false" 字符串在旧读侧会被当真值）——
+            # 写入时就拦下，别等读侧 fail-closed 兜底
+            errs.append("circles[%d].attachable 必须是布尔（得到 %r）"
+                        % (i, c["attachable"]))
         prefixes = (c.get("match") or {}).get("cwd_prefix")
         if prefixes is not None:
             if not isinstance(prefixes, list):

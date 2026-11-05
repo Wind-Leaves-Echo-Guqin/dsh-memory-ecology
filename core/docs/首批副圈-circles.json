@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "global_budget_chars": 600,
+  "circles": [
+    {
+      "id": "dsh-eco-dev",
+      "display_name": "dsh 记忆生态开发",
+      "match": {
+        "cwd_prefix": [
+          "D:/work/dsh-memory-ecology",
+          "C:/Users/qy160/dsh-memory-ecology",
+          "C:/Users/qy160/qq-gateway",
+          "C:/Users/qy160/eco-ops-live"
+        ]
+      },
+      "budget_chars": 800,
+      "catalog_limit": 20
+    },
+    {
+      "id": "quant-lab",
+      "display_name": "量化实验室",
+      "match": {
+        "cwd_prefix": [
+          "D:/work/quant-lab"
+        ]
+      },
+      "budget_chars": 600,
+      "catalog_limit": 16
+    }
+  ]
+}

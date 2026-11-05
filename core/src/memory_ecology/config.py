@@ -52,6 +52,20 @@ REVIEW_USE_WINDOW = True        # → gates.review()（窗口内被命中则免�
 CATALOG_LIMIT = 20              # → retrieve.materialize()
 CATALOG_BUDGET_CHARS = 600      # → retrieve.materialize()
 SEARCH_LIMIT = 8                # → retrieve.search()
+# L1 常驻段注入预算（目录段 600 的姊妹口径；L1 配额本身由门② 管）
+L1_INJECT_BUDGET_CHARS = 1500   # → cli.cmd_l1()（插件首轮 L1 注入）
+# 多生态圈（设计文档 docs/多生态圈动态机制-设计.md §8）
+CHARTER_RULES = (               # → cli.cmd_charter()（主圈物理法则，前缀字节稳定层）
+    "记忆生态在此会话生效：长期记忆永不物理删除，任何变更可回滚。",
+    "写入只经候选区与四道门，不直写记忆文件。",
+    "记忆目录是滚动视图，正文用 memory_load(id) 取；检索默认限本圈与全局。",
+    "pin 条目为人工保留区，不被淘汰。",
+)
+CHARTER_MAX_CHARS = 2000        # → cli.cmd_charter()（charter 总闸：前缀无界膨胀防线）
+LOAD_MAX_CHARS = 20000          # → cli.cmd_load()（正文硬上限：手植超大 detail 防线）
+CIRCLE_HIT_KEEP_DAYS = 180      # → cli.cmd_prune()（跨圈命中账归档窗口，同 hit 口径）
+CIRCLE_TAIL_MAX_CHARS = 900     # → 插件尾段总闸（JS 读同名配置口径，核心物化不裁它）
+CIRCLE_ATTACH_SUGGEST_AFTER = 3  # → cli.cmd_circles_stats()（跨圈命中建议阈值）
 # 注入预算（KPI，超标即设计失败，GUI 标红）
 INJECT_MAX_MESSAGES = 3         # → plugin + gui.cost_panel()
 INJECT_MAX_CHARS = 1200         # → plugin + gui.cost_panel()

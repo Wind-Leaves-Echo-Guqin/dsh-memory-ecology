@@ -59,6 +59,11 @@ _SCHEMA = [
         ts TEXT, session TEXT, tools_schema INTEGER, system_prompt INTEGER,
         catalog INTEGER, injected_msgs INTEGER, injected_chars INTEGER,
         eco_msgs INTEGER, eco_chars INTEGER)""",
+    # 多生态圈（设计文档 §6）：跨圈命中账。routed 圈的会话里命中了另一圈
+    # （挂载圈）的条目 → 一行。append-only，无淘汰——它是"驯化晋升"与
+    # 宇宙泡"泡间桥接"的唯一数据源。
+    """CREATE TABLE IF NOT EXISTS circle_hit(
+        ts TEXT, routed TEXT, scope TEXT, id TEXT, via TEXT)""",
 ]
 
 _INDEXES = [
@@ -159,6 +164,42 @@ def review_log(conn, action: str, slug: str = "", reason: str = "") -> None:
 def event(conn, kind: str, target: str = "", detail: str = "") -> None:
     log(conn, "event", {"ts": paths.now(), "kind": kind,
                         "target": target, "detail": detail[:500]})
+
+
+def circle_hit_log(conn, routed: str, scope: str, ids: list, via: str) -> int:
+    """跨圈命中落账（设计文档 §6）。`ids` 上限 20 行/次——search 的 limit
+    本来就 ≤20，这里再兜一层底。**只增不改**。返回写入行数。"""
+    if conn is None or not ids:
+        return 0
+    n = 0
+    for i in ids[:20]:
+        log(conn, "circle_hit", {
+            "ts": paths.now(), "routed": str(routed or "")[:40],
+            "scope": str(scope or "")[:40], "id": str(i)[:80],
+            "via": str(via or "")[:16]})
+        n += 1
+    return n
+
+
+def last_event(conn, kind: str) -> dict | None:
+    """最近一条指定 kind 的 event（health 报「上次被锁挡」用）。
+
+    **只读、绝不抛**：账本打不开/表不存在 → None（health 对 None 就是不报，
+    与 hit_stats 的口径一致）。没有匹配行也返回 None。
+    """
+    if conn is None:
+        return None
+    try:
+        rows = conn.execute(
+            "SELECT ts, target, detail FROM event WHERE kind=? "
+            "ORDER BY ts DESC LIMIT 1", (kind,)).fetchall()
+    except Exception:  # noqa: BLE001 - sqlite3.Error 及任何库级异常
+        return None
+    if not rows:
+        return None
+    ts, target, detail = rows[0]
+    return {"ts": str(ts or ""), "target": str(target or ""),
+            "detail": str(detail or "")}
 
 
 # ── 读侧：四门实况（GUI G2 的唯一数据源）─────────────────────────────
@@ -351,6 +392,21 @@ def prune_hit(conn, keep_days: int = 180) -> int:
     try:
         cur = conn.execute(
             "DELETE FROM hit WHERE julianday('now') - julianday(substr(ts,1,19)) > ?",
+            (keep_days,))
+        conn.commit()
+        return int(cur.rowcount or 0)
+    except sqlite3.Error:
+        return 0
+
+
+def prune_circle_hit(conn, keep_days: int = 180) -> int:
+    """`circle_hit` 跨圈命中账归档（同 hit 口径——二轮安全测试：60 次检索
+    刷出 1204 行且 prune 不覆盖它，高频会话可无界刷爆 eco.db）。"""
+    if conn is None or keep_days <= 0:
+        return 0
+    try:
+        cur = conn.execute(
+            "DELETE FROM circle_hit WHERE julianday('now') - julianday(substr(ts,1,19)) > ?",
             (keep_days,))
         conn.commit()
         return int(cur.rowcount or 0)

@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
-from . import (__version__, config, gates, ledger, packs, paths, retrieve, root as rootmod,
-               store)
+from . import (__version__, config, gates, ledger, packs, paths, proclock, retrieve,
+               root as rootmod, store)
 
 
 def _emit(obj: dict) -> None:
@@ -64,7 +65,23 @@ def cmd_deposit(root, args) -> dict:
     text = paths.norm_text(args.text)[:store.BODY_MAX]
     if not text:
         return {"ok": False, "error": "empty-text"}
-    scope = store.norm_scope(args.scope)
+    # **圈名塌缩拒绝**（安全测试探测 1）：携带字母/数字的 scope 被归一剥成
+    # 空串 → 静默落进可见面最宽的 global，成功回执毫无警示。机密意图不能这样
+    # 被"放宽"——fail-closed。纯标点塌缩（"."、".."、"—"）不在此列：那是
+    # test_compat 钉住的安全阀（恶意名安全碰撞，不产生穿越）。
+    raw_scope = str(getattr(args, "scope", "") or "").strip()
+    scope = store.norm_scope(raw_scope)
+    warn = ""
+    if (raw_scope and raw_scope.lower() != "global" and scope in ("", "global")
+            and any(ch.isalnum() for ch in raw_scope)):
+        return {"ok": False, "error": "scope-collapsed-to-global", "exit": 5,
+                "detail": ("圈名 %r 归一后为空（携带字母/数字的圈名被整段剥掉，"
+                           "内容会静默落进可见面最宽的 global）。"
+                           "请用 [a-z0-9._-] 组成的圈名。") % raw_scope[:40]}
+    # 部分塌缩警示（漏洞扫描低#11）：混合名 `机密圈X` 归一成 `x`——内容照投，
+    # 但回执里必须让投递方看见改名这一步。
+    if raw_scope and scope and scope != "global" and scope != raw_scope:
+        warn = "圈名 %r 被归一为 %r" % (raw_scope[:40], scope)
     ctype = store.norm_type(args.kind)
     if store.circle_readonly(root.path, scope):
         return {"ok": False, "readonly": True, "reason": "circle-readonly:%s" % scope}
@@ -79,30 +96,91 @@ def cmd_deposit(root, args) -> dict:
     except OSError as exc:
         return {"ok": False, "error": "append-failed", "detail": str(exc)[:200]}
     return {"ok": True, "file": f.name, "kind": ctype, "scope": scope,
-            "chars": len(text)}
+            "chars": len(text), **({"warn": warn} if warn else {})}
 
 
 def cmd_reconcile(root, args) -> dict:
     if root.readonly:
         return root.readonly_payload()
-    return gates.integrate(root, archive=not args.no_archive, dry_run=args.dry_run)
+    # 门① 的第二个入口也必须持进程锁（质量门①审查 P2）：插件每 3 分钟调它，
+    # 与另一进程的 `gate all` 并发写同一 root 的场景与 `gate` 完全同构。
+    lock = proclock.acquire(root.path, "gate")
+    if not lock.get("ok"):
+        try:
+            conn = root.connect()
+            try:
+                ledger.event(conn, "gate.lock-blocked", "reconcile",
+                             "holder pid=%s ts=%s" % ((lock.get("holder") or {}).get("pid"),
+                                                      (lock.get("holder") or {}).get("ts")))
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": False, "locked": True, "gate": "1",
+                "holder": lock.get("holder"),
+                "reason": "another-gate-run-in-progress", "exit": 5}
+    try:
+        return gates.integrate(root, archive=not args.no_archive, dry_run=args.dry_run)
+    finally:
+        proclock.release(root.path, "gate")
 
 
 def cmd_gate(root, args) -> dict:
     if root.readonly:
         return root.readonly_payload()
     which = args.gate
-    if which == "1":
-        return gates.integrate(root, archive=True, dry_run=args.dry_run)
-    if which == "2":
-        return gates.quota(root, dry_run=args.dry_run)
-    if which == "3":
-        return gates.distill(root, dry_run=args.dry_run)
-    if which == "4":
-        return gates.review(root, dry_run=args.dry_run)
-    if which == "all":
+    if which not in ("1", "2", "3", "4", "all"):
+        return {"ok": False, "error": "unknown-gate", "gate": which}
+    # ---- 进程级锁（v17 对照 · 缺口 3）：门可能被 hermes cron、插件维护、
+    # 人手 CLI 同时拉起。四门幂等，但并发写同一个 root 仍可能交错出脏状态。
+    # 规则：<30 分钟持锁 → 立即退出报 locked（被挡的一次落账，health 能报）；
+    # >30 分钟 → 判持有进程已死，清掉重跑。锁文件写不了 → fail-open 放行。
+    lock = proclock.acquire(root.path, "gate")
+    if not lock.get("ok"):
+        holder = lock.get("holder") or {}
+        try:
+            conn = root.connect()
+            try:
+                ledger.event(conn, "gate.lock-blocked", "gate:%s" % which,
+                             "holder pid=%s ts=%s age_min=%s"
+                             % (holder.get("pid"), holder.get("ts"), lock.get("age_min")))
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001 - 落账失败不能盖过 locked 本身
+            pass
+        return {"ok": False, "locked": True, "gate": which, "holder": holder,
+                "age_min": lock.get("age_min"),
+                "reason": "another-gate-run-in-progress", "exit": 5}
+    if lock.get("stale_cleared") or lock.get("degraded"):
+        try:
+            conn = root.connect()
+            try:
+                if lock.get("stale_cleared"):
+                    ledger.event(conn, "gate.lock-stale-cleared", "gate:%s" % which,
+                                 "前任 pid=%s ts=%s" % ((lock.get("holder") or {}).get("pid"),
+                                                        (lock.get("holder") or {}).get("ts")))
+                if lock.get("degraded"):
+                    ledger.event(conn, "gate.lock-degraded", "gate:%s" % which,
+                                 str(lock.get("degraded")))
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        if which == "1":
+            return gates.integrate(root, archive=True, dry_run=args.dry_run)
+        if which == "2":
+            return gates.quota(root, dry_run=args.dry_run)
+        if which == "3":
+            return gates.distill(root, dry_run=args.dry_run)
+        if which == "4":
+            return gates.review(root, dry_run=args.dry_run)
         return gates.maintain(root, dry_run=args.dry_run)
-    return {"ok": False, "error": "unknown-gate", "gate": which}
+    finally:
+        proclock.release(root.path, "gate")
 
 
 def cmd_bring_back(root, args) -> dict:
@@ -122,7 +200,8 @@ def cmd_catalog(root, args) -> dict:
     payload = retrieve.catalog_payload(
         root.items(), limit=args.limit or limit, scope=args.scope,
         budget_chars=args.max_chars if args.max_chars is not None else budget,
-        stats=retrieve.hit_stats(root.connect_ro()))
+        stats=retrieve.hit_stats(root.connect_ro()),
+        l1=retrieve.l1_resident(root))
     payload["ok"] = True
     if args.log_chars is not None and not root.readonly:
         conn = root.connect()
@@ -142,18 +221,35 @@ def cmd_load(root, args) -> dict:
     it = root.item(args.id)
     if it is None:
         return {"ok": False, "error": "not-found", "id": args.id}
+    body = it["body"]
+    # **正文硬上限**（二轮安全测试：15.8MB 手植 detail 一次 load 打爆上下文——
+    # BODY_MAX 只约束门①整合通道，load 直读必须自带上限）
+    try:
+        load_cap = int(config.get(root.path, "LOAD_MAX_CHARS", config.LOAD_MAX_CHARS))
+    except (TypeError, ValueError):
+        load_cap = config.LOAD_MAX_CHARS
+    truncated = False
+    if len(body) > load_cap:
+        body = body[:load_cap] + "\n…（超上限截断，全文在 detail/%s.md）" % it["name"]
+        truncated = True
     out = {"ok": True, "id": it["fm"].get("id") or it["name"],
            "kind": it.get("type"), "scope": it.get("scope"),
-           "status": it.get("status"), "body": it["body"], "chars": len(it["body"])}
+           "status": it.get("status"), "body": body, "chars": len(body),
+           "truncated": truncated}
     if not root.readonly:
         conn = root.connect()
         try:
             conn.execute("INSERT INTO hit(ts,id,kind,query) VALUES (?,?,?,?)",
                          (paths.now(), out["id"], out["kind"], "load"))
+            # 跨圈命中：routed 圈会话里 load 了另一圈的条目（设计文档 §6）
+            it_scope = store.norm_scope(out.get("scope") or "global")
+            routed = store.norm_scope(getattr(args, "routed", "") or "")
+            if routed and it_scope and it_scope != "global" and it_scope != routed:
+                ledger.circle_hit_log(conn, routed, it_scope, [out["id"]], "load")
             ledger.log(conn, "inject_event", {
                 "ts": paths.now(), "session": args.session or "", "source": "eco-load",
-                "form": "load", "items": 1, "chars": len(it["body"]),
-                "tokens": len(it["body"]) // 2, "ids": out["id"]})
+                "form": "load", "items": 1, "chars": len(body),
+                "tokens": len(body) // 2, "ids": out["id"]})
             conn.commit()
         finally:
             conn.close()
@@ -165,14 +261,43 @@ def cmd_search(root, args) -> dict:
     stats = retrieve.hit_stats(conn) if conn is not None else {}
     if conn is not None:
         conn.close()
-    hits = retrieve.search(root.items(), args.query, limit=args.limit,
+    # **L1 行也参与命中判定**（修复"L1 无人读"）：detail 命中先取一个大池子，
+    # 与 L1 命中按分数合并排序后再截到 limit——否则池子先截断会让 L1 命中
+    # 永远挤不进结果（或反过来）。
+    pool = max(1, args.limit, 32)
+    hits = retrieve.search(root.items(), args.query, limit=pool,
                            scope=args.scope, hit_stats=stats)
+    l1_hits = retrieve.l1_search_hits(retrieve.l1_resident(root), args.query)
+    if l1_hits:
+        # **同文去重**（漏洞扫描低#9）：promote 条目同时存在于 detail 与
+        # MEMORY.md，两路都命中会让同一段文本出现两次（还挤占注入预算）。
+        # 保留 detail 侧（可 load、有 hit 记账），丢弃 L1 影子命中。
+        detail_keys = {paths.norm_key(h.get("line") or "")[:30] for h in hits}
+        l1_hits = [h for h in l1_hits
+                   if paths.norm_key(h.get("line") or "")[:30] not in detail_keys]
+        hits = sorted(hits + l1_hits, key=lambda x: -x["score"])
+    # **截断无条件执行**（质量门①审查 P2）：L1 无命中时旧写法漏截，
+    # `--limit 8` 会返回最多 32 条（pool 口径），注入账跟着虚增
+    hits = hits[:max(1, args.limit)]
     if hits and not root.readonly:
         conn = root.connect()
         try:
+            # L1 命中没有可 load 的 id，也不构成"使用证据"——不进 hit 记账
+            # 跨圈命中（circle_hit）：routed 圈 A 的会话命中了另一圈 B 的条目
+            # ——驯化/桥接的唯一数据源（设计文档 §6）。global 条目不算跨圈。
+            routed = store.norm_scope(getattr(args, "routed", "") or "")
+            cross: dict[str, list] = {}
             for h in hits:
+                if h.get("source") == "L1":
+                    continue
                 conn.execute("INSERT INTO hit(ts,id,kind,query) VALUES (?,?,?,?)",
                              (paths.now(), h["id"], h["kind"], args.query[:120]))
+                hsc = store.norm_scope(h.get("scope") or "global")
+                if (routed and hsc and hsc != "global"
+                        and hsc != store.norm_scope(routed)):
+                    cross.setdefault(hsc, []).append(h["id"])
+            for hsc, hit_ids in cross.items():
+                ledger.circle_hit_log(conn, routed, hsc, hit_ids, "search")
             ledger.log(conn, "inject_event", {
                 "ts": paths.now(), "session": args.session or "", "source": "eco-search",
                 "form": "search", "items": len(hits),
@@ -228,12 +353,188 @@ def cmd_circles(root, args) -> dict:
                           "match": c.get("match", {}),
                           "display_name": c.get("display_name", "")})
     return {"ok": True, "count": len(items), "items": items,
-            "global_budget_chars": cfg.get("global_budget_chars")}
+            "global_budget_chars": cfg.get("global_budget_chars"),
+            # 读侧降级必须可见（二轮安全测试：手改坏配置的用户看不到截断/损坏
+            # 警示，命令输出装作"一切正常"）
+            **({"warn": cfg["warn"]} if cfg.get("warn") else {}),
+            **({"error": cfg["error"]} if cfg.get("error") else {}),
+            # 尾段总闸的唯一权威出口（设计文档 §8）：插件从这里读，
+            # **不许在 JS 里自定预算**——否则与核心口径漂移（条数/字符数的老坑）。
+            "tail_max_chars": config.get(root.path, "CIRCLE_TAIL_MAX_CHARS",
+                                         config.CIRCLE_TAIL_MAX_CHARS)}
 
 
 def cmd_route(root, args) -> dict:
     scope = store.route_circle(root.path, args.cwd) if args.cwd else "global"
     return {"ok": True, "cwd": args.cwd or "", "scope": scope}
+
+
+def cmd_charter(root, args) -> dict:
+    """主圈物理法则段（多生态圈 · 设计文档 §2/§8）。
+
+    三层常驻内容里**只有物理法则进这个命令**：气候（USER.md 摘要）与基础物种
+    （MEMORY.md/全局目录）走既有 L1 pre-step 与目录段——它们随使用演化，
+    进前缀会让字节稳定铁律破产。charter 文本 = 配置规则列表的确定性拼装，
+    **同 root 同配置下字节恒定**（前缀缓存友好的前提）；改规则 = 改 eco.toml
+    `[charter] charter_rules = [...]`（toml 短名归一要求键名自带 `charter_`
+    前缀——写 `[charter] rules` 会静默无效，正是"死配置"教训的形态），
+    代价一次重 prefill，由配置变更者有意承担。
+    """
+    rules = config.get(root.path, "CHARTER_RULES", config.CHARTER_RULES)
+    if not isinstance(rules, (list, tuple)):
+        rules = [str(rules)]
+    # 控制字符/内嵌换行清洗（漏洞扫描低#8）：charter 进 systemPrompt 前缀，
+    # ESC/换行会破坏"一法则一行"与终端渲染——折叠成空格（纵深防御，
+    # 配置是用户自己的，但输出格式是系统契约）。
+    clean = [re.sub(r"[\x00-\x1f\x7f]+", " ", str(r)).strip() for r in rules]
+    lines = [l for l in clean if l]
+    text = "\n".join("· " + l for l in lines)
+    # **总闸**（二轮安全测试：200KB 规则直通注入前缀 = 无界 prefill 膨胀）
+    try:
+        cap = int(config.get(root.path, "CHARTER_MAX_CHARS", config.CHARTER_MAX_CHARS))
+    except (TypeError, ValueError):
+        cap = config.CHARTER_MAX_CHARS
+    if len(text) > cap:
+        text = text[:cap] + "\n…（超 CHARTER_MAX_CHARS 截断）"
+        lines = text.splitlines()
+    return {"ok": True, "schema": 1, "source": "charter",
+            "text": text, "chars": len(text),
+            "rules": [l[2:] if l.startswith("· ") else l for l in lines
+                      if l and not l.startswith("…")],
+            "version": __version__}
+
+
+def cmd_circle_attach(root, args) -> dict:
+    """挂载圈（agent 主导激活的服务端，设计文档 §4）。
+
+    **校验 fail-closed**：未声明的圈、`attachable: false` 的圈一律拒绝——
+    attach 是跨圈可见性的授权动作，必须显式声明在案。成功 = 落账
+    （`circle.attach`）+ 返回该圈目录载荷（该圈 + global，绝不含第三圈）。
+    """
+    if root.readonly:
+        return root.readonly_payload()
+    cid = store.norm_scope(getattr(args, "circle", ""))
+    if not cid or cid == "global":
+        return {"ok": False, "error": "invalid-circle", "circle": cid,
+                "detail": "global 无需挂载（对所有圈可见）", "exit": 5}
+    declared = {store.norm_scope(c.get("id")): c
+                for c in store.load_circles(root.path).get("circles", [])}
+    c = declared.get(cid)
+    if c is None:
+        return {"ok": False, "error": "undeclared-circle", "circle": cid,
+                "detail": "未在 circles.json 声明的圈不可挂载（没声明就不猜）", "exit": 5}
+    if c.get("attachable") is False:
+        return {"ok": False, "error": "not-attachable", "circle": cid,
+                "detail": "该圈声明了 attachable: false（只可写不可挂）", "exit": 5}
+    routed = store.norm_scope(getattr(args, "routed", "") or "")
+    conn = root.connect()
+    try:
+        ledger.event(conn, "circle.attach", cid,
+                     "routed=%s session=%s" % (routed or "-",
+                                               getattr(args, "session", "") or "-"))
+        conn.commit()
+    finally:
+        conn.close()
+    budget, limit = store.circle_budget(root.path, cid)
+    conn = root.connect_ro()
+    stats = retrieve.hit_stats(conn) if conn is not None else {}
+    if conn is not None:
+        conn.close()
+    payload = retrieve.catalog_payload(root.items(), limit=limit, scope=cid,
+                                       budget_chars=budget, stats=stats)
+    return {"ok": True, "circle": cid,
+            "declared": True, "attachable": True, "routed": routed,
+            "readonly": store.circle_readonly(root.path, cid),
+            "count": payload["count"], "total": payload["total"],
+            "items": payload["items"],
+            "text": retrieve.render_catalog_text(payload, limit=limit)}
+
+
+def cmd_circle_detach(root, args) -> dict:
+    """分离圈：落账（`circle.detach`）。分离不撤回历史注入——append-only，
+    旧消息随 compaction 自然滚出（设计文档 §4）。"""
+    if root.readonly:
+        return root.readonly_payload()
+    cid = store.norm_scope(getattr(args, "circle", ""))
+    if not cid:
+        return {"ok": False, "error": "invalid-circle", "circle": "", "exit": 5}
+    conn = root.connect()
+    try:
+        ledger.event(conn, "circle.detach", cid,
+                     "session=%s" % (getattr(args, "session", "") or "-"))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True, "circle": cid}
+
+
+def cmd_circles_stats(root, args) -> dict:
+    """跨圈命中聚合（驯化/桥接的数据源，设计文档 §6）。
+
+    按 (routed, scope) 聚合 `circle_hit`：A 圈会话里命中了 B 圈条目多少次。
+    `count ≥ CIRCLE_ATTACH_SUGGEST_AFTER` → `suggest=true`——宇宙泡的
+    "泡间桥接"与未来的驯化建议都从这里取数。只读。
+    """
+    conn = root.connect_ro()
+    try:
+        threshold = int(config.get(root.path, "CIRCLE_ATTACH_SUGGEST_AFTER",
+                                   config.CIRCLE_ATTACH_SUGGEST_AFTER))
+    except (TypeError, ValueError):
+        threshold = config.CIRCLE_ATTACH_SUGGEST_AFTER
+    # 阈值毒性下限（二轮安全测试：配 0 → 全部行 suggest:true 刷社工信号）
+    if threshold < 1:
+        threshold = 1
+    rows, rows_err = [], ""
+    if conn is not None:
+        try:
+            # suggest 按 **distinct id** 计数（二轮安全测试：同一 id 反复检索
+            # 能把 hits 刷到 1200 伪造"建议挂载"——去重后的"真看过几条"才有资格建议）
+            raw = conn.execute(
+                "SELECT routed, scope, count(*), count(DISTINCT id), max(ts) "
+                "FROM circle_hit GROUP BY routed, scope ORDER BY 3 DESC").fetchall()
+            for routed, scope, n, distinct, last_ts in raw:
+                rows.append({"routed": str(routed or ""), "scope": str(scope or ""),
+                             "hits": int(n or 0), "distinct": int(distinct or 0),
+                             "last_ts": str(last_ts or ""),
+                             "suggest": int(distinct or 0) >= threshold})
+        except Exception as exc:  # noqa: BLE001 - 坏表不该让快照崩
+            rows, rows_err = [], str(exc)[:120]
+        finally:
+            conn.close()
+    else:
+        rows_err = "no-ledger"
+    total = len(rows)
+    # **limit 语义修正**（漏洞扫描低#4）：负数 limit 走 Python 负切片、
+    # count 不随截断变——count = 截断后行数，total = 聚合总行数。
+    try:
+        limit = max(0, int(getattr(args, "limit", 0) or 0) or 50)
+    except (TypeError, ValueError):
+        limit = 50
+    rows = rows[:limit]
+    return {"ok": True, "count": len(rows), "total": total, "rows": rows,
+            "suggest_after": threshold,
+            **({"warn": rows_err} if rows_err else {})}
+
+
+def cmd_l1(root, args) -> dict:
+    """L1 常驻段载荷 + 插件首轮注入文本（唯一出口，§ 语义不进 JS）。
+
+    预算默认 `L1_INJECT_BUDGET_CHARS`（1500）：目录段是 600 字符口径，
+    L1 是常驻层、配额由门② 管，注入预算单独给。超限按 § 段截断并标注
+    （retrieve.render_l1_injection）。**只读**——L1 的写入只属于四道门。
+    """
+    l1 = retrieve.l1_resident(root)
+    try:
+        budget = int(args.budget) if getattr(args, "budget", 0) else \
+            int(config.get(root.path, "L1_INJECT_BUDGET_CHARS",
+                           config.L1_INJECT_BUDGET_CHARS))
+    except (TypeError, ValueError):
+        budget = config.L1_INJECT_BUDGET_CHARS
+    text, truncated, omitted = retrieve.render_l1_injection(l1, max(60, budget))
+    return {"ok": True, "budget_chars": max(60, budget),
+            "inject_text": text, "truncated": truncated, "omitted_sections": omitted,
+            "memory": l1["memory"], "user": l1["user"],
+            "total_chars": l1["total_chars"]}
 
 
 def cmd_materialize(root, args) -> dict:
@@ -274,6 +575,9 @@ def cmd_health(root, args) -> dict:
     """健康快照。**任何单项失败都不能让整个快照失败**（GUI 会白屏）。"""
     notes: list[str] = []
     conn = None
+    recon = None
+    lock_state: dict = {"held": False}
+    last_blocked = None
     try:
         conn = root.connect_ro()
     except Exception as exc:  # noqa: BLE001 - 坏库不该让 health 崩
@@ -294,6 +598,23 @@ def cmd_health(root, args) -> dict:
         except Exception as exc:  # noqa: BLE001
             notes.append("成本账读取失败：%s" % str(exc)[:120])
             cost = {"rows": []}
+        # **L1 消费端对账**（v17 对照 · 第 10 步）：账本声称 promote 进 L1 的
+        # 条目必须"还在 L1 或有挤出账"。L1 无人读修好之后，这是 L1 唯一剩下的
+        # 失真通道——写了、账上有、读者读不到，没有这道核对谁也不会发现。
+        try:
+            recon = gates.l1_reconcile(root, conn) if conn is not None else None
+        except Exception as exc:  # noqa: BLE001
+            notes.append("L1 对账失败：%s" % str(exc)[:120])
+            recon = None
+        # **门锁可见性**：当前持锁（并发会被挡）+ 上次被锁挡的记录（24h 内才报，
+        # 否则一次历史阻塞永久挂在高频快照里）。
+        try:
+            lock_state = proclock.status(root.path, "gate")
+            last_blocked = (ledger.last_event(conn, "gate.lock-blocked")
+                            if conn is not None else None)
+        except Exception as exc:  # noqa: BLE001
+            notes.append("锁状态读取失败：%s" % str(exc)[:120])
+            lock_state, last_blocked = {"held": False}, None
     finally:
         if conn is not None:
             try:
@@ -322,6 +643,25 @@ def cmd_health(root, args) -> dict:
             notes.append("%s 空转：%s" % (g["name"], g["reason"]))
     if damaged:
         status = "warn"
+    if recon is not None and not recon.get("ok"):
+        # 对账没跑成（坏库/查询失败）必须可见，但 warn 与否交给既有坏库告警——
+        # 这里只落 note，不重复报警。
+        notes.append("L1 对账没跑成：%s" % recon.get("why"))
+    elif recon is not None and recon.get("missing"):
+        status = "warn"
+        notes.append("L1 对账：%d 条 promote 声称进 L1，但既不在 MEMORY.md 也无挤出账"
+                     "（手改/丢失？重跑门②可回填）：%s"
+                     % (len(recon["missing"]),
+                        "、".join(m["id"] for m in recon["missing"][:5])))
+    if lock_state.get("held"):
+        notes.append("四门锁当前被持有（pid=%s，%s 分钟）——此期间的并发门运行会被挡"
+                     % (lock_state.get("pid"), lock_state.get("age_min")))
+    if last_blocked:
+        age = paths.days_between(last_blocked.get("ts") or "")
+        if age is not None and age <= 1.0:
+            notes.append("上次四门被锁挡：%s（%s）"
+                         % (last_blocked.get("ts"),
+                            last_blocked.get("target") or last_blocked.get("detail")))
     try:
         mat = retrieve.read_materialized(root, "global")
     except Exception:  # noqa: BLE001
@@ -337,6 +677,8 @@ def cmd_health(root, args) -> dict:
             # 需要细看时再读 damaged[]。H2 的"隔离"在这里是**可观测的**。
             "damaged": damaged,
             "materialized": mat is not None,
+            "l1_reconcile": recon,
+            "gate_lock": {**lock_state, "last_blocked": last_blocked},
             "schema": rootmod.SCHEMA_VERSION}
 
 
@@ -368,7 +710,9 @@ def cmd_circles_write(root, args) -> dict:
                     "detail": "文件为空：%s" % fp, "exit": 5}
         try:
             data = json.loads(raw)
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
+            # RecursionError：深嵌套爆栈也归 invalid rc=5（二轮安全测试 R6 小疵：
+            # 落成 internal rc=4 会误导成"程序坏了"——这是可预期的坏输入）
             return {"ok": False, "error": "bad-json", "detail": str(exc)[:200], "exit": 5}
     else:
         if not (args.json or "").strip():
@@ -376,7 +720,7 @@ def cmd_circles_write(root, args) -> dict:
                     "detail": "必须给 --file 或 --json（不写就是不写，别猜）", "exit": 5}
         try:
             data = json.loads(args.json)
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             return {"ok": False, "error": "bad-json", "detail": str(exc)[:200], "exit": 5}
     if not isinstance(data, dict):
         return {"ok": False, "error": "invalid", "detail": "顶层必须是对象", "exit": 5}
@@ -423,14 +767,18 @@ def cmd_prune(root, args) -> dict:
     conn = root.connect()
     try:
         n = ledger.prune_hit(conn, keep_days=config.HIT_KEEP_DAYS)
+        n2 = ledger.prune_circle_hit(conn, keep_days=int(
+            config.get(root.path, "CIRCLE_HIT_KEEP_DAYS", config.CIRCLE_HIT_KEEP_DAYS)))
         moved = 0
         for target in (root.memory_md, root.user_md):
             moved += len(paths.prune_backups(target, config.BACKUP_KEEP))
-        ledger.event(conn, "prune", "hit", "deleted=%d moved_backups=%d" % (n, moved))
+        ledger.event(conn, "prune", "hit", "deleted=%d circle_hit=%d moved_backups=%d"
+                     % (n, n2, moved))
         conn.commit()
     finally:
         conn.close()
-    return {"ok": True, "hit_rows_deleted": n, "backups_archived": moved}
+    return {"ok": True, "hit_rows_deleted": n, "circle_hit_rows_deleted": n2,
+            "backups_archived": moved}
 
 
 # ── 参数表 ───────────────────────────────────────────────────────────
@@ -468,16 +816,36 @@ def build_parser() -> argparse.ArgumentParser:
     ld = sub.add_parser("load", help="读正文")
     ld.add_argument("id")
     ld.add_argument("--session", default="")
+    ld.add_argument("--routed", default="", help="会话的 routed 圈（跨圈命中账用）")
 
     s = sub.add_parser("search", help="词面检索")
     s.add_argument("query")
     s.add_argument("--limit", type=int, default=config.SEARCH_LIMIT)
     s.add_argument("--scope", default=None)
     s.add_argument("--session", default="")
+    s.add_argument("--routed", default="", help="会话的 routed 圈（跨圈命中账用）")
 
     sub.add_parser("circles", help="列圈")
     rt = sub.add_parser("route", help="cwd → 圈")
     rt.add_argument("--cwd", default="")
+
+    l1p = sub.add_parser("l1", help="L1 常驻段（MEMORY.md/USER.md）载荷与注入文本")
+    l1p.add_argument("--budget", type=int, default=0,
+                     help="注入文本字符预算（默认 L1_INJECT_BUDGET_CHARS=1500）")
+
+    sub.add_parser("charter", help="主圈物理法则段（前缀字节稳定层）")
+
+    ca = sub.add_parser("circle-attach", help="挂载圈（校验 fail-closed + 落账 + 返回圈目录）")
+    ca.add_argument("--circle", required=True)
+    ca.add_argument("--routed", default="", help="当前会话的 routed 圈（落账用）")
+    ca.add_argument("--session", default="")
+
+    cd = sub.add_parser("circle-detach", help="分离圈（落账）")
+    cd.add_argument("--circle", required=True)
+    cd.add_argument("--session", default="")
+
+    cs = sub.add_parser("circles-stats", help="跨圈命中聚合（驯化/桥接数据源）")
+    cs.add_argument("--limit", type=int, default=0)
 
     m = sub.add_parser("materialize", help="物化目录到 .eco/catalog/")
     m.add_argument("--limit", type=int, default=0)
@@ -518,6 +886,11 @@ _DISPATCH = {
     "search": cmd_search,
     "circles": cmd_circles,
     "route": cmd_route,
+    "l1": cmd_l1,
+    "charter": cmd_charter,
+    "circle-attach": cmd_circle_attach,
+    "circle-detach": cmd_circle_detach,
+    "circles-stats": cmd_circles_stats,
     "materialize": cmd_materialize,
     "stats": cmd_stats,
     "health": cmd_health,

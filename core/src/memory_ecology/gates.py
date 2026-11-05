@@ -40,16 +40,29 @@ from . import config, ledger, paths, similarity, store
 # ── 门① 写入整合 ─────────────────────────────────────────────────────
 
 def integrate(root, archive: bool = True, dry_run: bool = False,
-              limit: int = 500, session: str = "") -> dict:
+              limit: int = 500, session: str = "", scope_judge=None) -> dict:
     """候选 → detail。指纹去重 → 同源判定 → 类型归一 → 新旧取代（superseded + 隔离区）。
 
     幂等：同一候选跑两次结果一致（指纹是主键，`candidate` 表 + 磁盘 fp 双查）。
     **永不物理删除**：被取代的旧条目只改 frontmatter（status/fate/superseded_by），
     文件原地保留，`quarantine` 只收"候选与既有条目冲突且无法判定谁新"的副本。
+
+    `scope_judge`（多生态圈 · 两层筛选的第 2 层，设计文档 §5）：可插拔判圈终审，
+    签名 `judge(body, current_scope, options) -> scope | None`。`options` 是
+    已声明圈 id + global；返回 None/未知值/抛错 → 保持投递 scope（fail-open，
+    判圈绝不丢内容，只挪归属）。核心保持纯 stdlib——LLM judge 由调用方注入
+    （与 `distill(llm=…)` 同模式）。dry_run 不调 judge（不能为预演花钱）。
     """
     cfg = config.load(root.path)
     merge_th = float(cfg.get("MERGE_THRESHOLD", config.MERGE_THRESHOLD))
     body_max = int(cfg.get("BODY_MAX", config.BODY_MAX))
+    # 判圈 options：声明圈 + global（每次门① 现算——circles.json 可能刚改过）
+    circle_options = ["global"]
+    for c in store.load_circles(root.path).get("circles", []):
+        cid = store.norm_scope(c.get("id"))
+        if cid and cid not in circle_options:
+            circle_options.append(cid)
+    judge_name = getattr(scope_judge, "__name__", "judge")
 
     items = root.items()
     known: set[str] = set()
@@ -69,7 +82,7 @@ def integrate(root, archive: bool = True, dry_run: bool = False,
             known.add(fp)
 
         scanned = new = dup = merged = superseded = 0
-        ids, blocked = [], []
+        ids, blocked, rescoped = [], [], []
         per_file: dict[str, int] = {}
 
         for f, lineno, ctype, text, scope, sess in store.iter_candidates(root.pending):
@@ -140,9 +153,21 @@ def integrate(root, archive: bool = True, dry_run: bool = False,
                 continue
 
             mid_out = "mem-%s-%s" % (paths.today().replace("-", ""), fp[:8])
+            # **判圈终审（fail-open）**：judge 抛错/返回 None/给了不在 options 里的
+            # 圈名 → 一律保持投递 scope。dry_run 不调（预演不为判圈花钱）。
+            final_scope = scope
+            if scope_judge is not None and not dry_run:
+                try:
+                    verdict = scope_judge(body, scope, circle_options)
+                    v = store.norm_scope(verdict) if isinstance(verdict, str) else ""
+                    if v and v != store.norm_scope(scope) and v in circle_options:
+                        final_scope = v
+                        rescoped.append({"id": mid_out, "from": scope, "to": v})
+                except Exception:  # noqa: BLE001 - judge 是外挂能力，坏了不挡门①
+                    pass
             meta = {
                 "id": mid_out, "type": ctype, "status": "active", "fate": "retained",
-                "scope": scope, "created": paths.now(), "first_seen": paths.today(),
+                "scope": final_scope, "created": paths.now(), "first_seen": paths.today(),
                 "last_seen": paths.today(), "last_verified": paths.today(),
                 "occurrences": "1", "session_count": "1",
                 "sessions": _session_hash("", sess or session),
@@ -153,9 +178,12 @@ def integrate(root, archive: bool = True, dry_run: bool = False,
                 root.write_item(mid_out, meta, body)
                 conn.execute(
                     "INSERT OR IGNORE INTO candidate VALUES (?,?,?,?,?,?,?)",
-                    (fp, mid_out, ctype, scope, body, sess or session or f.name, paths.now()))
+                    (fp, mid_out, ctype, final_scope, body, sess or session or f.name, paths.now()))
                 ledger.gate_log(conn, "ADD", mid_out,
-                                "type=%s scope=%s file=%s" % (ctype, scope, f.name))
+                                "type=%s scope=%s file=%s" % (ctype, final_scope, f.name))
+                if final_scope != scope:
+                    ledger.gate_log(conn, "RESCOPE", mid_out,
+                                    "from=%s to=%s judge=%s" % (scope, final_scope, judge_name))
             known.add(fp)
             ids.append(mid_out)
             new += 1
@@ -202,6 +230,7 @@ def integrate(root, archive: bool = True, dry_run: bool = False,
         return {"ok": True, "scanned": scanned, "new": new, "dups": dup,
                 "merged": merged, "superseded_total": superseded,
                 "consumed_files": n, "ids": ids[:50],
+                "rescoped": rescoped[:50],
                 "blocked": blocked[:10], "dry_run": dry_run}
     finally:
         conn.close()
@@ -353,7 +382,7 @@ def quota(root, dry_run: bool = False) -> dict:
                     continue
             occ = _int(fm.get("occurrences"))
             sess = _int(fm.get("session_count"))
-            hits = int(stats.get(it["name"], (0, ""))[0])
+            hits = int(stats.get(_hit_key(it), (0, ""))[0])
             age = paths.days_between(fm.get("first_seen") or fm.get("created") or "") or 0.0
             why = []
             if occ >= min_occ and sess >= min_sess:
@@ -390,20 +419,25 @@ def quota(root, dry_run: bool = False) -> dict:
         # ---- 挤出 ----
         extruded = []
         if store.chars_of(entries) > trigger:
-            hi_value = set()
+            hi_value, pinned = set(), set()
             for it in items:
                 if _is_promotable(it, stats, promo_types, min_occ, min_sess,
                                   stable_days, min_hits):
                     hi_value.add(paths.norm_key(it["body"])[:30])
+                if is_pinned(it):
+                    # **pin 保留区**：与 protect 同级豁免（v17 对照 · 缺口 2）。
+                    # 挤出按"近似 LRU"排序，pin 是人对这个排序的否决。
+                    pinned.add(paths.norm_key(it["body"])[:30])
             entries, extruded = _extrude(
                 root, items, entries, trigger, dry_run,
-                protect=promoted_previews, hi_value=hi_value)
+                protect=promoted_previews, hi_value=hi_value, pinned=pinned)
             # 仍超限且有提升 → 撤销本轮提升（旧实现的有效做法）
             if store.chars_of(entries) > trigger and promoted:
                 reverted = [p["id"] for p in promoted]
                 entries, _ = _read_l1(root.memory_md)
+                # 撤销路径同样尊重 pin（否则"提升被撤销"会变成 pin 的旁路）
                 extruded = _extrude(root, items, entries, trigger, dry_run,
-                                    protect=set(), hi_value=set())[1]
+                                    protect=set(), hi_value=set(), pinned=pinned)[1]
                 promoted = []
                 blocked.append({"why": "promote-reverted-over-quota", "ids": reverted})
 
@@ -439,14 +473,15 @@ def _is_promotable(it, stats, promo_types, min_occ, min_sess, stable_days, min_h
     fm = it["fm"]
     occ = _int(fm.get("occurrences"))
     sess = _int(fm.get("session_count"))
-    hits = int(stats.get(it["name"], (0, ""))[0])
+    hits = int(stats.get(_hit_key(it), (0, ""))[0])
     age = paths.days_between(fm.get("first_seen") or fm.get("created") or "") or 0.0
     return ((occ >= min_occ and sess >= min_sess)
             or (age >= stable_days and hits >= min_hits)
             or (occ >= 2 and age >= stable_days))
 
 
-def _extrude(root, items, entries, trigger, dry_run, protect: set, hi_value: set):
+def _extrude(root, items, entries, trigger, dry_run, protect: set, hi_value: set,
+             pinned: set | None = None):
     """按序挤出直到 ≤ trigger：①非高价值同源 → ②非高价值历史日期 → ③非高价值靠后。
 
     第 ③ 类的排序语义是**近似 LRU**：L1 是 append-only 的，**尾部就是最新条目**，
@@ -454,20 +489,29 @@ def _extrude(root, items, entries, trigger, dry_run, protect: set, hi_value: set
     （索引大的先挤），语义正好反了——那会把刚写进去的记忆立刻挤出去。
     正确排序键：同类内 `idx` 升序（文件里越靠前 = 越老 = 越先被挤出）。
 
+    `pinned`（`pin: true` 的 detail 同源键）：与 protect 同级豁免——**永不挤出**。
+    pin 是人对"越老越先挤"的显式否决；极端配额下 pin 条目宁可贵 L1 超限，
+    也不能把人和约定挤出去（超额本身会由 health/门② 的账目可见，内容不丢）。
+
     每条被挤出的条目先保证 detail 里有同源副本（没有就现写一条），**绝不静默丢弃**。
     """
     cur = list(entries)
     extruded = []
+    pinned = pinned or set()
 
     def norm30(s):
         return paths.norm_key(s)[:30]
 
+    # v3.4.0（审计 01-P1-3）：只收 active 曾让「dormant/superseded 的圈条目
+    # 被挤出」时查不到归属 → 以 scope=global 新建 active 副本——跨圈泄漏 +
+    # 记忆重复（挤出泄漏的第三种状态形态，实测复现）。圈归属不随活性变化：
+    # 收全部 status 的条目（already=True → 不新建副本，原条目仍在）。
     detail_pref = {norm30(it["body"]): (it.get("scope") or "global")
-                   for it in items if it.get("status") == "active"}
+                   for it in items}
     order = []
     for idx, e in enumerate(cur):
         key = norm30(e)
-        if key in protect:
+        if key in protect or key in pinned:
             continue
         already = key in detail_pref
         prio = 0 if already else (1 if _has_hist_date(e) else 2)
@@ -535,8 +579,11 @@ def _read_l1(path: Path) -> tuple[list[str], str]:
 
 
 def _line_of(items, ident: str) -> str:
+    # **匹配口径必须与调用方一致**（质量门①审查 P2）：quota 传的 ident 是
+    # `it["name"]`（文件名），旧写法只认 `fm.id or name`——手写 detail 里
+    # fm.id ≠ 文件名时 preview 记成空串，promote 声称对 l1_reconcile 失明。
     for it in items:
-        if (it["fm"].get("id") or it["name"]) == ident:
+        if it["name"] == ident or (it["fm"].get("id") or it["name"]) == ident:
             return paths.norm_text(it["body"])[:80]
     return ""
 
@@ -550,11 +597,39 @@ def _hit_stats(conn) -> dict:
         return {}
 
 
+def _hit_key(it: dict) -> str:
+    """hit 统计的读取键——与落账口径（cli.py: fm.id or name）单源对齐。
+
+    v3.4.0（审计 01-P2-3 / REVIEW S7）：门侧曾一律按文件名查、hit 表按 fm.id
+    记——迁移条目「用了也被降级」（门④免降级、门②B 判据、检索加权三处同失准，
+    这正是 v3.2.0 立项要修的核心病）。"""
+    return str((it.get("fm") or {}).get("id") or it.get("name") or "")
+
+
 def _int(v) -> int:
+    # **YAML 合法引号数字**：`occurrences: "3"` 是合法 frontmatter，旧写法
+    # `int('"3"')` 静默返回 0 → 该条目永远 no-criterion（v17 对照 §4 实测坑）。
+    # 先剥一层成对引号再转。裸数字（现网 200/200 抽样全裸）行为不变。
     try:
-        return int(str(v).strip())
+        s = str(v).strip()
+        if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+            s = s[1:-1].strip()
+        return int(s)
     except (TypeError, ValueError):
         return 0
+
+
+def is_pinned(it: dict) -> bool:
+    """detail 的 `pin: true` 保留区标记（v17 对照 · 缺口 2）。
+
+    pin 的语义是**人对淘汰系统的否决**：这条记忆不许被挤出 L1、不许被门④
+    降级——"越老越先挤"的近似 LRU 对人和约定是错的（交接口中的例子）。
+    宽松取值：`true/1/yes/on` 都算（frontmatter 是人手编辑的面，别苛刻）。
+    """
+    v = (it or {}).get("fm", {}).get("pin")
+    if isinstance(v, bool):
+        return v
+    return str(v or "").strip().strip("\"'").lower() in ("true", "1", "yes", "on")
 
 
 # ── session_count 的正确口径 ─────────────────────────────────────────
@@ -632,7 +707,7 @@ def distill(root, dry_run: bool = False, llm=None) -> dict:
                 continue
             occ = _int(fm.get("occurrences"))
             sess = _int(fm.get("session_count"))
-            hits = int(stats.get(it["name"], (0, ""))[0])
+            hits = int(stats.get(_hit_key(it), (0, ""))[0])
             age = paths.days_between(fm.get("first_seen") or fm.get("created") or "") or 0.0
             strong = (occ >= min_occ and sess >= min_sess) or (age >= stable_days and hits >= 1)
             if not strong:
@@ -850,7 +925,14 @@ def review(root, dry_run: bool = False) -> dict:
                 # 一次偶然的检索命中不足以把已归档记忆自动拉回目录——
                 # 撤销系统的最终判断需要人的意图，不能是副作用。
                 continue
-            last_hit = stats.get(it["name"], (0, ""))[1] or fm.get("last_hit") or ""
+            if is_pinned(it):
+                # **pin 保留区（门④ 永不降级）**：`pin: true` 是人对遗忘曲线的
+                # 否决。已归档的 pin 不自动复活（终态仍归 bring-back 管，
+                # 上面的 continue 已跳过）；active/dormant 的 pin 则跳过全部
+                # 降级/归档判定，落一笔 kept 账让 GUI 能看到"为什么它不动"。
+                kept.append({"id": it["name"], "why": "pinned"})
+                continue
+            last_hit = stats.get(_hit_key(it), (0, ""))[1] or fm.get("last_hit") or ""
             verified = fm.get("last_verified") or fm.get("last_seen") or ""
             age_v = paths.days_between(verified)
             age_h = paths.days_between(last_hit) if last_hit else None
@@ -881,7 +963,7 @@ def review(root, dry_run: bool = False) -> dict:
                             ledger.review_log(
                                 conn, "revive", it["name"],
                                 "被使用（%.0f 天内命中 %d 次）→ 回 active"
-                                % (age_h or 0, stats.get(it["name"], (0, ""))[0]))
+                                % (age_h or 0, stats.get(_hit_key(it), (0, ""))[0]))
                     if not revived:
                         refreshed.append(it["name"])
                 kept.append({"id": it["name"], "why": "used-within-window",
@@ -918,25 +1000,93 @@ def review(root, dry_run: bool = False) -> dict:
             conn.commit()
         return {"ok": True, "demoted": demoted, "archived": archived,
                 "refreshed": refreshed[:50], "refreshed_count": len(refreshed),
-                "kept_count": len(kept), "dry_run": dry_run}
+                "kept_count": len(kept),
+                # kept 样本（前 50）：pin 豁免（why=pinned）要在 GUI 可见——
+                # "为什么这条记忆不降级"必须能被回答，否则 pin 是个黑箱。
+                "kept": kept[:50],
+                "dry_run": dry_run}
     finally:
         conn.close()
 
 
 # ── 一次跑全部门（runMaintenance 的落点）────────────────────────────
 
-def maintain(root, dry_run: bool = False, llm=None) -> dict:
+def maintain(root, dry_run: bool = False, llm=None, scope_judge=None) -> dict:
     """四门顺跑（每次调用都幂等；没有任何 cron 依赖）。
 
     顺序有讲究：先整合（门①产条目）→ 再巩固（门②挑得出来的）→ 再蒸馏（门③挑稳定的）
     → 最后复核（门④降级用不到的）。反过来会把刚进来的条目当场降级。
     """
-    g1 = integrate(root, archive=True, dry_run=dry_run)
+    g1 = integrate(root, archive=True, dry_run=dry_run, scope_judge=scope_judge)
     g2 = quota(root, dry_run=dry_run)
     g3 = distill(root, dry_run=dry_run, llm=llm)
     g4 = review(root, dry_run=dry_run)
     return {"ok": True, "gate1": g1, "gate2": g2, "gate3": g3, "gate4": g4,
             "dry_run": dry_run}
+
+
+# ── L1 消费端对账（v17 对照 · 第 10 步思路：账实核对）──────────────────
+
+def l1_reconcile(root, conn, window_days: float = 90.0) -> dict:
+    """账本声称 promote 进 L1 的条目，必须"还在 L1"或"有挤出账"。
+
+    promote 行是**声称**："这条内容此刻在 MEMORY.md 里"。之后它有三种命运：
+      ① 仍在 L1（正常）；② 被后续挤出挤回 detail（合法——有 `extrude` 账）；
+      ③ 被人手编辑 / 半截写 / bug 弄丢（**静默丢失**，无任何账）。
+    本对账只抓第 ③ 种。"L1 无人读"修好之后（catalog/search/注入都读 L1），
+    这是 L1 剩下的唯一失真通道：写了、账上有、但读者读不到——而且没有
+    这道核对的话，谁也不会发现。
+
+    口径：
+      - 匹配键 = `norm_key(文本)[:30]`（与 promote/extrude 的同源判定同口径）；
+        promote 行的 l1_preview 被账本截到 80 字符、L1 行是 120 字符预览，
+        前 30 个规范化字符不受截断影响
+      - 同一 slug 多次 promote 取**最近一次**（旧声称被新声称取代）
+      - 只读，绝不改任何文件；账本打不开/查询失败 → 如实报 `ok:False`
+        （health 会把它记成 note，**绝不静默装作对过账**）
+    """
+    if conn is None:
+        return {"ok": False, "checked": 0, "missing": [], "why": "no-ledger"}
+    try:
+        rows = conn.execute(
+            "SELECT slug, l1_preview, ts FROM quota_log WHERE action='promote'").fetchall()
+    except Exception as exc:  # noqa: BLE001 - 坏库不该让 health 崩
+        return {"ok": False, "checked": 0, "missing": [],
+                "why": "promote-query:%s" % str(exc)[:80]}
+    latest: dict[str, tuple[str, object]] = {}
+    for slug, preview, ts in rows:
+        slug = str(slug or "").strip()
+        preview = str(preview or "").strip()
+        dt = paths.parse_ts(str(ts or ""))
+        if not slug or not preview or dt is None:
+            continue
+        if window_days:
+            age = paths.days_between(str(ts or ""))
+            if age is None or age > window_days:
+                continue
+        prev = latest.get(slug)
+        if prev is None or dt > prev[1]:
+            latest[slug] = (preview, dt)
+    try:
+        extruded_keys = {paths.norm_key(str(r[0] or ""))[:30]
+                         for r in conn.execute(
+                             "SELECT l1_preview FROM quota_log "
+                             "WHERE action='extrude'").fetchall()
+                         if str(r[0] or "").strip()}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "checked": len(latest), "missing": [],
+                "why": "extrude-query:%s" % str(exc)[:80]}
+    l1_keys = {paths.norm_key(e)[:30] for e in _read_l1(root.memory_md)[0]}
+    l1_keys.discard("")
+    extruded_keys.discard("")
+    missing = []
+    for slug, (preview, dt) in sorted(latest.items()):
+        key = paths.norm_key(preview)[:30]
+        if key and key not in l1_keys and key not in extruded_keys:
+            missing.append({"id": slug, "preview": preview[:80],
+                            "last_ts": dt.strftime("%Y-%m-%d %H:%M:%S")})
+    return {"ok": True, "checked": len(latest), "missing": missing,
+            "window_days": window_days}
 
 
 

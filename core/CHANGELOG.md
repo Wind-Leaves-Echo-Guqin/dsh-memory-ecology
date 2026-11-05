@@ -7,7 +7,78 @@
 
 ## v3.4.0（2026-11-05）—— 3.4.0 重构：R1 测试可信度 + R7 版本大一统
 
-- 与主仓 CHANGELOG v3.4.0 段同源：R1 三红修复 + S18/S33/S34 治理；R7 版本收敛（含 gui-v3 并线）；R0 拆雷四提交
+> 3.4.0 的完整范围与闸门清单见交接文档 §10/§13；本段只记已落库项。
+
+- **R1 测试可信度**：三条红（compat 门②封零 / src 检索报告）判定为断言过期并修复——历史证据改钉合成账本语义回归；run_tests.py 假绿四路径全堵；1267 行脚本式测试入 pytest（收集 167→213）；12 条恒真断言清零；变异抽检必红实证
+- **R7 版本大一统**：全仓版本收敛 3.4.0（含 plugin/GUI/CHANGELOG/README）；run_tests 横幅动态化；version.py 自检扩面（run_tests 横幅防回潮 + gui-v3 + CHANGELOG 首条）并改精确比对（S47：3.2.20 曾判 ok）
+- **root.py 中文名两档放行**落库（对齐 C 仓 26cdee7，S1 销账·D 仓侧）
+- v3.2.2+ 的多生态圈动态机制（主圈常驻/副圈热挂载/两层筛选）随本版转正
+
+## v3.2.2+（未发版）—— 2026-10-31
+
+两个批次合入（L1 七步收口 + 多生态圈动态机制）。版本号维持 3.2.2 待发版拍板
+（`version` 四处一致性检查通过是本批次的验收项之一）。
+
+### 批次一 · L1 七步收口（第三轮对抗审查的遗留缺陷）
+
+子代理在途工作的接管与补齐，全部有回归钉住：
+
+- **L1 无人读**（步骤 1-3/7，在途已完成）：`catalog`/`search` 读 L1（常驻段
+  `l1` 键 + 影子命中标注 `source=L1`）、`l1` 命令（MEMORY.md 全文 + USER.md
+  摘要，按 § 段预算截断）、插件 `agent/pre-step` 增量注入通道（首轮全量
+  ≤1500 字符，变更才追加——**不进 systemPrompt 前缀**）、S3 scope fail-closed
+  （模型的 scope 参数不再优先于路由圈）。
+- **health 消费端对账**（步骤 4）：`gates.l1_reconcile()`——账本声称 promote
+  进 L1 的条目必须"还在 L1 或有挤出账"，静默丢失报 warn（生产根实测
+  checked=0 真实：门② 从未成功 promote 过，与已知空转画像一致）。
+- **gate 进程锁**（步骤 5）：`proclock.py`——**OS 字节范围互斥**
+  （`msvcrt.locking`/`fcntl.flock`，与 `paths._append_lock` 同款已实测模式）。
+  v1 文件协议（pid+ts+30 分钟判死）被两轮对抗测试证明修不干净（check-then-act
+  双获锁 → 接管 TOCTOU，5 轮复现 4 轮），v2 让 guard 旁路文件上的字节锁当裁判：
+  进程死锁自解，8/8 并发轮次恰好一个赢家、CLI 实弹 5/5。证据锁文件只做观测。
+- **pin 保留区**（步骤 6）：`pin: true` 的条目 `_extrude` 与 protect 同级豁免
+  （提升撤销路径同样尊重）、门④永不降级（kept 账可见 why=pinned）；
+  `_int()` 顺手剥引号（`occurrences: "3"` 静默当 0 的实测坑）。
+
+### 批次二 · 多生态圈动态机制（设计文档 `docs/多生态圈动态机制-设计.md`）
+
+主圈 = 大气层（三层常驻不可挤掉），副圈 = 可动态挂载的特化泡（末端注入、
+热加载、用完分离）：
+
+- **charter**：主圈物理法则段（`[charter] charter_rules`，字节稳定，前缀
+  order 9005）；气候（USER.md 摘要）与基础物种（MEMORY.md/全局目录）走既有
+  L1 pre-step 与目录段——三层各自的不可挤掉通道。
+- **注入拓扑 v2**：前主后副。副圈目录全部走 `agent/pre-step` 尾段消息
+  （`eco:circle`，≤900 字符总闸、按最终文本实长判定、整圈全进/全丢、丢弃
+  显式标注、变更才注入）；路由圈 = 默认挂载的副圈，不再用同名段遮蔽进前缀。
+  per-agent 挂载桶（`circlesByAgent`，64 桶上限）承接多 agent 隔离；
+  L1 注入状态同样 per-agent。
+- **agent 主导激活**：`memory_circle_list / attach / detach` 三工具——挂载
+  fail-closed（未声明圈 / `attachable: false` 一律拒绝，核心判 + 落账），
+  分离即停注（历史消息随 compaction 滚出）；S3 允许集合从 `{routed}` 扩为
+  `{routed} ∪ attached`（挂载是显式授权动作，未挂载圈依旧拒绝）。
+- **两层写入筛选**：投递方 `deposit --scope` 初筛（字母数字类圈名塌缩拒绝、
+  部分塌缩带 warn）→ 门①可插拔判圈 judge（`integrate(scope_judge=…)`，
+  LLM 由调用方注入、核心保持纯 stdlib，fail-open，RESCOPE 落账）。
+- **跨圈命中账**：`circle_hit` 表（routed 圈会话命中挂载圈条目）→
+  `circles-stats` 聚合（suggest 按 distinct id 计数，防刷）；prune 归档
+  180 天。这是未来"驯化晋升"与宇宙泡"泡间桥接"的数据源。
+- **首批副圈部署载荷**：`docs/首批副圈-circles.json`（dsh-eco-dev + quant-lab）
+  + `docs/首批副圈部署说明.md`——本轮不触生产（热重载红线单独排期）。
+
+### 质量门（用户规程：两轮审查 + 中间漏洞扫描，全部独立子代理执行）
+
+- 质量门①：缺陷审查 12 条（P1×3：L1 状态未分桶 / 锁 TOCTOU / circleOf 逗号
+  表达式既有一行 bug）+ 安全测试 6 漏洞（global 会话检索旁路等）——全修。
+- 漏洞扫描：11 条（高 1：锁接管 TOCTOU 复现；中 2：并发 attach 重复项、
+  工具桶跨会话串味）——高/中全修，低全修或文档化。
+- 质量门②：二轮审查 10 条（JS 里写 Python `%` 格式化 → 尾段首行字面 NaN、
+  attach 跨桶串写、per-circle 预算被插件全局参数压过等）+ 二轮安全测试
+  （并发锁 R5 复测通过 8/8 + CLI 5/5，6 条新发现全修）。
+- 终态测试：pytest **203 passed**、插件 mjs **30/30**、`run_tests.py` **7/7**
+  （含变异 168s、稳定性、并发）；红线 1 静态扫描（禁 unlink）持续在位。
+
+---
 
 ## v3.2.2 —— 2026-10-29
 
@@ -133,7 +204,7 @@
 
 ### 新增（Stage G · 观测舱 v2.3 接入 v3.2.0）
 
-**目标 GUI 是哪个，这里先说清**：是 `memory-ecology-compat/integrations/` 下的
+**目标 GUI 是哪个，这里先说清**：是 `memory-ecology-兼容版/integrations/` 下的
 **`gui/eco_gui.py`（8788 服务）+ `gui-v2.3/`（React 19 + TS + Vite 的 iOS 外壳）**，
 桌面快捷方式「生态观测舱v2」就指它。
 
@@ -229,11 +300,11 @@
 | `tests/test_gui_contract.py` | 9 | 兼容版 | 前端四处注册表一致 + 主屏不重名 + 不许出现 `v32` 写法 |
 | `tests/test_gui.py` | ~~38~~ | **已归档** | 那是错目标那套 GUI 的测试（`_archive/gui-wrong-target-v0.4/`） |
 
-> 两个仓库各自 `python run_tests.py`：**dsh-memory-ecology 7/7**、**memory-ecology-compat 57/57**，全绿。
+> 两个仓库各自 `python run_tests.py`：**dsh-memory-ecology 7/7**、**memory-ecology-兼容版 57/57**，全绿。
 >
 > **读表提醒（2026-10-30 审计补充）**：`所在仓库` 列写「兼容版」的三行
 > （`test_gui_v3_2_0.py` / `test_gui_contract.py` / 已归档的 `test_gui.py`）**不在本仓库**——
-> 它们属于 memory-ecology-compat那棵树。本仓库 `core/tests/` 实际只有 6 个文件
+> 它们属于 memory-ecology-兼容版那棵树。本仓库 `core/tests/` 实际只有 6 个文件
 > （`test_core` / `test_compat` / `test_regressions` / `test_concurrency` / `test_stability` /
 > `test_mutation`），加上 `plugin/test_plugin.mjs` 共 7 组。此前仅靠"所在仓库"这一列区分，
 > 容易让读者以为本仓库也有 GUI 测试，故显式说明。

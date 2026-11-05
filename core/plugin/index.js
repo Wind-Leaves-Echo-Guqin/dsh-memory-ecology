@@ -11,12 +11,19 @@
  *   5) 全链路 fail-open：任何异常都退化成「本轮没有记忆」，绝不阻塞会话；
  *   6) **零配置可用**：默认根 %LOCALAPPDATA%/dsh/memory-eco，首次自动创建。
  *
- * 上下文形态（成本结构）：
- *   warm  = ctx.systemPrompt.section({name:'eco:catalog', order:9100})   目录，≤20 行 / ≤600 字符
- *   cold  = 工具 memory_load(id) / memory_search(q)                       正文，按需
- *   **没有 hot 档**：已用六条判据枪毙（主/副记忆用目录排序表达，见 ARCHITECTURE §9.1）
+ * 上下文形态（成本结构，v2 拓扑 · 设计文档 docs/多生态圈动态机制-设计.md §3）：
+ *   前缀  = ctx.systemPrompt.section
+ *           ├─ eco:charter (9005)  主圈物理法则，字节稳定，仅版本/配置变更时变
+ *           └─ eco:catalog (9100)  全局目录（主圈基础物种滚动层），≤600 字符
+ *   末端  = agent/pre-step 追加 user 消息（append-only，随 compaction 滚出）
+ *           ├─ eco:l1      L1 常驻（MEMORY.md=基础物种常驻层 + USER.md=气候），
+ *           │              首轮全量 ≤1500，之后只在变更时增量
+ *           └─ eco:circle  挂载圈目录合集（routed 圈默认挂载 + attach 的圈），
+ *                          ≤900 字符总闸，变更才注入，分离即停
+ *   cold  = 工具 memory_load(id) / memory_search(q) / memory_circle_*   正文，按需
  *
- * 注入预算 KPI：≤3 条消息 / ≤1,200 字符每会话。本插件默认**0 条追加**（目录进前缀）。
+ * 注入预算 KPI：每轮最多 2 条追加消息，各自只在真正变化时出现；
+ * 圈的挂载/分离 = agent 主导的动态热加载（不重启会话）。
  *
  * 配置（cordis.patch.yml 同 id 覆盖，或环境变量）：
  *   rootPath / ECO_HOME        数据根
@@ -30,6 +37,7 @@
  */
 
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import os from 'node:os';
@@ -45,6 +53,8 @@ const SECTION_ORDER = 9100; // 排在 DELIVERABLE_FILE_REFERENCES(9000) 之后�
 const CALL_TIMEOUT_MS = 8000;
 const DEFAULT_CATALOG_LIMIT = 20;
 const DEFAULT_CATALOG_MAX_CHARS = 600; // 字符才是闸门，条数是假的
+const DEFAULT_L1_MAX_CHARS = 1500;     // L1 常驻段的注入预算（与核心 L1_INJECT_BUDGET_CHARS 同口径）
+const DEFAULT_CIRCLE_TAIL_MAX_CHARS = 900;  // 副圈尾段总闸（权威值来自核心 circles.tail_max_chars）
 const DEFAULT_RECONCILE_MS = 3 * 60 * 1000;
 const DEFAULT_MAINTENANCE_MS = 10 * 60 * 1000;
 const CATALOG_SCHEMA = 2;
@@ -137,6 +147,10 @@ function parseJsonLine(text) {
 // ── 目录文本渲染 ────────────────────────────────────────────────────────
 // 与核心 retrieve.render_catalog_text **同格式**。格式改动会让前缀缓存失效，
 // 所以两边必须一起改，并由 tests/test_plugin.mjs 钉住逐字节一致。
+//
+// **刻意不渲染 payload.l1**（第三轮审查）：L1 常驻段绝不进 systemPrompt.section
+// ——section 改前缀=全量重新 prefill（实测一次 0.29 元）。L1 走 agent/pre-step
+// 的 user 消息通道（见下方 L1 注入一节），物化载荷里的 l1 字段只供 GUI/诊断读。
 
 function renderCatalog(payload, limit) {
   const items = Array.isArray(payload?.items) ? payload.items : [];
@@ -152,6 +166,64 @@ function renderCatalog(payload, limit) {
     ? `记忆目录（共 ${total} 条，显示最近 ${shown.length} 条；正文用 memory_load(id) 取）`
     : `记忆目录（共 ${total} 条；正文用 memory_load(id) 取）`;
   return [head, ...lines].join('\n');
+}
+
+// ── 副圈尾段拼装（设计文档 §4，纯函数，__test__ 可直接测）───────────────
+//
+// `sections` = [{circle, text}]，**挂载顺序**（routed 最先）。预算语义：
+//   - 整圈为单位全进或全丢（半圈目录比没有更误导）；
+//   - 超闸的圈整圈丢弃，**后面放得下的小圈仍可进**；
+//   - 丢弃必须显式标注（静默缩水 = agent 以为挂了其实没挂）；
+//   - **预算按最终文本实长判定**（质量门①审查 P2）：头行与"超预算未注入"
+//     标注行都计入——先试排、超了才丢，保证输出 ≤ budget 字节级成立。
+function buildCircleTail(sections, budget) {
+  const usable = (sections || []).filter((s) => s && s.circle && String(s.text || '').trim());
+  const byId = new Map(usable.map((s) => [s.circle, s]));
+  const render = (ids, dropped) => {
+    const blocks = ids.map((id) => `▣ 圈 ${id}\n${byId.get(id).text}`);
+    if (dropped.length) {
+      blocks.push(`（超预算未注入：${dropped.join(' , ')}——用 memory_circle_detach 释放预算后再挂）`);
+    }
+    if (blocks.length === 0) return '';
+    // **JS 模板串**（二轮审查 P1：Python 的 `%` 格式化写进 JS 得到字面 NaN）
+    return [`项目圈记忆（挂载 ${ids.length} 圈；正文用 memory_load(id) 取，分离用 memory_circle_detach）：`,
+            ...blocks].join('\n');
+  };
+  const included = [];
+  const dropped = [];
+  let text = '';
+  for (const s of usable) {
+    if (included.includes(s.circle) || dropped.includes(s.circle)) continue;   // 同名圈只判一次
+    const trial = render([...included, s.circle], dropped);
+    if (trial.length <= budget) {
+      included.push(s.circle);
+      text = trial;
+    } else {
+      dropped.push(s.circle);
+      text = render(included, dropped);
+      // 丢弃标注行会让文本变长——若因此反超预算，从 included 尾部继续收缩
+      // （块长度 ≥ 标注增量，循环必然收敛），保证最终文本 ≤ budget 字节级成立
+      while (included.length && text.length > budget) {
+        dropped.push(included.pop());
+        text = render(included, dropped);
+      }
+    }
+  }
+  if (included.length === 0) {
+    if (dropped.length === 0) return { text: '', included, dropped };
+    // 全部圈超预算也要留标注（漏洞扫描低#7：静默空文本 = agent 以为
+    // 挂了其实什么都没进来）；**标注本身也受预算约束**（二轮审查 P2：
+    // 40 个长名圈的全丢标注实测可到 1390 字符）
+    let note = `（挂载圈全部超预算未注入：${dropped.join(' , ')}`
+      + '——用 memory_circle_detach 释放预算）';
+    if (note.length > budget) {
+      note = `（挂载圈全部超预算未注入：${dropped.length} 圈`
+        + '——用 memory_circle_detach 释放预算）';
+    }
+    if (note.length > budget) note = note.slice(0, Math.max(0, budget));
+    return { text: note, included, dropped };
+  }
+  return { text, included, dropped };
 }
 
 // ── 宿主模块解析（link 安装时裸导入走不到宿主依赖树）─────────────────────
@@ -191,11 +263,22 @@ export async function apply(ctx, config = {}) {
   const { mod: toolsMod } = await importHostModule(config, '@deepseek-ai/dsh-tools');
   const { defineTool } = toolsMod;
 
+  // L1 注入需要 createUserMessage（@deepseek-ai/dsh-llm，参照旧线 eco-note）。
+  // **fail-open**：宿主包解析不到就退化为原始 user 消息对象，绝不因此整插件失效。
+  let createUserMessage = null;
+  try {
+    const llm = await importHostModule(config, '@deepseek-ai/dsh-llm');
+    createUserMessage = llm.mod?.createUserMessage ?? null;
+  } catch (e) {
+    ctx.logger.debug(`eco-memory: dsh-llm 不可用，L1 注入退化为原始消息对象: ${e?.message ?? e}`);
+  }
+
   const root = resolveRoot(config);
   const core = resolveCore(config);
   const pys = pythonCandidates(config);
   const limit = Number(config?.catalogLimit ?? DEFAULT_CATALOG_LIMIT) || DEFAULT_CATALOG_LIMIT;
   const maxChars = Number(config?.catalogMaxChars ?? DEFAULT_CATALOG_MAX_CHARS);
+  const l1MaxChars = Number(config?.l1MaxChars ?? DEFAULT_L1_MAX_CHARS) || DEFAULT_L1_MAX_CHARS;
   const reconcileMs = Number(config?.reconcileIntervalMs ?? DEFAULT_RECONCILE_MS);
   const maintenanceMs = Number(config?.maintenanceIntervalMs ?? DEFAULT_MAINTENANCE_MS);
   const packsEnabled = config?.packs?.enabled !== false;
@@ -211,9 +294,44 @@ export async function apply(ctx, config = {}) {
     circle: '',
     routeMap: new Map(),   // cwd 前缀（已归一）→ 圈名；由核心 circles 填充
     packsText: '',
+    // 多生态圈（设计文档 §3/§4）：**per-agent 桶**。一个宿主进程可能跑
+    // 多个 agent——v3.2.2 靠 per-agent 同名段遮蔽隔离；v2 圈目录走尾段消息，
+    // 隔离改由 per-agent 桶承担（agent/created 建，pre-step 按创建者的
+    // agent.id 取）。桶同时承载 L1 注入状态（质量门①审查 P1：L1 三状态
+    // 原先是进程级单例，第二个及之后的 agent 永远收不到 L1 常驻段）。
+    // 工具（memory_search/load）没有 agent 上下文，用「最近创建的 agent」
+    // 桶——与 v3.2.2 共享 state.circle 同一局限，不是新退化。
+    circlesByAgent: new Map(),
+    // agentKey → {circle, attached: [], tailHash: '', l1Hash: '', l1Loaded: false, l1Seen: Set}
+    // **工具侧桶归属**（漏洞扫描【中】：state.circle/attached 镜像会跨会话串味
+    // ——v2 里 attached 是授权 allowlist，"谁挂载"不能跨会话生效）。
+    // lastAgentKey = 最近一次 pre-step/created 的 agent（每轮 pre-step 先于
+    // 本轮全部工具调用发生，串行 turn 下即"当前 agent"）；工具 execute 开头
+    // 统一经 toolBucket() 刷新镜像。多 agent 并发交错 turn 是残余风险（在案）。
+    lastAgentKey: '',
+    attached: [],
+    tailBudget: DEFAULT_CIRCLE_TAIL_MAX_CHARS,
+    charterText: '',
   };
   const circleCache = new Map();
   let warmed = false;
+
+  /**
+   * 工具侧桶归属（漏洞扫描【中】修复）：按 lastAgentKey 取**当前 agent** 的桶
+   * 并刷新 state.circle/state.attached 镜像。没有桶就建一个并持久化（L1 状态
+   * 必须跨轮存活）。取不到 = 无圈无授权 → 全局语义，绝不借别人的桶。
+   */
+  function toolBucket() {
+    let b = state.circlesByAgent.get(state.lastAgentKey);
+    if (!b) {
+      b = { circle: '', attached: [], tailHash: '',
+            l1Hash: '', l1Loaded: false, l1Seen: new Set() };
+      state.circlesByAgent.set(state.lastAgentKey, b);
+    }
+    state.circle = b.circle;
+    state.attached = b.attached;
+    return b;
+  }
 
   const call = (args, timeout) => runEco(state.py, core, root, args, timeout);
 
@@ -252,16 +370,57 @@ export async function apply(ctx, config = {}) {
     const exact = state.routeMap.get(target);
     if (exact) return exact === 'global' ? '' : exact;
     // 2) 前缀最长匹配（用的是核心声明的 cwd_prefix，不是目录名）
+    //    **质量门①审查 P1 修复**：旧写法 `{ best, bestLen = scope, prefix.length; }`
+    //    是逗号表达式——best 永不赋值、bestLen 被赋成圈名字符串。子目录 cwd
+    //    落进这条 fallback 后永远路由不到圈 → 本应受圈限的会话全库直通。
     let best = '', bestLen = -1;
     for (const [prefix, scope] of state.routeMap) {
       if (!prefix) continue;
       if (target === prefix || target.startsWith(prefix.endsWith('/') ? prefix : prefix + '/')) {
-        if (prefix.length > bestLen) { best, bestLen = scope, prefix.length; }
+        if (prefix.length > bestLen) { best = scope; bestLen = prefix.length; }
       }
     }
     if (best) return best === 'global' ? '' : best;
     // 3) 核心没有任何声明 → 只有全局记忆（**这正确**：没声明就不猜）
     return '';
+  }
+
+  /**
+   * **S3 fail-closed：圈边界绝不交给模型。**
+   *
+   * 旧写法 `normScope(args?.scope) || normScope(state.circle)` 让模型写的
+   * scope **优先于**路由出的圈——模型在参数里填目标圈名就能跨圈检索/读取
+   * （REVIEW.md S3 实测复现：`memory_search scope="alpha"` 在 beta 会话命中
+   * alpha 的口令）。`args.scope` 是**模型可写**的参数，不能当边界。
+   *
+   * 新契约（多生态圈 v2）：允许集合 = `{routed} ∪ attached`。
+   *   - routed：cwd → 圈（核心声明），会话的默认边界；
+   *   - attached：**已挂载**的圈——挂载本身是显式工具调用
+   *     （`memory_circle_attach`，核心 `circle-attach` 校验 + 落账），
+   *     所以"指向已挂载圈"是 auditable 的授权路径，不是走私。
+   * 未挂载圈一律拒绝（fail-closed），只允许"等于允许集合中的圈"。
+   * 全局会话（routed 为空）里显式 `global` 等于本圈，放行；圈会话里要
+   * global/别的圈一律拒绝——本圈检索本来就 union 了 global 条目，拒绝
+   * global 不损失任何合法可达内容，只关掉"跨圈"这一扇不该开的门。
+   */
+  function resolveScopeGuard(askedRaw) {
+    const routed = normScope(state.circle);
+    const asked = normScope(askedRaw);
+    // **无圈会话兜底 global**（质量门①安全测试探测 4）：旧写法返回 ''，
+    // search 据此不传 --scope → 核心全库直通，任意圈的 id+预览可读。
+    // 兜成 'global' 后 search 显式 --scope global（核心语义：只回 global 条目），
+    // 跨圈的正门只有 memory_circle_attach。
+    if (!asked) return { ok: true, scope: routed || 'global' };
+    if (asked === routed) return { ok: true, scope: asked };
+    if (state.attached.includes(asked)) return { ok: true, scope: asked };
+    if (!routed && asked === 'global') return { ok: true, scope: 'global' };
+    return { ok: false, routed, asked };
+  }
+
+  function scopeDeniedText(guard) {
+    const attached = state.attached.length ? `，已挂载：${state.attached.join(' , ')}` : '';
+    return `（scope 被拒绝：本会话记忆圈是 ${guard.routed || 'global'}${attached}，`
+      + `不接受未挂载的跨圈 scope=${guard.asked}；需要时先用 memory_circle_attach 挂载）`;
   }
 
   /**
@@ -282,6 +441,10 @@ export async function apply(ctx, config = {}) {
       }
     }
     state.routeMap = map;
+    // 尾段总闸的权威值在核心（eco.toml）；插件 config 只在显式给出时覆盖
+    const coreTail = Number(payload?.tail_max_chars);
+    state.tailBudget = Number(config?.circleTailMaxChars)
+      || (Number.isFinite(coreTail) && coreTail > 0 ? coreTail : DEFAULT_CIRCLE_TAIL_MAX_CHARS);
     return map.size;
   }
 
@@ -343,8 +506,13 @@ export async function apply(ctx, config = {}) {
    * 物化成文件后，热路径只是一次 readFileSync。
    */
   async function materializeAll({ audit = false } = {}) {
-    const res = await call(['materialize', '--limit', String(limit),
-      '--max-chars', String(maxChars)], 20000);
+    // **不传全局 --limit/--max-chars**（二轮审查 P2）：核心物化时
+    // `limit or c_limit / budget_chars or c_budget`——显式全局参数会永远压过
+    // circles.json 的每圈预算（用户调小预算的圈照样收到 600 字符，
+    // cmd_circles 上报的占用与实际注入字节漂移）。每圈用自己的预算才是
+    // "用户授权的圈级预算"的本义。JS 侧 config.catalogLimit/catalogMaxChars
+    // 只留给审计诊断调用。
+    const res = await call(['materialize'], 20000);
     const payload = parseJsonLine(res.out);
     if (!payload?.ok) {
       ctx.logger.debug(`eco-memory: materialize 失败 ${payload?.reason || res.err || ''}`);
@@ -441,15 +609,33 @@ export async function apply(ctx, config = {}) {
     });
   }
 
-  // ---- 启动：初始化 + 物化全部圈的目录 + 门① 补账 ----
+  // ---- 启动：初始化 + 物化全部圈的目录 + charter + 门① 补账 ----
   try {
     if (await ensureReady()) {
       await syncView({ audit: true });
+      // charter（主圈物理法则）：**每进程取一次**。它是前缀字节稳定层——
+      // 内容只随版本/eco.toml 变化，运行期重取既没必要又破坏稳定性语义。
+      try {
+        const cres = await call(['charter'], CALL_TIMEOUT_MS);
+        const cp = parseJsonLine(cres.out);
+        if (cp?.ok && cp.text) state.charterText = String(cp.text);
+      } catch (e) {
+        ctx.logger.debug(`eco-memory: charter 获取失败（fail-open，本轮无规定段）: ${e?.message ?? e}`);
+      }
       enqueueReconcile('startup');
     }
   } catch (e) {
     ctx.logger.warn(`eco-memory: 启动阶段异常（fail-open）: ${e?.message ?? e}`);
   }
+
+  // ---- charter：主圈物理法则段（order 9005，排在目录段之前——"主在尽量靠前"）----
+  // 空文本时不产生输出；`interpolate: false` 与目录段同理（{{...}} 会炸装配）。
+  ctx.systemPrompt.section({
+    name: 'eco:charter',
+    order: SECTION_ORDER - 95,   // 9005：紧贴目录段之前，仍在其余宿主段之后
+    interpolate: false,
+    text: () => state.charterText || '',
+  });
 
   // ---- warm：目录段（每次 assembly 调用，但只返回缓存）----
   // `interpolate: false` 是**必须的**：text 默认 true，目录正文里只要出现 `{{...}}`
@@ -484,30 +670,218 @@ export async function apply(ctx, config = {}) {
         ctx.logger.debug(`eco-memory: created 处理异常（fail-open）: ${e?.message ?? e}`);
       });
 
-    // 2) 副圈遮蔽段（按 cwd 决定圈；无圈则用全局段）
+    // 2) 路由圈 = **默认挂载**的副圈（注入拓扑 v2，设计文档 §3）。
+    //    v3.2.2 的同名段遮蔽把圈目录放进前缀——既不满足"副圈末端注入"，
+    //    也无法会话中热切。v2 里圈目录全部走 pre-step 尾段；前缀只留
+    //    主圈内容（charter + 全局目录），更稳定。
+    //    state.circle 仍是检索/加载的默认边界（H4/S3 语义不变）。
     const cwd = agent?.session?.header?.cwd;
     const circle = circleOf(cwd);
-    if (!circle) return;
-    state.circle = circle;
-    // 同步取：物化文件在启动时已写好，这里是纯文件读，不再有竞态
-    const fallback = circleCache.get(circle) ?? readCatalogSync(circle) ?? state.catalogText;
-    if (!circleCache.has(circle)) circleCache.set(circle, fallback);
-    try {
-      if (typeof agent?.ctx?.systemPrompt?.section !== 'function') {
-        ctx.logger.debug('eco-memory: agent.ctx 无 systemPrompt，副圈不可用（降级为全局段）');
-        return;
-      }
-      agent.ctx.systemPrompt.section({
-        name: SECTION_NAME,
-        order: SECTION_ORDER,
-        interpolate: false,
-        text: () => circleCache.get(circle) ?? fallback,
-      });
-      ctx.logger.info(`eco-memory: 副圈启用 circle=${circle} chars=${fallback.length}`);
-    } catch (e) {
-      ctx.logger.debug(`eco-memory: 副圈注册异常（fail-open）: ${e?.message ?? e}`);
+    const bucket = {
+      circle: circle || '', attached: [], tailHash: '',
+      // L1 注入状态 per-agent（质量门①审查 P1 修复）
+      l1Hash: '', l1Loaded: false, l1Seen: new Set(),
+    };
+    state.circlesByAgent.set(String(agent?.id ?? ''), bucket);
+    state.lastAgentKey = String(agent?.id ?? '');
+    // 桶上限（漏洞扫描低#6：长驻宿主 Map 无界涨）：超 64 删最旧（Map 按插入序），
+    // 不删当前 agent
+    while (state.circlesByAgent.size > 64) {
+      const oldest = state.circlesByAgent.keys().next().value;
+      if (oldest === undefined || oldest === state.lastAgentKey) break;
+      state.circlesByAgent.delete(oldest);
     }
+    if (circle) {
+      bucket.attached.push(circle);   // routed 圈最先 → 预算挤兑时最后被丢
+    }
+    // 工具侧镜像指向本桶（最近创建的 agent）
+    state.circle = bucket.circle;
+    state.attached = bucket.attached;
+    // 同步取：物化文件在启动时已写好，这里是纯文件读，不再有竞态
+    if (circle && !circleCache.has(circle)) {
+      const text = readCatalogSync(circle);
+      if (text !== null) circleCache.set(circle, text);
+    }
+    ctx.logger.info(`eco-memory: 副圈路由 circle=${circle || '-'}（尾段注入，attached=${bucket.attached.length}）`);
   });
+
+  // ---- L1 常驻注入（agent/pre-step，user 消息追加）----
+  //
+  // **为什么不是 systemPrompt.section**：section 进前缀，而 dsh 的上下文是
+  // append-only——改前缀 = 之后每一次请求全量重新 prefill（实测一次 0.29 元）。
+  // L1 内容会随门②③ 变化，走前缀等于反复付全量；走 pre-step 追加 user 消息
+  // 只在真正变化时付一次（旧线 eco-note 的成熟写法，见
+  // integrations/dsh/package-cordis/index.js 的 agent/pre-step）。
+  //
+  // 预算：首轮全量 ≤ l1MaxChars（默认 1500，核心 render_l1_injection 按 § 段
+  // 截断并标注）；之后**只在 L1 内容变更（文件指纹对比）时追加增量**——
+  // 按 § 段指纹判断哪些段是新的，不变更的轮次零注入（避免每轮重复注入）。
+  //
+  // 注意：dsh 0.2.1-rc.x 没有 agent/session-start 事件（已并入 agent/created），
+  // 这里只监听真实存在的 agent/pre-step。
+  function l1FilePaths() {
+    return {
+      mem: path.join(root, 'memories', 'MEMORY.md'),
+      user: path.join(root, 'memories', 'USER.md'),
+    };
+  }
+
+  /** 两份 L1 文件的联合指纹。缺文件按空串参与（门②③ 首次写入前是常态）。 */
+  function l1FileHash() {
+    try {
+      const { mem, user } = l1FilePaths();
+      const a = existsSync(mem) ? readFileSync(mem, 'utf8') : '';
+      const b = existsSync(user) ? readFileSync(user, 'utf8') : '';
+      if (!a.trim() && !b.trim()) return '';
+      return createHash('sha1').update(a).update('\u0000').update(b).digest('hex');
+    } catch {
+      return '';
+    }
+  }
+
+  /** 组注入消息。优先宿主 createUserMessage（与 eco-note 同款），退化用原始对象。 */
+  function buildSnapshotMessage(sectionName, text) {
+    const input = {
+      content: [{ type: 'text', text }],
+      source: { kind: name, form: 'snapshot', sections: [{ name: sectionName, text }] },
+    };
+    if (typeof createUserMessage === 'function') return createUserMessage(input);
+    return { role: 'user', ...input };
+  }
+
+  function buildL1Message(text) {
+    return buildSnapshotMessage('eco:l1', text);
+  }
+
+  /** 当前挂载圈的尾段（从物化缓存取，缺的 fail-open 跳过）。 */
+  function circleTailSections(attached) {
+    const secs = [];
+    for (const c of attached || []) {
+      const t = circleCache.get(c) ?? readCatalogSync(c);
+      if (t) secs.push({ circle: c, text: t });
+    }
+    return secs;
+  }
+
+  function tailHash(text) {
+    return createHash('sha1').update(String(text || '')).digest('hex');
+  }
+
+  async function fetchL1() {
+    const res = await call(['l1', '--budget', String(l1MaxChars)], CALL_TIMEOUT_MS);
+    const payload = parseJsonLine(res.out);
+    return payload?.ok ? payload : null;
+  }
+
+  /** 增量块拼装：超预算按块丢弃（尾部优先保留）并标注，绝不注入超预算文本。 */
+  function buildL1Delta(header, blocks, budget) {
+    const out = [header];
+    let used = header.length;
+    let dropped = 0;
+    for (const b of blocks) {
+      const cost = b.text.length + 24;
+      if (used + cost > budget) { dropped += 1; continue; }
+      out.push(`- [L1·${b.file}] ${b.text}`);
+      used += cost;
+    }
+    if (dropped) out.push(`（超预算省略 ${dropped} 段，全文在 memories/MEMORY.md）`);
+    return out.join('\n');
+  }
+
+  /** L1 增量消息（v3.2.2 既有逻辑；状态在 per-agent 桶上——质量门① P1 修复）。 */
+  async function composeL1Message(agent, bucket) {
+    const h = l1FileHash();
+    if (!h || h === bucket.l1Hash) return null;   // 无 L1 / 本 agent 已见过此版本 → 零注入
+    const payload = await fetchL1();
+    if (!payload) return null;
+    const all = [
+      ...((payload.memory?.sections) || []).map((s) => ({ ...s, file: 'MEMORY.md' })),
+      ...((payload.user?.sections) || []).map((s) => ({ ...s, file: 'USER.md' })),
+    ];
+    let text;
+    if (!bucket.l1Loaded) {
+      // 首轮：全量（核心已按预算截断并标注），全部段记为已见
+      for (const s of all) bucket.l1Seen.add(`${s.file}:${s.hash}`);
+      // 上限修剪（漏洞扫描低#6：长驻宿主 Set 无界涨）
+      if (bucket.l1Seen.size > 512) {
+        bucket.l1Seen = new Set([...bucket.l1Seen].slice(-256));
+      }
+      text = String(payload.inject_text || '');
+    } else {
+      // 增量：只注入本轮没见过指纹的段（超预算整段丢弃并标注——
+      // 丢弃的段同样记为已见：下轮文件再变时按当时内容重新判）
+      const fresh = all.filter((s) => !bucket.l1Seen.has(`${s.file}:${s.hash}`));
+      if (fresh.length === 0) {
+        bucket.l1Hash = h;   // 变化只是重排/归一 → 无新段，不打扰对话
+        return null;
+      }
+      for (const s of all) bucket.l1Seen.add(`${s.file}:${s.hash}`);
+      if (bucket.l1Seen.size > 512) {
+        bucket.l1Seen = new Set([...bucket.l1Seen].slice(-256));
+      }
+      text = buildL1Delta(`L1 常驻记忆增量（${fresh.length} 段新增/变更）：`, fresh, l1MaxChars);
+    }
+    if (!text) { bucket.l1Hash = h; return null; }
+    bucket.l1Hash = h;
+    bucket.l1Loaded = true;
+    ctx.logger.debug(`eco-memory: L1 注入 chars=${text.length} `
+      + `session=${String(agent?.id ?? '') || '-'}`);
+    return buildL1Message(text);
+  }
+
+  /** 圈尾段消息：只在挂载集合或内容变化时出现（变更才注入）。per-agent。 */
+  function composeCircleTailMessage(bucket) {
+    const tail = buildCircleTail(circleTailSections(bucket.attached), state.tailBudget);
+    if (!tail.text) return null;
+    const h = tailHash(tail.text);
+    if (h === bucket.tailHash) return null;
+    bucket.tailHash = h;
+    if (tail.dropped.length) {
+      ctx.logger.debug(`eco-memory: 圈尾段超预算丢弃 ${tail.dropped.join(',')}`);
+    }
+    return buildSnapshotMessage('eco:circle', tail.text);
+  }
+
+  // ---- pre-step：L1 + 副圈尾段（每轮最多两条追加消息，各自只在变化时出现）----
+  //
+  // **为什么不是 systemPrompt.section**：section 进前缀，而 dsh 的上下文是
+  // append-only——改前缀 = 之后每一次请求全量重新 prefill（实测一次 0.29 元）。
+  // L1 会随门②③ 变化、圈目录随挂载集合变化，走前缀等于反复付全量；
+  // 走 pre-step 追加 user 消息只在真正变化时付一次（旧线 eco-note 的成熟写法）。
+  // 分离圈 = 停止追加；已注入的历史消息随 compaction 自然滚出。
+  //
+  // 注意：dsh 0.2.1-rc.x 没有 agent/session-start 事件（已并入 agent/created），
+  // 这里只监听真实存在的 agent/pre-step。
+  ctx.on('agent/pre-step', async ({ agent, signal }, next) => {
+    const decision = await next();
+    if (!decision || decision.kind === 'reject' || signal?.aborted) return decision;
+    try {
+      if (!state.ready) return decision;
+      const base = decision.messages || [];
+      const extra = [];
+      // per-agent 桶：agent/created 时没建桶的（异常路径）**建并持久化**——
+      // L1 状态必须跨轮存活，临时桶会让 L1 每轮重复注入。
+      // lastAgentKey 在此刷新：pre-step 先于本轮全部工具调用，串行 turn 下
+      // 它就是"当前 agent"（工具侧桶归属的依据，漏洞扫描【中】）。
+      const agentKey = String(agent?.id ?? '');
+      state.lastAgentKey = agentKey;
+      let bucket = state.circlesByAgent.get(agentKey);
+      if (!bucket) {
+        bucket = { circle: '', attached: [], tailHash: '',
+                   l1Hash: '', l1Loaded: false, l1Seen: new Set() };
+        state.circlesByAgent.set(agentKey, bucket);
+      }
+      const l1Msg = await composeL1Message(agent, bucket);
+      if (l1Msg) extra.push(l1Msg);
+      const tailMsg = composeCircleTailMessage(bucket);
+      if (tailMsg) extra.push(tailMsg);
+      if (extra.length === 0) return decision;
+      return { kind: 'enter', messages: [...base, ...extra] };
+    } catch (e) {
+      ctx.logger.debug(`eco-memory: pre-step 注入异常（fail-open）: ${e?.message ?? e}`);
+      return decision;
+    }
+  }, { prepend: true });
 
   // ---- cold：按需读取 ----
   ctx.tools.register(defineTool({
@@ -525,9 +899,18 @@ export async function apply(ctx, config = {}) {
       render: (_args, value) => [{ type: 'text', text: value.result }],
     },
     execute: async (args) => {
+      toolBucket();   // 桶归属刷新（当前 agent 的圈边界，防跨会话串味）
       const id = String(args?.id ?? '').trim();
       if (!id) return { result: '（id 必填）' };
-      const res = await call(['load', '--', id]);
+      // **S3：scope 不是本工具的声明参数，模型 smuggle 进来的 scope 更不能当边界。**
+      // fail-closed：给的 scope 与路由圈不一致 → 直接拒绝（不调核心、不确认存在）。
+      const guard = resolveScopeGuard(args?.scope);
+      if (!guard.ok) return { result: scopeDeniedText(guard) };
+      // --routed 必须在 `--` 之前：`--` 之后全是位置参数（argparse 契约）
+      const loadArgv = ['load'];
+      if (state.circle) loadArgv.push('--routed', state.circle);
+      loadArgv.push('--', id);
+      const res = await call(loadArgv);
       const payload = parseJsonLine(res.out);
       if (!payload) return { result: `（记忆读取失败：${res.err || '无输出'}）` };
       if (!payload.ok) {
@@ -538,10 +921,15 @@ export async function apply(ctx, config = {}) {
       // **H4：load 也要过圈。** `id` 是模型给的，而检索/目录都受圈约束；
       // 唯独 load 直通，等于给了一条"知道 id 就能读任意圈"的旁路
       // （跨圈泄漏实测：projb 会话 `memory_load` 能读出 proja 的口令正文）。
-      // 判定口径与核心 `retrieve` 一致：本圈 + global 可见，其余一律不返回正文。
-      const want = normScope(args?.scope) || normScope(state.circle);
+      // 判定口径与核心 `retrieve` 一致：允许集合（routed ∪ attached）+ global
+      // 可见，其余一律不返回正文。圈的两个来源都是**非模型**的：
+      // routed 来自 cwd 路由，attached 来自显式挂载工具（resolveScopeGuard
+      // 已把关模型给的 scope）。
+      const allowed = new Set(['global']);
+      if (guard.scope) allowed.add(normScope(guard.scope));
+      for (const c of state.attached) allowed.add(normScope(c));
       const got = normScope(payload.scope || 'global');
-      if (want && want !== 'global' && got !== want && got !== 'global') {
+      if (!allowed.has(got)) {
         return { result: `（没有这条记忆：${id}）` };   // 不确认它存在，避免探测圈名
       }
       const kind = payload.kind ? ` [${payload.kind}]` : '';
@@ -571,18 +959,24 @@ export async function apply(ctx, config = {}) {
       render: (_args, value) => [{ type: 'text', text: value.result }],
     },
     execute: async (args) => {
+      toolBucket();   // 桶归属刷新（当前 agent 的圈边界，防跨会话串味）
       const q = String(args?.query ?? '').trim();
       if (!q) return { result: '（query 必填）' };
       const n = Math.max(1, Math.min(20, Number(args?.limit ?? 8) || 8));
       const argv = ['search', '--limit', String(n)];
       // **H4：scope 必须有兜底，不能交给模型自己填。**
-      // 旧实现只认 `args.scope`，模型省略就是全库直通——圈内会话用一句话就能
-      // 检索到别的项目的机密（实测：projb 会话不带 scope 能命中 proja 的口令）。
-      // 插件在 `agent/created` 时**已经算出了 state.circle**（cwd → 圈，由核心
-      // 声明的前缀决定），直接用它是现成信息，不需要模型配合。
-      // 显式要 `global`（跨圈查）仍然放行——那是用户的明确意图，不是默认值。
-      const scopeArg = normScope(args?.scope) || normScope(state.circle);
-      if (scopeArg && scopeArg !== 'global') argv.push('--scope', scopeArg);
+      // **S3：模型显式给的 scope 只能等于路由圈，不一致一律拒绝（fail-closed）。**
+      // 旧实现 `normScope(args?.scope) || normScope(state.circle)` 让模型写的
+      // 圈名**优先于**路由——填个目标圈名就能跨圈检索（REVIEW.md S3 实测）。
+      // 本圈检索本来就 union 全局条目（核心 `--scope <circle>` = 本圈 + global），
+      // 所以拒绝跨圈不损失任何合法内容。
+      const guard = resolveScopeGuard(args?.scope);
+      if (!guard.ok) return { result: scopeDeniedText(guard) };
+      const scopeArg = guard.scope;
+      // **scope 必须显式下发**（质量门①安全测试探测 4）：省略 --scope 在核心
+      // 语义里是"全库直通"，不是"global"。routed/global 都要显式传。
+      if (scopeArg) argv.push('--scope', scopeArg);
+      if (state.circle) argv.push('--routed', state.circle);   // 跨圈命中账（设计文档 §6）
       argv.push('--', q);
       const res = await call(argv);
       const payload = parseJsonLine(res.out);
@@ -594,6 +988,153 @@ export async function apply(ctx, config = {}) {
     },
     presentCall: (args) => ({
       card: 'generic', title: '检索长期记忆', kind: 'other', rawInput: args,
+    }),
+  }));
+
+  // ---- 多生态圈：agent 主导激活（设计文档 §4）----
+  //
+  // **领域判定全在核心**：能不能挂（已声明/attachable/未挂载）由 `circle-attach`
+  // fail-closed 判定并落账，插件只搬运结果。attach 的授权语义：挂载是显式工具
+  // 调用（auditable），挂了之后 `resolveScopeGuard` 才允许指向该圈——
+  // 未挂载圈在 search/load 里依旧拒绝（S3 不回退）。
+  ctx.tools.register(defineTool({
+    name: 'memory_circle_list',
+    description: '列出可用的记忆圈（项目生态）与当前挂载状态，附跨圈命中建议。挂载前先看这里。',
+    parameters: {},
+    output: {
+      schema: {
+        type: 'object', additionalProperties: false,
+        properties: { result: { type: 'string', required: true } },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.result }],
+    },
+    execute: async () => {
+      toolBucket();   // 桶归属刷新（当前 agent 的圈边界，防跨会话串味）
+      const res = await call(['circles'], CALL_TIMEOUT_MS);
+      const payload = parseJsonLine(res.out);
+      if (!payload?.ok) return { result: `（圈清单读取失败：${res.err || payload?.error || '无输出'}）` };
+      const rows = (payload.items || []).filter((c) => c.id !== 'global');
+      if (rows.length === 0) {
+        return { result: '（还没有声明任何项目圈；圈由 circles.json 声明或投递 --scope 建立）' };
+      }
+      const lines = rows.map((c) => {
+        const flags = [
+          c.id === state.circle ? 'routed' : '',
+          state.attached.includes(c.id) ? '已挂载' : '未挂载',
+          c.readonly ? '只读' : '',
+        ].filter(Boolean).join('·');
+        return `- ${c.id}${c.display_name ? `（${c.display_name}）` : ''}`
+          + ` │ ${c.count} 条 │ ${flags || '可挂载'}`;
+      });
+      // 跨圈命中建议（驯化数据源；fail-open——stats 失败不影响清单）
+      let sug = '';
+      try {
+        const sres = await call(['circles-stats', '--limit', '8'], CALL_TIMEOUT_MS);
+        const sp = parseJsonLine(sres.out);
+        const hits = (sp?.rows || []).filter((r) => r.suggest);
+        if (hits.length) {
+          sug = '\n跨圈命中建议（在这些会话里被反复命中的圈，考虑挂载）：\n'
+            + hits.map((r) => `- ${r.scope}（在 ${r.routed || 'global'} 会话命中 ${r.hits} 次）`).join('\n');
+        }
+      } catch { /* fail-open */ }
+      return { result: `记忆圈清单（挂载用 memory_circle_attach，分离用 memory_circle_detach）：\n${lines.join('\n')}${sug}` };
+    },
+    presentCall: (args) => ({
+      card: 'generic', title: '列出记忆圈', kind: 'other', rawInput: args,
+    }),
+  }));
+
+  ctx.tools.register(defineTool({
+    name: 'memory_circle_attach',
+    description: '挂载一个记忆圈（项目生态）：挂载后该圈目录随消息末端注入，检索/读取也对其放行。任务切换时挂对应的圈，用完用 memory_circle_detach 分离。',
+    parameters: {
+      circle: { type: 'string', required: true, description: '圈 id（用 memory_circle_list 查）' },
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: false,
+        properties: { result: { type: 'string', required: true } },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.result }],
+    },
+    execute: async (args) => {
+      // 读-改-写进串行链（漏洞扫描【中】：并发 attach 同圈会让 includes 检查
+      // 与 push 之间隔着 await，产生重复项 → 一次 detach 报"已分离"但授权仍在）
+      return serialize(async () => {
+        // **先捕获本 agent 的桶**（二轮审查 P1：await 期间 agent/created 或别的
+        // 工具调用会把 state.attached 重绑到别的桶——复查和 push 若走镜像，
+        // 授权会写进别人的桶：B 未挂载却拿到了 A 挂的圈的检索权，A 反而丢失）。
+        const bucket = toolBucket();
+        const circle = normScope(args?.circle);
+        if (!circle) return { result: '（circle 必填）' };
+        if (circle === 'global') return { result: '（global 无需挂载：它对所有会话可见）' };
+        if (bucket.attached.includes(circle)) {
+          return { result: `（圈 ${circle} 已挂载）` };
+        }
+        const argv = ['circle-attach', '--circle', circle];
+        if (bucket.circle) argv.push('--routed', bucket.circle);
+        const res = await call(argv, CALL_TIMEOUT_MS);
+        const payload = parseJsonLine(res.out);
+        if (!payload?.ok) {
+          // 核心是权威：未声明 / attachable:false / 未知错误 → 原样告知，不猜
+          return { result: `（挂载被拒绝：${payload?.detail || payload?.error || res.err || '未知原因'}）` };
+        }
+        // **await 之后对 bucket 复查**：并发窗口里可能已被同 agent 的另一次 attach 挂上
+        if (!bucket.attached.includes(circle)) bucket.attached.push(circle);
+        if (payload.text) circleCache.set(circle, payload.text);
+        ctx.logger.info(`eco-memory: 圈挂载 circle=${circle} entries=${payload.count} attached=${bucket.attached.length}`);
+        return { result: `已挂载圈 ${circle}（${payload.count} 条进目录，尾段总闸 ${state.tailBudget} 字符）。`
+          + `下一轮起该圈记忆随消息注入；不需要时用 memory_circle_detach 分离。` };
+      });
+    },
+    presentCall: (args) => ({
+      card: 'generic', title: '挂载记忆圈', kind: 'other', rawInput: args,
+    }),
+  }));
+
+  ctx.tools.register(defineTool({
+    name: 'memory_circle_detach',
+    description: '分离一个已挂载的记忆圈：停止注入该圈目录（已注入的历史消息随上下文压缩自然滚出）。某圈的经验用完就分离，保持上下文干净。',
+    parameters: {
+      circle: { type: 'string', required: true, description: '圈 id（用 memory_circle_list 查当前挂载）' },
+    },
+    output: {
+      schema: {
+        type: 'object', additionalProperties: false,
+        properties: { result: { type: 'string', required: true } },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.result }],
+    },
+    execute: async (args) => {
+      // 串行链 + **删尽所有匹配**（漏洞扫描【中】：重复项残留会让"已分离、
+      // 检索不再放行"的回执变成假话——授权集合里还留着圈）
+      return serialize(async () => {
+        const bucket = toolBucket();   // 同 attach：对捕获的桶操作，不经镜像
+        const circle = normScope(args?.circle);
+        if (!circle) return { result: '（circle 必填）' };
+        if (!bucket.attached.includes(circle)) {
+          return { result: `（圈 ${circle} 未挂载）` };
+        }
+        // **原地移除**（不能 filter 重新赋值）：桶数组被 pre-step/工具共享，
+        // 重新赋值会断开引用；**删尽所有匹配**（重复项残留会让"已分离"的
+        // 回执变成假话——授权集合里还留着圈）
+        let removed = 0;
+        let idx;
+        while ((idx = bucket.attached.indexOf(circle)) >= 0) {
+          bucket.attached.splice(idx, 1);
+          removed += 1;
+        }
+        // 落账 fail-open：账写不进去不挡分离本身（分离是本地状态操作）
+        try {
+          await call(['circle-detach', '--circle', circle], CALL_TIMEOUT_MS);
+        } catch { /* fail-open */ }
+        ctx.logger.info(`eco-memory: 圈分离 circle=${circle} x${removed} attached=${bucket.attached.length}`);
+        return { result: `已分离圈 ${circle}。该圈目录停止注入，检索/读取也不再放行`
+          + `（重新挂载随时可用 memory_circle_attach）。` };
+      });
+    },
+    presentCall: (args) => ({
+      card: 'generic', title: '分离记忆圈', kind: 'other', rawInput: args,
     }),
   }));
 
@@ -613,6 +1154,9 @@ export async function apply(ctx, config = {}) {
   ctx.systemPrompt.section({
     name: 'eco:packs',
     order: SECTION_ORDER + 10,
+    // **interpolate:false**（二轮审查 P2，改动前已存在、顺带修）：pack 标题
+    // 来自外部 manifest——含 `{{...}}` 会让整个装配抛错，与 fail-open 承诺冲突
+    interpolate: false,
     text: () => state.packsText || '',
   });
 
@@ -655,7 +1199,7 @@ export async function apply(ctx, config = {}) {
 export { name, inject };
 
 // 供测试直接验证渲染口径（与核心 retrieve.render_catalog_text 必须逐字节一致）
-export const __test__ = { renderCatalog, resolveRoot, normScopeOf: (v) => String(v || '')
+export const __test__ = { renderCatalog, buildCircleTail, resolveRoot, normScopeOf: (v) => String(v || '')
   .toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^[-._]+|[-._]+$/g, '').slice(0, 40) };
 
 

@@ -277,17 +277,24 @@ await test('T6c 显式 core 路径坏掉时回退到包内 src（不静默失效
   process.env.ECO_CORE = saved;
 });
 
-// ── T8 多圈（作用域遮蔽）──────────────────────────────────────────────
-function fakeAgent(cwd) {
-  const box = { reg: null };
+// ── T8 多圈（注入拓扑 v2：副圈走 pre-step 尾段，per-agent 挂载桶）────────
+function fakeAgent(cwd, id = '') {
   return {
+    id,
     session: { header: { cwd } },
-    ctx: { systemPrompt: { section: (reg) => { box.reg = reg; return () => {}; } } },
-    _box: box,
+    ctx: { systemPrompt: { section: () => {} } },
   };
 }
 
-await test('T8 不同项目圈看到各自的目录，且都包含全局条目', async () => {
+/** 驱动 pre-step：返回插件追加的 eco:circle 尾段消息数组（无追加 → []）。 */
+async function circleTailOf(agent) {
+  const h = cap.handlers['agent/pre-step'][0];
+  const out = await h({ agent, signal: undefined }, async () => ({ kind: 'enter', messages: [] }));
+  if (!out || out.kind !== 'enter') return [];
+  return (out.messages || []).filter((m) => m?.source?.sections?.[0]?.name === 'eco:circle');
+}
+
+await test('T8 不同项目圈看到各自的尾段目录，且都包含全局条目', async () => {
   core(['deposit', '--session', 't', '--text', '全局约定：提交前必须跑全套测试', '--kind', 'lesson'], root);
   core(['deposit', '--session', 't', '--text', '项目甲：部署用 blue-green', '--kind', 'procedural', '--scope', 'proj-alpha'], root);
   core(['deposit', '--session', 't', '--text', '项目乙：数据库固定用 sqlite', '--kind', 'semantic', '--scope', 'proj-beta'], root);
@@ -306,53 +313,184 @@ await test('T8 不同项目圈看到各自的目录，且都包含全局条目',
 
   // 真实顺序：数据先存在 → 会话边界物化 + 刷新路由表 → agent 创建时同步读文件
   cap.handlers['agent/created'][0]({
-    agent: { session: { header: { cwd: '' } }, ctx: { systemPrompt: { section: () => {} } } },
+    agent: { id: 'boot', session: { header: { cwd: '' } }, ctx: { systemPrompt: { section: () => {} } } },
     source: 'resume',
   });
   await settle(2500);
 
-  const a = fakeAgent('D:/proj-alpha');
-  const b = fakeAgent('D:/proj-beta');
+  const a = fakeAgent('D:/proj-alpha', 'agent-a');
+  const b = fakeAgent('D:/proj-beta', 'agent-b');
   cap.handlers['agent/created'][0]({ agent: a, source: 'startup' });
   cap.handlers['agent/created'][0]({ agent: b, source: 'startup' });
   await settle(1200);
 
-  const ta = a._box.reg ? a._box.reg.text({}) : '';
-  const tb = b._box.reg ? b._box.reg.text({}) : '';
+  const ta = (await circleTailOf(a)).map((m) => m.content[0].text).join('\n');
+  const tb = (await circleTailOf(b)).map((m) => m.content[0].text).join('\n');
 
-  assert.ok(a._box.reg, 'agent alpha 没有注册遮蔽段');
-  assert.ok(b._box.reg, 'agent beta 没有注册遮蔽段');
-  assert.match(ta, /blue-green/, `alpha 目录缺自己的条目：${ta}`);
-  assert.match(ta, /全局约定/, 'alpha 目录缺全局条目');
+  assert.match(ta, /blue-green/, `alpha 尾段缺自己的条目：${ta}`);
+  assert.match(ta, /全局约定/, 'alpha 尾段缺全局条目');
   assert.doesNotMatch(ta, /sqlite/, `alpha 看到了 beta 的记忆：${ta}`);
 
-  assert.match(tb, /sqlite/, `beta 目录缺自己的条目：${tb}`);
-  assert.match(tb, /全局约定/, 'beta 目录缺全局条目');
+  assert.match(tb, /sqlite/, `beta 尾段缺自己的条目：${tb}`);
+  assert.match(tb, /全局约定/, 'beta 尾段缺全局条目');
   assert.doesNotMatch(tb, /blue-green/, `beta 看到了 alpha 的记忆：${tb}`);
 });
 
 await test('T8x 未声明的目录**不会**按目录名猜出一个圈（安全回归）', async () => {
   // 这是审查抓到的跨圈泄漏：配置里只有 proj-alpha/proj-beta，
   // 若插件按 basename 判圈，`D:/work/alpha` 就会被判成圈 alpha 并注入其机密。
-  const a = fakeAgent('D:/work/alpha');
+  const a = fakeAgent('D:/work/alpha', 'agent-x');
   cap.handlers['agent/created'][0]({ agent: a, source: 'startup' });
   await settle(400);
-  assert.equal(a._box.reg, null,
+  const msgs = await circleTailOf(a);
+  assert.equal(msgs.length, 0,
     '未声明的目录被按目录名判成了圈 —— 会泄漏别的圈的记忆');
 });
 
-await test('T8b 遮蔽段名/order/interpolate 与全局段一致（靠同名遮蔽）', () => {
-  const a = fakeAgent('D:/proj-alpha');
+await test('T8b 尾段快照消息契约 + 内容未变更时零注入', async () => {
+  const a = fakeAgent('D:/proj-alpha', 'agent-a');
   cap.handlers['agent/created'][0]({ agent: a, source: 'startup' });
-  assert.equal(a._box.reg.name, GLOBAL_SECTION().name);
-  assert.equal(a._box.reg.order, GLOBAL_SECTION().order);
-  assert.equal(a._box.reg.interpolate, false);
+  const first = await circleTailOf(a);
+  assert.ok(first.length === 1, `尾段应恰一条消息：${first.length}`);
+  assert.equal(first[0].source.form, 'snapshot');
+  assert.equal(first[0].source.sections[0].name, 'eco:circle');
+  assert.equal(first[0].content[0].type, 'text');
+  // 变更才注入：同 agent 内容没变 → 不再追加
+  const again = await circleTailOf(a);
+  assert.equal(again.length, 0, `内容未变更却重复注入了尾段：${again.length}`);
 });
 
-await test('T8c 无 cwd 的 agent 不注册遮蔽段（降级为全局）', () => {
-  const c = fakeAgent('');
+await test('T8c 无 cwd 的 agent 无尾段（降级为全局段）', async () => {
+  const c = fakeAgent('', 'agent-c');
   cap.handlers['agent/created'][0]({ agent: c, source: 'startup' });
-  assert.equal(c._box.reg, null);
+  const msgs = await circleTailOf(c);
+  assert.equal(msgs.length, 0, '无圈 agent 不应有尾段');
+});
+
+await test('T8v attach/detach：显式挂载的圈进尾段，分离即停', async () => {
+  const a = fakeAgent('', 'agent-attach');
+  cap.handlers['agent/created'][0]({ agent: a, source: 'startup' });
+  // 未声明的圈：核心 fail-closed 拒绝
+  const bad = await cap.tools.memory_circle_attach.execute({ circle: 'ghost-circle' });
+  assert.match(bad.result, /挂载被拒绝/, `未声明圈应被拒绝：${bad.result}`);
+  // 挂载 proj-alpha（已声明）→ 下一次 pre-step 出现其条目
+  const ok = await cap.tools.memory_circle_attach.execute({ circle: 'proj-alpha' });
+  assert.match(ok.result, /已挂载/, `声明圈应挂载成功：${ok.result}`);
+  const tail = (await circleTailOf(a)).map((m) => m.content[0].text).join('\n');
+  assert.match(tail, /blue-green/, `挂载后尾段应包含该圈条目：${tail}`);
+  // 分离 → 尾段停止（内容变化后不再含该圈）
+  const off = await cap.tools.memory_circle_detach.execute({ circle: 'proj-alpha' });
+  assert.match(off.result, /已分离/, `分离应成功：${off.result}`);
+  const tail2 = (await circleTailOf(a)).map((m) => m.content[0].text).join('\n');
+  assert.doesNotMatch(tail2, /blue-green/, `分离后尾段仍包含该圈：${tail2}`);
+});
+
+await test('T8w 跨圈命中落账：挂载圈的命中进 circle_hit 并被 circles-stats 聚合', async () => {
+  const a = fakeAgent('D:/proj-beta', 'agent-hit');
+  cap.handlers['agent/created'][0]({ agent: a, source: 'startup' });
+  const ok = await cap.tools.memory_circle_attach.execute({ circle: 'proj-alpha' });
+  assert.match(ok.result, /已挂载/, JSON.stringify(ok));
+  // suggest 按 **distinct id** 计数（二轮安全测试：同一 id 反复检索能伪造
+  // 建议挂载）——所以这里要命中 ≥3 条不同的 alpha 条目才到建议阈值
+  core(['deposit', '--session', 't', '--text', '项目甲第二条：回滚用 canary-3355', '--kind', 'procedural', '--scope', 'proj-alpha'], root);
+  core(['deposit', '--session', 't', '--text', '项目甲第三条：监控用 lighthouse-4466', '--kind', 'semantic', '--scope', 'proj-alpha'], root);
+  core(['gate', '1'], root);
+  const terms = ['blue-green', 'canary-3355', 'lighthouse-4466'];
+  for (const q of terms) {
+    const r = await cap.tools.memory_search.execute({ query: q, scope: 'proj-alpha', limit: 5 });
+    assert.match(r.result, new RegExp(q), `挂载后应能检索挂载圈：${r.result}`);
+  }
+  await settle(600);
+  const stats = core(['circles-stats'], root);
+  const row = (stats.rows || []).find((x) => x.routed === 'proj-beta' && x.scope === 'proj-alpha');
+  assert.ok(row && row.hits >= 3, `跨圈命中没有落账：${JSON.stringify(stats)}`);
+  assert.ok(row.distinct >= 3, `distinct 计数不对：${JSON.stringify(row)}`);
+  assert.equal(row.suggest, true, 'distinct 达到阈值应标记 suggest');
+});
+
+// ── T8u 无圈会话检索限界（质量门①安全测试探测 4 的修复钉）─────────────
+await test('T8u 无圈会话检索显式限 global：看不到任何圈的条目', async () => {
+  const a = fakeAgent('', 'agent-unrouted');
+  cap.handlers['agent/created'][0]({ agent: a, source: 'startup' });
+  // proj-alpha 的条目在 T8 已入库；无圈会话不带 scope 检索 → 只查 global
+  const r = await cap.tools.memory_search.execute({ query: 'blue-green', limit: 10 });
+  assert.match(r.result, /没有命中/,
+    `无圈会话检索到了圈的条目（全库直通旁路）：${r.result}`);
+  // 全局条目仍可达
+  const g = await cap.tools.memory_search.execute({ query: '全局约定', limit: 10 });
+  assert.match(g.result, /全局约定/, '无圈会话连全局都查不到 = 关过头了');
+});
+
+// ── T8s 子目录 cwd 路由（质量门①审查 P1：circleOf 逗号表达式 bug）──────
+await test('T8s 声明前缀的子目录 cwd 能路由到圈（前缀最长匹配真实生效）', async () => {
+  const a = fakeAgent('D:/proj-alpha/sub/deeper', 'agent-sub');
+  cap.handlers['agent/created'][0]({ agent: a, source: 'startup' });
+  // 观测点：路由成功 → 工具侧默认 scope=proj-alpha → 能查到 alpha 条目；
+  // 路由失败（旧 bug）→ state.circle='' → --scope global → 查不到
+  const r = await cap.tools.memory_search.execute({ query: 'blue-green', limit: 10 });
+  assert.match(r.result, /blue-green/,
+    `子目录 cwd 没路由到圈（circleOf 前缀匹配失效）：${r.result}`);
+});
+
+// ── T8l1 多 agent L1（质量门①审查 P1：L1 状态必须 per-agent）──────────
+await test('T8l1 第二个 agent 也能收到 L1 常驻段首轮注入', async () => {
+  const memDir = path.join(root, 'memories');
+  writeFileSync(path.join(memDir, 'MEMORY.md'), '跨 agent 的常驻约定 Unicorn-9000\n', 'utf8');
+  const drive = async (agent) => {
+    const h = cap.handlers['agent/pre-step'][0];
+    const out = await h({ agent, signal: undefined }, async () => ({ kind: 'enter', messages: [] }));
+    return ((out && out.kind === 'enter') ? (out.messages || []) : [])
+      .filter((m) => m?.source?.sections?.[0]?.name === 'eco:l1');
+  };
+  const a = fakeAgent('', 'agent-l1a');
+  const b = fakeAgent('', 'agent-l1b');
+  cap.handlers['agent/created'][0]({ agent: a, source: 'startup' });
+  cap.handlers['agent/created'][0]({ agent: b, source: 'startup' });
+  const ma = await drive(a);
+  const mb = await drive(b);
+  assert.ok(ma.length >= 1, '第一个 agent 没收到 L1');
+  assert.match(ma[0].content[0].text, /Unicorn-9000/);
+  assert.ok(mb.length >= 1, '第二个 agent 没收到 L1（L1 状态被进程级单例吞了）');
+  assert.match(mb[0].content[0].text, /Unicorn-9000/);
+});
+
+// ── T8y 尾段预算闸（纯函数直测）───────────────────────────────────────
+await test('T8y buildCircleTail：整圈全进/全丢 + 丢弃显式标注', () => {
+  const { buildCircleTail } = __test__;
+  const secs = [
+    { circle: 'routed-first', text: 'a'.repeat(300) },
+    { circle: 'second', text: 'b'.repeat(300) },
+    { circle: 'third', text: 'c'.repeat(300) },
+  ];
+  const out = buildCircleTail(secs, 700);
+  // **精确预算语义**：丢弃标注行也计入预算——装两圈+标注会超 700，
+  // 收缩循环正确放弃 second（这正是"字节级不超闸"的证明）
+  assert.ok(out.included.includes('routed-first'), 'routed 圈应最优先保留');
+  assert.equal(out.included.length, 1, `预算内应只装得下一圈：${JSON.stringify(out)}`);
+  assert.deepEqual(out.dropped, ['third', 'second'], `整圈丢弃：${JSON.stringify(out)}`);
+  assert.ok(out.text.length <= 700, `尾段超闸：${out.text.length}`);
+  assert.match(out.text, /超预算未注入：third , second/, '丢弃必须显式标注（静默缩水 = agent 以为挂了）');
+  // **首行断言**（二轮审查 P1：Python 的 `%` 格式化写进 JS 会得到字面 NaN）
+  assert.match(out.text, /^项目圈记忆（挂载 1 圈；/, `首行圈数成 NaN 了：${out.text.split('\n')[0]}`);
+  assert.doesNotMatch(out.text, /NaN/, '尾段任何地方不得出现字面 NaN');
+  const all = buildCircleTail(secs, 10000);
+  assert.equal(all.included.length, 3);
+  assert.equal(all.dropped.length, 0);
+  assert.equal(buildCircleTail([], 900).text, '', '空挂载必须零文本（不注入噪音）');
+  // 半圈不进：文本不足一整圈时宁可不注入（半圈目录比没有更误导）
+  const none = buildCircleTail([{ circle: 'big', text: 'x'.repeat(2000) }], 900);
+  assert.equal(none.included.length, 0);
+  assert.deepEqual(none.dropped, ['big']);
+});
+
+// ── T16 charter：主圈物理法则段（前缀，字节稳定层）──────────────────────
+await test('T16 charter 段注册在目录段之前，内容来自核心', () => {
+  const s = cap.sections['eco:charter'];
+  assert.ok(s, 'charter 段未注册');
+  assert.ok(s.order < GLOBAL_SECTION().order, 'charter 应排在目录段之前（主在尽量靠前）');
+  assert.equal(s.interpolate, false, 'interpolate 必须为 false');
+  const text = s.text({});
+  assert.match(text, /永不物理删除/, `charter 内容应来自核心 CHARTER_RULES：${text}`);
 });
 
 // ── T8d 冷路径隔离（H4）────────────────────────────────────────────────
@@ -375,10 +513,14 @@ await test('T8d 冷路径隔离：不带 scope 时按会话圈过滤（search + 
   assert.match(noScope.result, /没有命中/,
     `beta 会话不带 scope 检索到了 alpha 的口令（跨圈泄漏）：${noScope.result}`);
 
-  // ② 显式要 global 仍然放行（跨圈查是用户的明确意图，不是默认值）
+  // ② 显式要 global：**拒绝**（S3 v2 契约——routed 会话里 global 条目本来
+  // 就 union 在本圈检索里，单独的"只查 global"是没有授权价值的窄视图；
+  // 跨圈的正当通道是 memory_circle_attach，不是 scope 参数走私）
   const explicit = await cap.tools.memory_search.execute({ query: 'blue-green-7788', scope: 'global', limit: 10 });
-  assert.match(explicit.result, /blue-green-7788/,
-    '显式 scope=global 也查不到 —— 收紧过头会误伤"我要跨圈找"的正常意图');
+  assert.match(explicit.result, /scope 被拒绝/,
+    `routed 会话显式 global 应被拒绝（S3 契约）：${explicit.result}`);
+  assert.doesNotMatch(explicit.result, /blue-green-7788/,
+    `拒绝提示里不应回显命中内容：${explicit.result}`);
 
   // ③ load：知道 id 也不能读别的圈（id 是模型给的，必须能被圈约束）
   const alphaId = core(['search', '--limit', '5', '--scope', 'proj-alpha', '--', 'blue-green-7788'], root)
