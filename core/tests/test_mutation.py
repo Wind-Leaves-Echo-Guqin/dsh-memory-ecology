@@ -133,8 +133,13 @@ MUTANTS: list[dict] = [
         new='    _do_write()  # MUTANT: 不加锁（Windows 并发丢行）\n',
         why="**实测真 bug**：Windows 的 O_APPEND 不是原子 seek+write，"
             "6 进程同时写 9KB 会算出同一偏移、后写覆盖先写 → 静默丢整行（8% 概率）",
-        runners=[P(CORE + "::TestPaths::test_append_line_concurrent_same_file_no_interleave")],
-        hint="（若存活）说明并发用例的行太短或进程太少；要 >8KB × ≥6 进程 × ≥5 行。",
+        # 两条断言一起：并发丢行那条是**概率**的（16 轮仍有 10~20% 漏检，会让
+        # 变异组"随机红"），另一条改成**确定性**口径（外部持有 .appendlock 时
+        # append_line 必须阻塞）——去掉锁就 100% 必红。
+        runners=[P(CORE + "::TestPaths::test_append_line_concurrent_same_file_no_interleave",
+                   CORE + "::TestPaths::test_append_lock_actually_serializes")],
+        hint="（若存活）确定性断言 test_append_lock_actually_serializes 应必红；"
+             "它红不了说明锁文件路径/加锁点被绕过了，不是概率问题。",
     ),
     dict(
         name="M3  connect 去掉 WAL", group="paths",

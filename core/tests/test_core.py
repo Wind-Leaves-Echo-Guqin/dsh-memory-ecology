@@ -269,6 +269,69 @@ class TestPaths(Base):
             self.assertEqual(dict(c), {"w%d" % i: 5 for i in range(WORKERS)},
                              "第 %d 轮有 worker 的写入丢失：%s" % (rnd, dict(c)))
 
+    def test_append_lock_actually_serializes(self):
+        """**确定性**验证追加锁真的起作用（M2c 的稳定版断言）。
+
+        为什么需要这条：`test_append_line_concurrent_same_file_no_interleave`
+        靠 Windows `O_APPEND` 非原子性的**概率竞态**（实测单轮 8% 丢行）来抓
+        M2c，16 轮只能把漏检压到 10~20%——变异组因此"随机红"。概率断言不是
+        断言，是抽奖。
+
+        这里改用**不靠概率**的口径：另一个进程先持住 `<file>.appendlock`，
+        主进程调 `append_line` 必须**被挡住**（拿不到锁就不写）。去掉锁的变异体
+        会立刻写进去 → 断言必红，且是 100% 必红。
+        """
+        if os.name != "nt":
+            self.skipTest("追加锁只在 Windows 上启用（POSIX 的 O_APPEND 本来就原子）")
+        target = self.tmp / "serialize.md"
+        # 先建出锁文件，并让子进程持锁 3 秒（足够覆盖下面的尝试窗口）
+        lockpath = target.with_name(target.name + ".appendlock")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        lockpath.write_bytes(b"\0")
+
+        holder = (
+            "import os, sys, time, msvcrt\n"
+            "fd = os.open(sys.argv[1], os.O_RDWR | os.O_BINARY)\n"
+            "os.lseek(fd, 0, os.SEEK_SET)\n"
+            "msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)\n"
+            "print('LOCKED', flush=True)\n"
+            "time.sleep(float(sys.argv[2]))\n"
+        )
+        proc = subprocess.Popen([sys.executable, "-c", holder, str(lockpath), "3"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            # 等它真的拿到锁
+            first = proc.stdout.readline().decode("utf-8", "replace").strip()
+            self.assertEqual(first, "LOCKED", "持锁进程没拿到锁，用例前提不成立")
+
+            # 在持锁期间尝试追加：必须**阻塞**（不能在锁被占时写进去）
+            writer = (
+                "import sys; sys.path.insert(0, %r)\n"
+                "from memory_ecology.paths import append_line\n"
+                "from pathlib import Path\n"
+                "append_line(Path(sys.argv[1]), 'BLOCKED-ME\\n')\n"
+                "print('WROTE', flush=True)\n"
+            ) % str(SRC)
+            w = subprocess.Popen([sys.executable, "-c", writer, str(target)],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                # 1.2 秒内它不该完成（锁被别人持有 3 秒）
+                out, err = w.communicate(timeout=1.2)
+                wrote = out.decode("utf-8", "replace").strip() == "WROTE"
+            except subprocess.TimeoutExpired:
+                wrote = False
+                w.kill()
+                w.communicate()
+            self.assertFalse(
+                wrote,
+                "锁被别的进程持有时 %s 仍然写成功了 —— 追加锁没生效（M2c 形态）" % target.name)
+            self.assertFalse(
+                target.is_file() and "BLOCKED-ME" in target.read_text(encoding="utf-8"),
+                "锁被占用时内容仍被写入：锁没起作用")
+        finally:
+            proc.kill()
+            proc.communicate()
+
     def test_backup_is_reversible_never_deletes(self):
         """备份超出保留份数 → **移入 _bak-archive**，不是 unlink（红线 1）。"""
         p = self.tmp / "MEMORY.md"
