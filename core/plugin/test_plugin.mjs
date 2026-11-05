@@ -536,6 +536,25 @@ await test('T8d 冷路径隔离：不带 scope 时按会话圈过滤（search + 
   const betaSelf = await cap.tools.memory_load.execute({ id: firstId });
   assert.match(betaSelf.result, /第一条可检索的经验|第二条事实/,
     `全局条目在自己圈里读不出来了：${betaSelf.result}`);
+
+  // ⑤ **显式他圈名**（审计 01-P1-1 的漏测分支）：模型主动填 scope="proj-alpha"。
+  // T8d 原来只测"省略 scope"与"显式 global"，这条绕过路径完全没覆盖：
+  // 旧写法 `normScope(args?.scope) || normScope(state.circle)` 里非空 args.scope
+  // 会短路掉 state.circle 兜底，一句话就跨圈。修好后必须同样被拒绝。
+  const smuggle = await cap.tools.memory_search.execute(
+    { query: 'blue-green-7788', scope: 'proj-alpha', limit: 10 });
+  assert.match(smuggle.result, /scope 被拒绝/,
+    `模型显式填他圈名未被拒绝（S3/H4 绕过）：${smuggle.result}`);
+  assert.doesNotMatch(smuggle.result, /blue-green-7788/,
+    `被拒的检索仍回显了目标圈内容：${smuggle.result}`);
+
+  // ⑥ load 侧的同一绕过：把未在 schema 声明的 scope 塞进去也必须无效。
+  // （`memory_load` 的 schema 里根本没有 scope 参数，模型仍可能塞；旧实现对
+  // 这参数的处理与 search 同构，同样短路了 state.circle。）
+  const smuggleLoad = await cap.tools.memory_load.execute(
+    { id: alphaId, scope: 'proj-alpha' });
+  assert.doesNotMatch(smuggleLoad.result, /blue-green-7788/,
+    `memory_load 带他圈 scope 绕过了圈边界：${smuggleLoad.result}`);
 });
 
 // ── T15 记忆包 mount 段 ────────────────────────────────────────────────
