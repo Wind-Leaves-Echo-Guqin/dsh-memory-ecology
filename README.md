@@ -95,7 +95,7 @@ python -m memory_ecology --root /tmp/eco-demo catalog       # 看目录：注入
 | **`core/`** | **核心引擎（唯一维护线）**：四道门 + 多生态圈 + 只读记忆包 + 检索，纯 stdlib；dsh 插件本体 `core/plugin/` 也在这里 | **3.4.1** |
 | `core/src/memory_ecology/` | 15 个模块：`gates.py` / `ledger.py` / `store.py` / `paths.py` / `retrieve.py` / `packs.py` / `config.py` / `root.py` / `proclock.py` / `similarity.py` / `measure.py` / `version.py` / `cli.py` / `__init__.py` / `__main__.py` | 3.4.1 |
 | `core/tests/` | 核心 / 兼容与数据安全 / 并发 / 稳定性 / 变异（`run_tests.py` 7 组） | — |
-| `src/memory_ecology/` | v3.1 治理核心（历史线，54 个 CLI 脚本 + 17 个测试）：写门/配额/蒸馏/复核/eco_note/向量缓存 | 3.1.0 |
+| `src/memory_ecology/` | v3.1 治理核心（历史线，54 个 CLI 脚本 + 21 个测试）：写门/配额/蒸馏/复核/eco_note/向量缓存 | 3.1.0 |
 | `integrations/hermes/` | Hermes 参考实现（state.db / cron 耦合件） | — |
 | `integrations/dsh/` | dsh 适配器（`package/` = EAC；`package-cordis/` = 官方桌面版 cordis）。**v3.1 旧线（eco-note 时代），已冻结，勿用于新装** | — |
 | `integrations/gui-v3/` | 观测舱 GUI 当前发布版（液态玻璃 / iOS 外壳，18 视图） | 3.4.1（并入产品版本线） |
@@ -107,7 +107,7 @@ python -m memory_ecology --root /tmp/eco-demo catalog       # 看目录：注入
 | 树 | 定位 | 现在能改吗 |
 |---|---|---|
 | **`core/`** | **唯一维护线**。新功能、缺陷修复只进这里 | ✅ 唯一入口 |
-| `src/`（v3.1，33 脚本） | **已冻结**：只接受安全修复，不再加功能 | ⚠️ 冻结 |
+| `src/`（v3.1，54 个脚本） | **已冻结**：只接受安全修复，不再加功能 | ⚠️ 冻结 |
 | `integrations/hermes/` | 生产 cron 今天仍跑这一套（v3.1 脚本） | ⚠️ 冻结 |
 
 - **冻结判据（可验证）**：`tools/sync_trees_check.py` 报双树漂移时，若改动只发生在 `src/`
@@ -296,8 +296,8 @@ node test_cordis.mjs  # 官方桌面版：纯函数 + apply() 端到端
 
 **结论**：不合并成"一棵树"，而是让 `core/` 吸收 `src/` 的缺口，齐平后直接删 `src/`。
 
-**为什么不现在做**：两棵树差的是**能力面**，不是结构。`core/` 14 个模块 / 17 个子命令，
-`src/` 33 个 CLI 脚本（另有 17 个测试）；`core/` 目前**没有** v3.1 的写入门（`write_gate`）、
+**为什么不现在做**：两棵树差的是**能力面**，不是结构。`core/` 15 个模块 / 22 个子命令，
+`src/` 54 个 CLI 脚本（另有 21 个测试）；`core/` 目前**没有** v3.1 的写入门（`write_gate`）、
 golden 评测链路、`eco_health_check` 等。直接合并 = 功能回退。
 
 **顺序（每步都可独立验证）**：
@@ -318,19 +318,19 @@ golden 评测链路、`eco_health_check` 等。直接合并 = 功能回退。
 `pending/` 走既有的人工确认链路；`memory_query --disputes` 输出加一列建议。先把"建议"
 跑准（可做影子比对），再谈放开自动。
 
-### 3. v3.1 独立测试（`tests/`）尚未随发布物分发
+### 3. v3.1 独立测试（`tests/`）已收敛到 5 个
 
-**现状**：发布树只发 `tests/fixtures/`（论文复现依赖）。源树 `tests/` 下另有 27 个测试
-（含 `test_v31_security` / `test_pii_rules` / `test_round3_redteam` 这批安全与隐私测试）
-**没有随发**。
+**现状（2026-11-05 实测）**：仓库根 `tests/` 共 5 个测试文件——
+`test_gui_contract.py` / `test_gui_security.py` / `test_gui_v3_2_0.py` /
+`test_health_score_v4.py` / `test_publish_rollback.py`，全部随仓库分发，
+`python -m pytest tests` 一次跑完（58 条）。
 
-**为什么没做完**：这批测试依赖开发树的 `scripts/`、`tools/`、`agent-hooks/` 三处布局
-（含 `subprocess` 里硬编码 `scripts/write_gate.py`、`ECO_SCRIPTS_DIR` 等）。实测：只补
-`sys.path` 能到 201/222 通过，剩余 21 个缺 `eco_evolve` / `check_shell_sync` / `eco_extract`
-等未登记件。
-
-**为什么回退而不是硬发**：发一个"201/222 能跑"的测试目录，比不发更糟——会让人以为发布树
-可回归。要么补齐到全绿，要么不发。
+**历史**：这里一度有 27 个测试（含 `test_v31_security` / `test_pii_rules` /
+`test_round3_redteam` 这批安全与隐私测试），它们依赖开发树的 `scripts/`、`tools/`、
+`agent-hooks/` 三处布局（含 `subprocess` 里硬编码 `scripts/write_gate.py`、
+`ECO_SCRIPTS_DIR` 等），只补 `sys.path` 也只能到 201/222 通过。
+**按"要么补齐到全绿，要么不发"的口径，那批没有随发布物分发**；后续 v3.1 线冻结、
+治理能力迁到 `core/`，它们已不是当前的回归路径。
 
 ### 4. 门④ 的调度频率与"使用驱动"缺数据源（**生产侧，本仓库不含**）
 
