@@ -5,6 +5,32 @@
 
 ---
 
+## v3.4.1（2026-11-05）—— R8 GUI 性能 + 三件 P1 收口 + 候选键单源化
+
+- **R8 GUI 性能**：18 视图改 `React.lazy` + `Suspense`（Dashboard 保持静态=首屏默认视图）；
+  vite 按 react/three/charts 分组拆包。入口 chunk **1009KB → 97.6KB**，
+  three 552KB 独立成块、只在进 3D 视图时加载（首屏 raw 1009→316KB，gzip 280→101KB）。
+  CDP 逐视图验收 18/18 真渲染。node_modules 从 D:\archive Junction 换正常安装 + 落 lockfile。
+- **05-P1-1 急救箱假修复**：`add()` 曾把「没修」报成「已修复」（库损坏/数据根缺失/CLI 缺失/
+  cron 报错全中招 → all_ok 恒 True、退出码恒 0）。改：`fixed` 必须真执行修复且复评通过，
+  探针失败（拿不到证据）不算修好。
+- **05-P1-2 发布链清场绕过**：`main()` 的 `except SystemExit: raise` 直接重抛，
+  而 build() 内三处 SystemExit 都在已写入几百文件之后 → 半更新树留下。
+  改：同样清场再重抛，以 `_PUBLISH_TOUCHED` 为闸（拒绝型退出不得清场），
+  旗标在进入破坏性清空循环**之前**置位。
+- **05-P1-3 meta 写副作用**：`core_call(["init"])` 在 TTL 缓存外 → healthz(20s)/meta(8s)
+  每轮 spawn 写子进程、GET 有建根副作用。改：meta 纯只读（读 root.json + 进程内 import），
+  建根拆 `ensure_root()` 只在启动调一次；只读成因直接取核心 `Root.open()` 的四种；
+  `core_ok` 改用 `_is_v3_2_0` 判据（v3.1 镜像不再假报可达）。
+- **01-P1-2 候选匹配键单源化**：写入用 trait(80)、查重用完整正文(60)，低词密度正文两键
+  永不相等 → 每轮重造候选（created 归零、观察期结构性失效）+ 2 会话时当轮把 `- - -`
+  晋升进 USER.md + 每轮多一个 `.promoted.<stamp>.md`。改：`_cand_key()` 唯一口径；
+  `_is_marked_candidate()` 按点号段识别三种终态；`_trait_of()` 按词字符含量取窗口，
+  纯标点正文拒收并记 `skip`。
+- **版本自检扩面**：`version` 增加 `integrations/gui-v3/index.html` 的 `<title>` 校验位。
+- **测试可信度**：M2c 从「8% 概率竞态」改为确定性断言（外部持锁时 append_line 必须阻塞，
+  100% 必红）；T8d 补「显式他圈名」绕过分支（search + load 两处，变异验证必红）。
+
 ## v3.4.0（2026-11-05）—— 3.4.0 重构：R1 测试可信度 + R7 版本大一统
 
 > 3.4.0 的完整范围与闸门清单见交接文档 §10/§13；本段只记已落库项。

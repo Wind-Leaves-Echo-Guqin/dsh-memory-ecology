@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { Ico } from '../lib/icons'
 import { useEco } from '../lib/eco'
+import { OBSERVATORY_VERSION_TAG } from '../lib/version'
 import { applyAppearance, applyWallpaper, getAppearance, getWallpaper, WALLPAPERS, type Appearance, type WallpaperId } from '../lib/palette'
 import { copyDiagnostic, V03_URL } from '../lib/sys'
 import { ui, useUi, type AnimLevel } from '../lib/ui'
@@ -75,7 +76,7 @@ export default function Settings() {
         <div className="vh">设置</div>
         <div className="ios-list set-profile" onClick={() => setSec('about')}>
           <AppGlyph app={APP.dashboard} size={58} />
-          <div><b>记忆生态 · 观测舱</b><span>v3.4.0 液态玻璃 · 只读观测 · 生态 {meta?.version ?? '—'}</span></div>
+          <div><b>记忆生态 · 观测舱</b><span>{OBSERVATORY_VERSION_TAG} 液态玻璃 · 只读观测 · 生态 {meta?.version ?? '—'}</span></div>
           <Ico name="chev" size={13} className="ios-chev" />
         </div>
         {[0, 1, 2].map(g => (
@@ -167,8 +168,8 @@ export default function Settings() {
         {sec === 'about' && (
           <>
             <Group title="关于本机">
-              <Row label="名称" value="记忆生态 · 观测舱 v3.4.0" />
-              <Row label="观测舱版本" value="v3.4.0（对齐核心 3.4.0）" />
+              <Row label="名称" value={`记忆生态 · 观测舱 ${OBSERVATORY_VERSION_TAG}`} />
+              <Row label="观测舱版本" value={`${OBSERVATORY_VERSION_TAG}（前端应用）`} />
               <Row label="生态版本" value={meta?.version ?? '—'} />
               <Row label="评分模型" value={meta?.score_model ?? '—'} />
               <Row label="数据快照" value={meta?.snapshot?.replace('T', ' ') ?? '—'} />

@@ -23,6 +23,12 @@ from pathlib import Path
 _ARG_ROOT: str | None = None      # eco_gui.py 启动时注入
 _ARG_SCRIPTS: str | None = None
 
+# **评分模型版本**（v4，2026-11-05 重做：连续扣分 + 正向维度）。
+# 与 `src/memory_ecology/eco_health_check.py: SCORE_V4_VERSION` 必须一致——
+# GUI 显示的「评分模型」和体检报告里写的必须是同一代，否则用户看到的
+# 数字与报告对不上（v3 时代这两处各自硬编码过，漂移过一次）。
+SCORE_MODEL = "v4"
+
 
 def set_root(root: str | None, scripts: str | None = None) -> None:
     global _ARG_ROOT, _ARG_SCRIPTS
@@ -566,10 +572,52 @@ def skill_md(rel_path: str) -> dict | None:
 
 
 # ── 版本 / 体检 / 基因库 ────────────────────────────────────────────────
+def _engine_version() -> str:
+    """**生态引擎（memory_ecology 核心）的版本** —— 版本号的唯一权威来源。
+
+    2026-11-05 纠正（用户指出 GUI 里一直显示 v3.1.0）：
+    旧实现从数据根的 `VERSION.md` 里正则抓 `生态版本: vX.Y.Z`。那个文件在
+    hermes 根下，写的是 **Hermes 生产树的版本（v3.1.0）**；而记忆生态自
+    v3.2.0 起就与 Hermes 剥离了，代码线版本早已是 3.4.x。于是 GUI 上
+    「观测舱版本 v3.4.0」旁边挂着「生态版本 v3.1.0」，看起来像自己的版本错了。
+
+    现在改为读核心包 `__version__`（进程内 import，零子进程），并回退到
+    仓库 `VERSION.md` 的第一条 `**vX.Y.Z**`（发布树里 core/ 与仓库分居时的兜底）。
+    都取不到才回 "?"——绝不猜一个数字出来。
+    """
+    # ① 核心包（C 仓 core/src 或已安装）
+    for cand in (Path(__file__).resolve().parents[2] / "core" / "src",
+                 Path(__file__).resolve().parents[2] / "src"):
+        if (cand / "memory_ecology" / "__init__.py").is_file():
+            try:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location(
+                    "_eco_ver_probe", cand / "memory_ecology" / "__init__.py")
+                if spec and spec.loader:
+                    mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+                    v = str(getattr(mod, "__version__", "") or "")
+                    if v:
+                        return "v" + v
+            except Exception:  # noqa: BLE001 - 版本探测永不抛
+                pass
+    # ② 仓库/数据根 VERSION.md 的第一条版本条目
+    for base in (Path(__file__).resolve().parents[2], data_root()):
+        text = _read(base / "VERSION.md")
+        m = re.search(r"\*\*v(\d+\.\d+\.\d+)", text)
+        if m:
+            return "v" + m.group(1)
+    return "?"
+
+
 def version_info() -> dict:
+    """→ {version, health_rows, version_source}。
+
+    `version` = **生态引擎版本**（见 `_engine_version`），不再是 Hermes 树的版本；
+    `health_rows` 仍来自数据根的 VERSION.md（那是体检历史表，与版本号来源无关）。
+    """
     root = data_root()
     text = _read(root / "VERSION.md")
-    m = re.search(r"生态版本[::]\s*(v[\d.]+)", text)
     rows = []
     for line in text.splitlines():
         if line.startswith("| 20"):
@@ -577,7 +625,8 @@ def version_info() -> dict:
             if len(cells) >= 5:
                 rows.append({"date": cells[0], "gene": cells[1], "cron": cells[2],
                              "fail": cells[3], "mem": cells[4]})
-    return {"version": m.group(1) if m else "?", "health_rows": rows[:14]}
+    return {"version": _engine_version(), "health_rows": rows[:14],
+            "version_source": "engine"}
 
 
 def score_history() -> list:
@@ -726,7 +775,7 @@ def meta() -> dict:
     today_ran = any(r["ts"].startswith(today) for r in logs["rows"])
     sd = scripts_dir()
     return {"root": str(root), "root_exists": _looks_like_eco_root(root),
-            "version": ver["version"], "score_model": "v3",
+            "version": ver["version"], "score_model": SCORE_MODEL,
             "snapshot": datetime.now().isoformat(timespec="seconds"),
             "locks": lock_info(), "writer_today_ran": today_ran,
             "scripts_dir": str(sd) if sd else None,

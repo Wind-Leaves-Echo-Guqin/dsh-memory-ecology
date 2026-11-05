@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Ico } from '../lib/icons'
 import { ui, useUi } from '../lib/ui'
+import { OBSERVATORY_VERSION_TAG } from '../lib/version'
 
 /** iOS 底部卡片（sheet）：替代 v2.2 侧抽屉。拖动把手下滑可关闭；背后的应用会缩小退后。 */
 export function Sheet() {
@@ -58,7 +59,7 @@ export function WhatsNew() {
       <div className="sheet-mask" onClick={() => ui.finishGuide()} />
       <aside className="sheet whatsnew" role="dialog" aria-label="新功能介绍">
         <div className="wn-inner">
-          <h2>欢迎使用<br /><span>观测舱 v3.4.0</span></h2>
+          <h2>欢迎使用<br /><span>观测舱 {OBSERVATORY_VERSION_TAG}</span></h2>
           <ul className="wn-list">
             {FEATURES.map(f => (
               <li key={f.title}>

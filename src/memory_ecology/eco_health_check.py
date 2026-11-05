@@ -462,39 +462,148 @@ def gateway_status():
         return f"状态未知（{type(e).__name__}）"
 
 
-def health_score(skills, dups, dangling, ver_rate, missing, cron_errs, mem_over, backup_flags):
-    """健康评分 0-100 + 状态灯（v3：补 cron/记忆/备份维度 + 分项构成）。"""
-    items = []  # (扣分, 原因)
+# ===== 健康评分模型 v4（2026-11-05 重做）=====
+#
+# 为什么要重做（v3 的实测症状，来自 5 份历史报告的真实分布）：
+#   1. **分数长期卡死**：2026-10-23 / 10-30 / 11-04 / 11-05 四连 **75 分**不动，
+#      而这期间 cron 报错从 1 个涨到 5 个又回落——分数对这个变化**完全不敏感**。
+#   2. **悬崖效应（硬阈值）**：cron 报错 1 个和 25 个都扣 10 分；必需字段缺失
+#      11 项和 100 项都扣 10 分。于是"病情加重"和"原地不动"看起来一样。
+#   3. **无正向维度**：缓存命中率 98.6%（这条掉到 50% 成本约 ×8）根本不进分；
+#      记忆产出、检索可用性也不进分。健康模型只罚不奖，天然趋向"躺平的 75"。
+#   4. **量纲不统一**：重复副本 1 组扣 15 分，而 cron 报错 1 个也扣 10 分——
+#      前者几乎不影响使用，后者意味着生产任务没跑。
+#
+# v4 的设计原则：
+#   - **连续而非阶梯**：每项用单调饱和函数 `饱和扣分 = 权重 × (1 - e^(-n/尺度))`，
+#     n=0 → 0 分；n→∞ → 逼近权重上限。既不会"1 个就扣满"，也不会"100 个还在扣那点"。
+#   - **权重表显式化**：所有系数集中在 `SCORE_V4_WEIGHTS`，改权重要改这里一处。
+#   - **引入正向维度**：缓存命中率 / 记忆产出 / 检索就绪三项作为**加分项**，
+#     上限受 `SCORE_V4_BONUS_CAP` 约束，避免"刷分"能盖过真实缺陷。
+#   - **量纲统一**：权重按"这件事坏了有多影响你使用记忆生态"排，不按实现难度排。
+#
+# 权重依据（2026-11-05 从 5 份历史报告的真实触发分布统计）：
+#   必需字段缺失  5/5 份都触发（39~43 项）——最常见的欠账，但影响是"元数据不全"
+#   cron 报错     4/5 份触发（1~5 个）——生产任务没跑，影响最直接
+#   备份异常      5/5 份触发（1 个）——数据安全兜底，单项但严重
+#   重复副本      0/5 触发（0 组）——真出现时是明确的治理事故，故权重高
+#   悬空引用      0/5 触发——同上，出现即异常
+#   版本覆盖率    5/5 都在 96%（阈值 90%），从未触发扣分——保持低权重
+#   记忆超限      0/5 触发
+SCORE_V4_VERSION = "v4"
+
+SCORE_V4_WEIGHTS = {
+    # 缺陷项（扣分）：权重 = 该维度"最坏情况"能扣掉多少分
+    "dups":         {"weight": 12.0, "scale": 1.0,  "label": "重复副本"},
+    "dangling":     {"weight": 10.0, "scale": 2.0,  "label": "悬空引用"},
+    "cron_errs":    {"weight": 14.0, "scale": 2.0,  "label": "cron 报错"},
+    "backup_flags": {"weight": 10.0, "scale": 1.0,  "label": "备份异常"},
+    "field_miss":   {"weight": 10.0, "scale": 40.0, "label": "必需字段缺失"},
+    "mem_over":     {"weight": 6.0,  "scale": 1.0,  "label": "MEMORY 超上限"},
+    "ver_rate":     {"weight": 6.0,  "scale": 0.15, "label": "版本覆盖率不足"},
+}
+
+# 正向项（加分）：权重 = 该项"满状态"能加回多少分
+SCORE_V4_BONUS = {
+    "cache_hit":   {"weight": 4.0, "label": "缓存命中率"},   # 50% 及以下不加，98%+ 满分
+    "search_ready": {"weight": 3.0, "label": "检索可用"},
+    "memory_fresh": {"weight": 3.0, "label": "记忆活跃"},
+}
+SCORE_V4_BONUS_CAP = 8.0   # 加分总额上限：再健康也不能盖过真实缺陷
+
+
+def _sat(n: float, weight: float, scale: float) -> float:
+    """单调饱和扣分：n=0→0，n 增大→逼近 weight。**替代 v3 的阶梯扣分**。
+
+    `1 - exp(-n/scale)` 的形状：scale 是"扣掉 63% 权重"时的数量级。
+    例：cron 报错 weight=14/scale=2 → 1 个扣 5.5、2 个扣 9.1、5 个扣 12.9、10 个 13.9。
+    对比 v3：1 个和 25 个都是 10 —— 这正是"分数卡在 75"的成因之一。
+    """
+    import math
+    if n <= 0:
+        return 0.0
+    return float(weight) * (1.0 - math.exp(-float(n) / max(1e-9, float(scale))))
+
+
+def health_score(skills, dups, dangling, ver_rate, missing, cron_errs, mem_over, backup_flags,
+                 cache_hit_rate=None, search_ready=None, memory_fresh=None):
+    """健康评分 0-100 + 状态灯（**v4：连续扣分 + 正向维度**）。
+
+    参数沿用 v3 的八个，另加三个可选正向输入（缺省 None = 该维度不参与：
+    采集不到就不打分，绝不按 0 或满分臆断——这是"不猜"纪律）。
+
+    返回 `(score, light, verdict, detail)`，detail 里带正负号便于人读。
+    """
+    items = []   # (分值, 带符号的原因)
+
+    # ── 缺陷项（扣分）──
+    w = SCORE_V4_WEIGHTS
     if dups:
-        items.append((15, f"重复副本 {len(dups)} 组"))
-    if skills and ver_rate < 0.9:  # P2：空库 0/0 不再触发假扣分
-        items.append((10, f"版本覆盖率 {ver_rate * 100:.0f}% <90%"))
+        d = _sat(len(dups), w["dups"]["weight"], w["dups"]["scale"])
+        items.append((-d, f"重复副本 {len(dups)} 组"))
     field_miss = sum(missing.values()) if missing else 0
     if field_miss > 0:
-        # v1.0：扣分分级（悬崖效应修正）——缺失 >100 扣 15，>10 扣 10，>0 扣 5
-        if field_miss > 100:
-            items.append((15, f"必需字段缺失 {field_miss} 项"))
-        elif field_miss > 10:
-            items.append((10, f"必需字段缺失 {field_miss} 项"))
-        else:
-            items.append((5, f"必需字段缺失 {field_miss} 项"))
+        d = _sat(field_miss, w["field_miss"]["weight"], w["field_miss"]["scale"])
+        items.append((-d, f"必需字段缺失 {field_miss} 项"))
     if dangling:
-        items.append((10, f"悬空引用 {len(dangling)} 个"))
+        d = _sat(len(dangling), w["dangling"]["weight"], w["dangling"]["scale"])
+        items.append((-d, f"悬空引用 {len(dangling)} 个"))
     if cron_errs:
-        items.append((10, f"cron 报错 {len(cron_errs)} 个"))
+        d = _sat(len(cron_errs), w["cron_errs"]["weight"], w["cron_errs"]["scale"])
+        items.append((-d, f"cron 报错 {len(cron_errs)} 个"))
     if mem_over:
-        items.append((5, "MEMORY 超字符上限"))
+        d = _sat(1, w["mem_over"]["weight"], w["mem_over"]["scale"])
+        items.append((-d, "MEMORY 超字符上限"))
     if backup_flags:
-        items.append((5, f"备份异常 {len(backup_flags)} 个"))
-    score = max(100 - sum(d for d, _ in items), 0)
+        d = _sat(len(backup_flags), w["backup_flags"]["weight"], w["backup_flags"]["scale"])
+        items.append((-d, f"备份异常 {len(backup_flags)} 个"))
+    # 版本覆盖率：只在真有技能时评（空库 0/0 不罚，沿用 v3 的 P2 修正）
+    if skills:
+        gap = max(0.0, 0.9 - float(ver_rate))
+        if gap > 0:
+            d = _sat(gap, w["ver_rate"]["weight"], w["ver_rate"]["scale"])
+            items.append((-d, f"版本覆盖率 {ver_rate * 100:.0f}% <90%"))
+
+    # ── 正向项（加分，总额封顶）──
+    bonus = 0.0
+    if cache_hit_rate is not None:
+        # 50% 及以下 = 0 分；98% 及以上 = 满分；中间线性
+        span = max(1e-9, 0.98 - 0.50)
+        r = min(1.0, max(0.0, (float(cache_hit_rate) - 0.50) / span))
+        b = SCORE_V4_BONUS["cache_hit"]["weight"] * r
+        if b > 0.05:
+            items.append((b, f"缓存命中率 {cache_hit_rate * 100:.1f}%"))
+            bonus += b
+    if search_ready:
+        b = SCORE_V4_BONUS["search_ready"]["weight"]
+        items.append((b, "检索 CLI 就绪"))
+        bonus += b
+    if memory_fresh:
+        b = SCORE_V4_BONUS["memory_fresh"]["weight"]
+        items.append((b, "记忆今日有活动"))
+        bonus += b
+    if bonus > 0:
+        overflow = bonus - SCORE_V4_BONUS_CAP
+        if overflow > 0:   # 加分封顶：按比例回缩，明细同步缩
+            k = SCORE_V4_BONUS_CAP / bonus
+            items = [(v * k if v > 0 else v, t) for v, t in items]
+
+    raw = 100.0 + sum(v for v, _ in items)
+    score = int(round(max(0.0, min(100.0, raw))))
     if score >= 80:
         light, verdict = "🟢 健康", "骨架健康"
     elif score >= 60:
         light, verdict = "🟡 亚健康", "可用但有欠账"
     else:
         light, verdict = "🔴 欠健康", "需优先治理"
-    detail = "、".join(f"{r}(-{d})" for d, r in items) if items else "无"
+    # 明细：保留一位小数，正负号区分加分/扣分；加分被封顶时注明，
+    # 否则用户会奇怪"三项加起来 10 分怎么总分只多了 8"。
+    parts = [f"{t}({v:+.1f})" for v, t in items] or ["无"]
+    if bonus > SCORE_V4_BONUS_CAP:
+        parts.append(f"正向加分封顶 {SCORE_V4_BONUS_CAP:.0f}（原始 {bonus:.1f}）")
+    detail = "、".join(parts)
     return score, light, verdict, detail
+
 
 
 def fmt_size(n):
@@ -630,7 +739,7 @@ def build_report(write_history: bool = True):
     except OSError:
         pass
     L.append(f"- 生态版本: {eco_ver}")
-    L.append("- 评分模型: v3（跨版本评分不可比）")
+    L.append(f"- 评分模型: {SCORE_V4_VERSION}（跨版本评分不可比；v3→v4 为连续扣分+正向维度重做）")
     L.append("- 口径声明: 技能/记忆/备份 = 目录实时统计 · cron = jobs.json 瞬时 + executions.db 近 7 天 · 评分 = 报告生成时点快照")
     L.append("")
 
@@ -655,13 +764,38 @@ def build_report(write_history: bool = True):
     jobs, (cron_errs, cron_oks) = cron_health()
     mem_over = any(name == "MEMORY.md" and chars > MEM_MAX_CHARS for name, size, chars in mem_out)
     backup_flags = [b for b in backs if b.get("flag")]
-    score, light, verdict, score_detail = health_score(skills, dups, dangling, ver_rate, missing,
-                                                       cron_errs, mem_over, backup_flags)
+    # v4 正向维度：采集不到就传 None（不参与打分），绝不臆断成 0 或满分
+    try:
+        _cache = collect_cache_stats()
+        _cache_hit = float(_cache["hit_rate"]) if _cache.get("available") else None
+    except Exception:      # noqa: BLE001 - 采集失败不该让体检崩
+        _cache_hit = None
+    try:
+        # 检索 CLI 是否可用：体检脚本自身所在目录（本文件就在 scripts/ 或
+        # src/memory_ecology/ 下，两种布局都找一遍）
+        _here = Path(__file__).resolve().parent
+        _search_ready = any((d / "eco_note_query.py").is_file()
+                            for d in (_here, _here.parent / "scripts", _here.parent))
+    except Exception:      # noqa: BLE001
+        _search_ready = None
+    # 记忆活跃：今日是否动过 MEMORY.md/USER.md（用 mtime 判，零成本）
+    try:
+        _mem_files = [HERMES_HOME / "memories" / n for n in ("MEMORY.md", "USER.md")]
+        _today = datetime.date.today()
+        _memory_fresh = any(
+            p.is_file() and datetime.date.fromtimestamp(p.stat().st_mtime) >= _today
+            for p in _mem_files)
+    except Exception:      # noqa: BLE001
+        _memory_fresh = None
+    score, light, verdict, score_detail = health_score(
+        skills, dups, dangling, ver_rate, missing,
+        cron_errs, mem_over, backup_flags,
+        cache_hit_rate=_cache_hit, search_ready=_search_ready, memory_fresh=_memory_fresh)
 
     # ===== 0. 执行摘要 =====
     L.append("## 0. 执行摘要")
     L.append("")
-    L.append(f"- 健康评分: **{score}/100**（{light}）——{verdict}（[v3 模型，跨版本不可比]）")
+    L.append(f"- 健康评分: **{score}/100**（{light}）——{verdict}（[{SCORE_V4_VERSION} 模型，跨版本不可比]）")
     # v1.1：趋势观测（读历史列表，同模型对比；append 保留 20 条）
     history = []
     if SCORE_HISTORY.exists():
@@ -673,7 +807,7 @@ def build_report(write_history: bool = True):
             history = []
     prev_score = None
     for h in reversed(history):
-        if isinstance(h, dict) and h.get("model") == "v3":
+        if isinstance(h, dict) and h.get("model") == SCORE_V4_VERSION:
             prev_score = h
             break
     if prev_score:
@@ -932,7 +1066,7 @@ def build_report(write_history: bool = True):
     L.append("*本报告由 eco_health_check.py v1.1 生成（正式版只读工具），设计稿 v0.8。变更记录：v2（一测 16 项修复）→ v3（二测 14 项修复）→ v3.1（复查 4 项）→ v1.0 正式版（三测准入评审 10 场景×10 轮，P0 五项 = 口径×3+标注+展示）→ v1.1（正式版一测 20 场景×5 轮，30+ 项修复：空目录除零/阈值告警时区死代码/并列截断/表格转义/趋势历史 append/gateway 维度/悬空自动核实/备份模式/字段容错）。*")
     # v1.1：趋势观测——append 记录本次评分（保留最近 20 条，同模型才对比）
     try:
-        history.append({"score": score, "time": now.strftime("%Y-%m-%d %H:%M"), "model": "v3"})
+        history.append({"score": score, "time": now.strftime("%Y-%m-%d %H:%M"), "model": SCORE_V4_VERSION})
         # 同分钟多次运行只保留最后一条（分钟粒度趋势图同一 x 只该有一个点）
         deduped = {}
         for h in history:
