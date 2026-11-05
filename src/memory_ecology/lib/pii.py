@@ -29,7 +29,7 @@ _ID_CAND = re.compile(r"(?<!\d)\d{17}[\dXx](?!\d)")
 # 16-19 位连续数字；18 位是否算银行卡由 _classify_long 再判。
 # 两侧排除 X/x：否则 18 位身份证（末位 X）会被银行卡规则截走前 17 位。
 _BANK_CAND = re.compile(r"(?<![\dXx])\d{16,19}(?![\dXx])")
-_MOBILE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
+_MOBILE = re.compile(r"(?<!\d)(?:\+?86)?1[3-9]\d{9}(?!\d)")  # 3.4.0（S40 折中）：+86/86 前缀为大陆手机号最高频漏检形态
 
 # 住址：显式标签（地址：xxx）与常见口语（家住xxx）
 _ADDR_LABEL = re.compile(
