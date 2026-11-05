@@ -714,15 +714,28 @@ def distill(root, dry_run: bool = False, llm=None) -> dict:
                 blocked.append({"id": it["name"], "why": "not-stable",
                                 "occ": occ, "sess": sess, "age_days": round(age, 1)})
                 continue
-            if _candidate_exists(root, it["body"]):
+            # trait 先算——**查重与写入用同一个 trait**（审计 01-P1-2：旧实现
+            # 写入用 trait(80)、查重用完整正文(60)，低词密度正文两边永不相等，
+            # 于是观察期归零 + 垃圾 trait 重复晋升）。
+            trait = _trait_of(it["body"], max_trait, llm)
+            # **归一后为空的 trait 不许进候选**：正文全是 `-`、标点、空格时
+            # （`"- - - ..."`），截断后的 trait 可能一个词字符都不剩。这种"画"进
+            # USER.md 毫无信息量，而且它的 `_cand_key` 是空串——会与所有其它
+            # 空键互相碰撞（fail-open 方向错了）。记一笔 skip 便于观测。
+            if not _cand_key(trait):
+                if not dry_run:
+                    ledger.distill_log(conn, "skip", it["name"],
+                                       "trait 归一后为空（正文无词字符）：%r" % trait[:40])
+                blocked.append({"id": it["name"], "why": "empty-trait"})
+                continue
+            if _candidate_exists(root, trait):
                 # **同一事实被更多会话印证 → 提升 corroborate**
                 # 旧实现只写死 `corroborate: "1"`，从来没有任何自增点，于是
                 # "交叉印证可提前晋升"这条旁路实际上只能靠手工改文件触发
                 # （实测：7 个会话重申同一句，corroborate 仍是 1）。
                 if not dry_run:
-                    _corroborate_candidate(root, it, conn)
+                    _corroborate_candidate(root, it, conn, trait)
                 continue
-            trait = _trait_of(it["body"], max_trait, llm)
             root.user_candidates.mkdir(parents=True, exist_ok=True)
             cname = _slug_of(trait) + ".md"
             # **corroborate 的初值 = 实际看到过这条事实的独立会话数**（数 `sessions`
@@ -744,7 +757,7 @@ def distill(root, dry_run: bool = False, llm=None) -> dict:
 
         # ---- 阶段 2：候选 → USER.md（观察期满 或 交叉印证）----
         for cf in sorted(root.user_candidates.glob("*.md")):
-            if cf.name.endswith((".promoted.md", ".rejected.md", ".approved")):
+            if _is_marked_candidate(cf.name):
                 continue
             fm, body = store.parse_frontmatter(paths.read_text(cf))
             if (fm.get("status") or "").strip().lower() not in ("observing", ""):
@@ -814,6 +827,22 @@ def distill(root, dry_run: bool = False, llm=None) -> dict:
         conn.close()
 
 
+_MARKED_RE = re.compile(r"\.(?:promoted|rejected|approved)(?:\.|$)")
+
+
+def _is_marked_candidate(name: str) -> bool:
+    """候选文件是否已被标记终态（promoted / rejected / approved）。
+
+    **不能用 `endswith(".promoted.md")`**（审计 01-P1-2 的放大器）：`_mark_candidate`
+    在目标名已存在时走 `"%s.%s.%s.md" % (cf.name, status, stamp_ms())`，
+    产出 `xxx.promoted.1730000000000.md`——不以 `.promoted.md` 结尾，于是
+    下一轮又把它当活候选再晋升一次、再改名一次，文件与账本无界增长。
+    这里按「`.promoted` / `.rejected` / `.approved` 出现在点号段」判定，
+    两种命名都能识别。
+    """
+    return bool(_MARKED_RE.search(str(name or "")))
+
+
 def _mark_candidate(cf: Path, status: str) -> None:
     """给候选文件改名标记终态（`promoted` / `rejected`）。
 
@@ -832,7 +861,25 @@ def _mark_candidate(cf: Path, status: str) -> None:
         pass
 
 
-def _corroborate_candidate(root, it: dict, conn) -> int:
+def _cand_key(trait: str) -> str:
+    """候选「是不是同一个事实」的**唯一判定口径**（单源）。
+
+    为什么必须是单源（审计 01-P1-2）：
+      旧实现两头口径错位——写入时候选正文是 `norm_text(body)[:80]`（trait，
+      80 字符），而查重时拿 `norm_key(条目完整正文)[:60]` 去比候选正文。
+      只要正文前 80 个 norm_text 字符里词字符不足 60（正文含大量 `-`、标点、
+      空格，例如 `"- - - ... 用户只在意简洁"`），两个键**永不相等** →
+      `_candidate_exists` 每轮都判"不存在" → 重写同名候选（`created` 归零，
+      30 天观察期结构性失效）→ 若 `sessions` ≥2 还当轮走交叉印证旁路把垃圾
+      trait 晋升进 USER.md，同时每轮多一个 `.promoted.<stamp>.md` 文件。
+
+    口径：先把 trait 归一成 key（去空白/标点/下划线），再截 60。
+    两端都调这一个函数，任何一端要改都必须同时改这里。
+    """
+    return paths.norm_key(trait)[:60]
+
+
+def _corroborate_candidate(root, it: dict, conn, trait: str = "") -> int:
     """把条目**真实见过的会话集合**并入对应的 observing 候选，返回新的 corroborate。
 
     **不能用条目名的哈希冒充会话**：那会凭空多算一个来源，于是"单会话反复重申"
@@ -843,7 +890,8 @@ def _corroborate_candidate(root, it: dict, conn) -> int:
     real = [x for x in str(fm.get("sessions") or "").split(",") if x]
     if not real:
         return 0
-    key = paths.norm_key(it["body"])[:60]
+    # 键必须与写入候选时**同一个来源**（候选正文就是 trait），见 `_cand_key`。
+    key = _cand_key(trait) if trait else _cand_key(_trait_of(it["body"], 80))
     d = root.user_candidates
     if not d.is_dir():
         return 0
@@ -851,7 +899,7 @@ def _corroborate_candidate(root, it: dict, conn) -> int:
         cfm, cbody = store.parse_frontmatter(paths.read_text(cf))
         if (cfm.get("status") or "").strip().lower() not in ("observing", ""):
             continue
-        if paths.norm_key(cbody)[:60] != key:
+        if _cand_key(cbody) != key:
             continue
         seen = set(x for x in str(cfm.get("sessions_seen") or "").split(",") if x)
         seen |= set(real)
@@ -872,20 +920,30 @@ def _source_still_active(root, source: str) -> bool:
     return True   # 源不在了（历史迁移）→ 不因缺证据而否决
 
 
-def _candidate_exists(root, body: str) -> bool:
-    key = paths.norm_key(body)[:60]
+def _candidate_exists(root, trait: str) -> bool:
+    """该 trait 是否已有候选文件（与写入口径同源，见 `_cand_key`）。"""
+    key = _cand_key(trait)
+    if not key:
+        return False
     d = root.user_candidates
     if not d.is_dir():
         return False
     for f in d.glob("*.md"):
         fm, b = store.parse_frontmatter(paths.read_text(f))
-        if paths.norm_key(b)[:60] == key:
+        if _cand_key(b) == key:
             return True
     return False
 
 
 def _trait_of(body: str, max_trait: int, llm=None) -> str:
-    """LLM 只做措辞；失败/未接 → 原文截断（**绝不因为没网就不动**）。"""
+    """LLM 只做措辞；失败/未接 → 原文截断（**绝不因为没网就不动**）。
+
+    **"截断"按词字符含量算，不是按位置截**（审计 01-P1-2）：机械 `text[:max_trait]`
+    在正文以大量 `-`/标点开头时（`"- - - ..."` 铺满前 80 字符）会得到一个
+    一个词字符都没有的"画像"，既毫无信息量、又让候选匹配键变成空串。
+    这里把截断点挪到"前 max_trait 个字符里至少有内容"的位置：
+    先看 `[:max_trait]`，若其中无词字符，则退到**首个含词字符的窗口**。
+    """
     text = paths.norm_text(body)
     if llm is not None:
         try:
@@ -894,6 +952,15 @@ def _trait_of(body: str, max_trait: int, llm=None) -> str:
                 text = out.strip()
         except Exception:   # noqa: BLE001 - fail-open 是承诺
             pass
+    head = text[:max_trait]
+    if paths.norm_key(head):
+        return head
+    # 窗口里全是标点/空白：把窗口起点右移到第一个有内容的位置，长度仍受 max_trait 约束。
+    # 找不到任何有内容的位置（整篇全是标点）→ 原样返回，由调用方按 empty-trait 拒收。
+    for start in range(1, len(text)):
+        window = text[start:start + max_trait]
+        if paths.norm_key(window):
+            return window
     return text[:max_trait]
 
 

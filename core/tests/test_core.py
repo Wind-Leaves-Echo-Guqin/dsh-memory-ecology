@@ -25,6 +25,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -991,6 +992,144 @@ class TestGate3(Base):
         self.cli("gate", "3")
         self.assertTrue(list((self.root_path / "memories").glob("USER.md.bak-蒸馏前-*")),
                         "写 USER.md 前没备份")
+
+
+class TestGate3CandidateKeySingleSource(Base):
+    """候选匹配键单源化（审计 01-P1-2，批5）。
+
+    旧口径两头错位：写入时候选正文是 `norm_text(body)[:80]`（trait），
+    查重却拿 `norm_key(条目完整正文)[:60]` 去比。**低词密度正文**（大量 `-`、
+    标点、空格，如 `"- - - ...用户只在意简洁"`）里词字符不足 60，两个键永不
+    相等，于是：
+      ① `_candidate_exists` 每轮判"不存在" → 重写同名候选，`created` 归零，
+         30 天观察期对这类条目结构性失效；
+      ② 若 `sessions` ≥2，当轮就走交叉印证旁路把垃圾 trait 晋升进 USER.md；
+      ③ 每轮多一个 `.promoted.<stamp>.md`（不被 `.promoted.md` 后缀跳过名单
+         识别），文件和账本无界增长。
+
+    这批用例覆盖旧测试完全没碰的低词密度形态。
+    """
+
+    # 形态 A：**审计实测的真实触发形态**——前 80 个 norm_text 字符里全是 `- `
+    # （词字符 0 个），真正的语义内容落在 80 字符之后。于是：
+    #   norm_key(完整正文)[:60] = "用户只在意简洁"   ← 旧查重键
+    #   norm_key(trait)[:60]    = ""                 ← 旧写入键（trait 截 80）
+    # 两键永不相等 → 每轮重判"不存在"→ 重写候选（created 归零）+ 2 会话时当轮
+    # 晋升，USER.md 被 "- - -" 污染、每轮多一个 .promoted.<stamp>.md。
+    SPARSE = "- " * 50 + "用户只在意简洁"
+    # 形态 B：**归一后一个词字符都没有**（纯标点）——不能进候选，否则空键会与
+    # 所有其它空键碰撞，且这种"画像"毫无信息量。
+    PUNCT_ONLY = "- - - - - - - - - - - - - - - - - - - - - - -"
+
+    def _stable(self, mid, sessions="s2", occ="2", sess="2"):
+        p = self.root_path / "memories" / "detail" / (mid + ".md")
+        fm, body = store.parse_frontmatter(p.read_text(encoding="utf-8"))
+        fm.update({"occurrences": occ, "session_count": sess, "sessions": sessions})
+        p.write_text(store.dump_frontmatter(fm, body), encoding="utf-8")
+        return p
+
+    def _cands(self):
+        d = self.root_path / "memories" / "user_candidates"
+        return sorted(d.glob("*.md")) if d.is_dir() else []
+
+    def test_sparse_body_candidate_is_not_recreated_every_round(self):
+        """形态 A：低词密度正文，第二轮必须认出"同一候选"，不重写 created。"""
+        self.init()
+        self.deposit(self.SPARSE, session="sess-one")
+        mid = self.cli("gate", "1")["ids"][0]
+        self._stable(mid)
+
+        self.cli("gate", "3")
+        first = self._cands()
+        self.assertEqual(len(first), 1, "第一轮应当产生 1 个候选，实际 %s" % [c.name for c in first])
+        cfm1, _ = store.parse_frontmatter(first[0].read_text(encoding="utf-8"))
+        created1 = cfm1.get("created")
+
+        # 第二轮：同一事实，必须判"已存在"→ 只 corroborate，不重写 created
+        out2 = self.cli("gate", "3")
+        self.assertEqual(out2["candidates"], 0,
+                         "第二轮又产了候选 —— 低词密度正文的匹配键与写入键仍不同源")
+        self.assertEqual(len(self._cands()), 1,
+                         "候选文件被重复创建：%s" % [c.name for c in self._cands()])
+        cfm2, _ = store.parse_frontmatter(self._cands()[0].read_text(encoding="utf-8"))
+        self.assertEqual(cfm2.get("created"), created1, "created 被重置 → 观察期归零")
+
+    def test_sparse_body_observation_period_still_blocks(self):
+        """形态 A：观察期必须真的挡住它（旧实现在 2 会话时当轮晋升、单会话也每轮重试）。"""
+        self.init()
+        self.deposit(self.SPARSE, session="sess-only")
+        mid = self.cli("gate", "1")["ids"][0]
+        self._stable(mid, sessions="sess-only")
+        out = self.cli("gate", "3")
+        self.assertEqual(out["candidates"], 1)
+        # 单会话 → corroborate=1 → 未满观察期，不许晋升
+        self.assertEqual(out["promoted"], 0,
+                         "低词密度 trait 被当轮晋升进 USER.md：%s" % out.get("promote"))
+        # 再跑一轮：仍然不许晋升，且不许再造一个新候选（旧实现两个都犯）
+        out2 = self.cli("gate", "3")
+        self.assertEqual(out2["promoted"], 0,
+                         "第二轮把它晋升了：%s" % out2.get("promote"))
+        self.assertEqual(out2["candidates"], 0,
+                         "第二轮又造了新候选（键不同源）")
+        self.assertEqual(len(self._cands()), 1,
+                         "候选文件增长：%s" % [c.name for c in self._cands()])
+
+    def test_punct_only_body_never_becomes_candidate(self):
+        """形态 B：归一后为空 → 不进候选、不晋升，且记 skip 账可观测。"""
+        self.init()
+        self.deposit(self.PUNCT_ONLY, session="sess-a")
+        mid = self.cli("gate", "1")["ids"][0]
+        self._stable(mid, sessions="sess-a,sess-b")
+        out = self.cli("gate", "3")
+        self.assertEqual(out["candidates"], 0,
+                         "纯标点正文产出了候选：%s" % [c.name for c in self._cands()])
+        self.assertEqual(out["promoted"], 0)
+        self.assertEqual(self._cands(), [])
+        reasons = [b.get("why") for b in out.get("blocked", [])]
+        self.assertIn("empty-trait", reasons, "被拒的原因要可观测：%s" % reasons)
+
+    def test_multiround_does_not_grow_candidate_files(self):
+        """③ 多轮不得无界增长（旧实现每轮多一个 .promoted.<stamp>.md）。"""
+        self.init()
+        self.deposit(self.SPARSE, session="sess-a")
+        mid = self.cli("gate", "1")["ids"][0]
+        self._stable(mid, sessions="sess-a,sess-b")   # 2 会话 → 首轮就够交叉印证
+        for _ in range(4):
+            self.cli("gate", "3")
+        names = [c.name for c in self._cands()]
+        self.assertLessEqual(len(names), 2,
+                             "候选文件随轮次增长：%s" % names)
+
+    def test_marked_candidate_suffix_variants_recognized(self):
+        """`.promoted.<stamp>.md` 与 `.promoted.md` 都必须被识别为终态。"""
+        for name in ("a.promoted.md", "a.promoted.1730000000000.md",
+                     "a.rejected.md", "a.rejected.1730000000000.md",
+                     "a.approved", "a.approved.1730000000000.md"):
+            self.assertTrue(gates._is_marked_candidate(name),
+                            "终态候选未被识别：%s（会被再次晋升 → 文件无界增长）" % name)
+        for name in ("normal.md", "a.md", "promoted.md.bak", "x.promotedx.md"):
+            self.assertFalse(gates._is_marked_candidate(name),
+                             "活候选被误判为终态，永远不会被晋升：%s" % name)
+
+    def test_cand_key_is_the_single_source(self):
+        """源码级：两端必须都走 `_cand_key`，不许再出现裸 `norm_key(...)[:60]`。
+
+        注意：docstring 里为了说明历史缺陷会**引用**旧写法，所以先剥掉
+        三引号字符串再扫，否则测试会因为"注释里提到它"而误报。
+        """
+        src = (Path(__file__).resolve().parents[1] / "src" / "memory_ecology"
+               / "gates.py").read_text(encoding="utf-8")
+        # 去掉 docstring / 注释行，只看真代码
+        code = re.sub(r'""".*?"""', "", src, flags=re.S)
+        code = re.sub(r"'''.*?'''", "", code, flags=re.S)
+        code = "\n".join(ln for ln in code.splitlines()
+                         if not ln.strip().startswith("#"))
+        bare = re.findall(r"norm_key\([^)]*\)\[:60\]", code)
+        self.assertEqual(len(bare), 1,
+                         "还有 %d 处裸 norm_key()[:60]（应全部走 _cand_key）：%s"
+                         % (len(bare), bare))
+        m = re.search(r"def _cand_key\(.*?(?=\ndef |\Z)", src, re.S)
+        self.assertIn("norm_key", m.group(0))
 
 
 # ── 门④ ──────────────────────────────────────────────────────────────
