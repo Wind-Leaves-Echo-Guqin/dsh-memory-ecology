@@ -1,6 +1,7 @@
 /** 外壳共用的小工具：时钟、帧率、服务心跳、诊断包、配额门倒计时。 */
 import { useEffect, useState } from 'react'
 import { copyText } from './ui'
+import { OBSERVATORY_VERSION_TAG } from './version'
 
 const WEEK = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
 
@@ -81,7 +82,7 @@ export function quotaGateCountdown(): string {
 
 /** 诊断包（对齐 v1 copyDiagnostic）：一键复制可读诊断段。 */
 export async function copyDiagnostic(bellCount: number): Promise<void> {
-  const lines: string[] = ['记忆生态 · 观测舱 v2.3（液态玻璃）诊断包', '生成时间：' + new Date().toLocaleString()]
+  const lines: string[] = [`记忆生态 · 观测舱 ${OBSERVATORY_VERSION_TAG}（液态玻璃）诊断包`, '生成时间：' + new Date().toLocaleString()]
   try {
     const meta = await (await fetch('/api/meta')).json()
     lines.push('生态版本：' + meta.version + ' · 评分模型：' + meta.score_model)

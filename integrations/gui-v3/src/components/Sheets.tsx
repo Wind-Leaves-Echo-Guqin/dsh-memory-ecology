@@ -41,8 +41,8 @@ export function Sheet() {
 }
 
 const FEATURES: Array<{ ico: string; color: string; title: string; body: string }> = [
-  { ico: 'gates', color: '#34c759', title: 'v3.2.0 · 四门实况', body: '哪个门死了、死了多久。区分「没跑」（账本一行都没有）与「空转」（有行全是心跳）——旧界面看不出后者，四门就是这样停摆两个月。' },
-  { ico: 'circles', color: '#0a84ff', title: 'v3.2.0 · 圈与记忆包', body: '多生态圈按启动目录自动隔离；记忆包可只读挂载（mount）或吸收（integrate，走门①）。新端点前缀 /api/v3.2.0/，与旧根九视图并存不混算。' },
+  { ico: 'gates', color: '#34c759', title: '四门实况 · v3.2.0 起', body: '哪个门死了、死了多久。区分「没跑」（账本一行都没有）与「空转」（有行全是心跳）——旧界面看不出后者，四门就是这样停摆两个月。' },
+  { ico: 'circles', color: '#0a84ff', title: '圈与记忆包 · v3.2.0 起', body: '多生态圈按启动目录自动隔离；记忆包可只读挂载（mount）或吸收（integrate，走门①）。新端点前缀 /api/v3.2.0/，与旧根九视图并存不混算。' },
   { ico: 'dashboard', color: '#0a84ff', title: '看健康', body: '主屏小组件 10 秒扫完：体检评分、记忆水位、告警与生态计数。点任意小组件进入对应应用。' },
   { ico: 'bell', color: '#ff9f0a', title: '处理告警', body: '点状态栏左侧时间打开通知中心；每条告警可「拷贝」或「去处理」。需要写入的动作一律走确认闸门。' },
   { ico: 'starmap', color: '#5e5ce6', title: '一个视图就是一个 App', body: '四门实况 / 圈的视角 / 注入观测 / 记忆包 / 圈管理 / 成本面板 / 急救箱，加上原有九个观测视图，都是独立应用，从图标放大启动。' },
