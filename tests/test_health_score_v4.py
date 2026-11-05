@@ -21,16 +21,37 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "src"))
-# eco_health_check 依赖 Hermes 树的 lib.*；生产树里有，测试时挂上去。
-# 找不到就跳过整组（不让环境缺失伪装成缺陷）。
+
+# **不要把 `REPO/src` 永久压进 sys.path**（2026-11-05 踩到）：
+# 本仓库的 `src/memory_ecology/` 是 **v3.1 历史线镜像**（没有 root.py），
+# 一旦它抢到 `memory_ecology` 包名，同进程里后面的测试
+# （test_gui_v3_2_0 的 `_root_readonly` → `import memory_ecology.root`）就会
+# 导入失败并被静默回落，导致"只读判定"整组失效——表现为**单独跑绿、一起跑红**。
+# 正确做法：用 importlib 按文件路径直接加载体检脚本，绕开包名竞争。
 _PROD_SCRIPTS = Path.home() / "AppData" / "Local" / "hermes" / "scripts"
-if _PROD_SCRIPTS.is_dir():
+if not (_PROD_SCRIPTS / "lib" / "config.py").is_file():
+    pytest.skip("需要 Hermes 树的 lib/ 才可导入体检脚本", allow_module_level=True)
+# lib.* 是平级包（`from lib.config import ...`），必须让它在 sys.path 上；
+# 但它与 memory_ecology 包名不冲突，加进去是安全的。
+if str(_PROD_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_PROD_SCRIPTS))
 
-pytest.importorskip("lib.config", reason="需要 Hermes 树的 lib/ 才可导入体检脚本")
 
-from memory_ecology import eco_health_check as h  # noqa: E402
+def _load_health_module():
+    """按路径加载 `src/memory_ecology/eco_health_check.py`，不污染包名。
+
+    脚本里的 `from lib.config import hermes_root` 依赖上面那条 sys.path，
+    其余依赖（json/math/pathlib）都在标准库。
+    """
+    import importlib.util
+    path = REPO / "src" / "memory_ecology" / "eco_health_check.py"
+    spec = importlib.util.spec_from_file_location("_eco_health_under_test", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+h = _load_health_module()
 
 
 def _base(**over):

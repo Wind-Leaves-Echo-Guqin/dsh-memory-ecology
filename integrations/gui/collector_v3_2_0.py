@@ -252,7 +252,14 @@ def _root_readonly(root: Path) -> tuple[bool, str]:
 
     进程内 import（零子进程、零写盘：`Root.__init__` 不写盘，`open(create=False)`
     也不写；`probe_writable` 会写一个 pid 唯一的小探针再删掉，这是核心本来
-    每次写操作前都会做的事）。核心不可用时回落 (False, "")——不猜一个原因出来。
+    每次写操作前都会做的事）。
+
+    **核心导入失败也要说出原因**（2026-11-05 修正）：早期版本 `except` 里直接
+    `return False, ""`——"核心用不了" 与 "根完全可写" 在返回值上无法区分。
+    实测踩到：同进程里若 `sys.path` 上有个 v3.1 历史线镜像（本仓库 `src/` 就是）
+    抢到 `memory_ecology` 包名，`import memory_ecology.root` 会 ModuleNotFound，
+    于是只读判定**静默失效**——根不可写也会报成可写。现在把失败原因如实返回，
+    让 meta 的 `readonly_reason` 能显示"核心不可用"，而不是伪装成一切正常。
     """
     src = find_eco_core()
     if src is not None:
@@ -262,10 +269,13 @@ def _root_readonly(root: Path) -> tuple[bool, str]:
     try:
         import importlib
         mod_root = importlib.import_module("memory_ecology.root")
+    except Exception as exc:  # noqa: BLE001 - 核心不可用：如实报告，不静默
+        return False, "core-unavailable:%s" % type(exc).__name__
+    try:
         r = mod_root.Root(root).open(create=False)
         return bool(r.readonly), str(r.reason or "")
-    except Exception:  # noqa: BLE001 - 核心不可用/根不存在：不猜原因
-        return False, ""
+    except Exception as exc:  # noqa: BLE001 - 根存在问题：同样如实报告
+        return False, "root-probe-failed:%s" % type(exc).__name__
 
 
 def meta() -> dict:

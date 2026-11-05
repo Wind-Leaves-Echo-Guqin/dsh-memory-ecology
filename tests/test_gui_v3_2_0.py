@@ -231,6 +231,34 @@ class TestMetaIsReadOnly:
         assert m["readonly"] is True
         assert m["readonly_reason"] == "root-not-initialized", m["readonly_reason"]
 
+    def test_root_readonly_reports_core_unavailable(self, tmp_path: Path, monkeypatch):
+        """核心导入失败时**必须说出原因**，不能静默报「可写」。
+
+        实测踩到（2026-11-05）：同进程里若 `sys.path` 上有个 v3.1 历史线镜像
+        （本仓库 `src/memory_ecology/` 就是，没有 root.py）抢到 `memory_ecology`
+        包名，`import memory_ecology.root` 会 ModuleNotFound，而早期实现 `except`
+        里直接 `return False, ""` —— 于是"核心用不了"与"根完全可写"返回值一样，
+        只读判定静默失效。现在失败原因如实进 `readonly_reason`。
+        """
+        monkeypatch.setattr(collector_v3_2_0, "ecoroot", lambda: tmp_path)
+        # 造一个"抢到包名但没有 root 子模块"的 v3.1 镜像
+        mirror = tmp_path / "mirror"
+        pkg = mirror / "memory_ecology"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text('__version__ = "3.1.0"\n', encoding="utf-8")
+        monkeypatch.setattr(collector_v3_2_0, "find_eco_core", lambda: mirror)
+        # 关键：把**已导入的真 core**驱逐出 sys.modules，再让镜像排在最前，
+        # 这样 `import memory_ecology.root` 才会真的命中镜像（没有 root.py）。
+        for name in list(sys.modules):
+            if name == "memory_ecology" or name.startswith("memory_ecology."):
+                monkeypatch.delitem(sys.modules, name, raising=False)
+        monkeypatch.syspath_prepend(str(mirror))
+
+        readonly, reason = collector_v3_2_0._root_readonly(tmp_path)
+        assert readonly is False
+        assert "core-unavailable" in reason, (
+            "核心导入失败却没有留下原因——只读判定会静默失效：%r" % (reason,))
+
     def test_core_ok_rejects_v31_mirror(self, tmp_path: Path, monkeypatch):
         """`core_ok` 不能按「能 import 到 memory_ecology」判定 —— v3.1 镜像会假报可达。"""
         pkg = tmp_path / "memory_ecology"
