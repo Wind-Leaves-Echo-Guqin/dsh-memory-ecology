@@ -1,5 +1,5 @@
 import { useEffect } from 'react'
-import { fetchCircles, fetchCoreStats, type CircleRow, type CirclesData, type CoreStats } from '../lib/api_v3_2_0'
+import { fetchCircles, fetchCirclesStats, fetchCoreStats, type CircleRow, type CirclesData, type CirclesStatsData, type CoreStats } from '../lib/api_v3_2_0'
 import { useAsync } from '../hooks/useAsync'
 import { EmptyArt } from '../lib/icons'
 import { ui, useUi, type ExportRow } from '../lib/ui'
@@ -8,6 +8,8 @@ import { ui, useUi, type ExportRow } from '../lib/ui'
  *
  * 圈是**同一数据根里的作用域**，不是多个数据根（多根 = 多门多 cron = N 个写者）。
  * 数字全部来自核心 `circles`，本视图不自己算——否则与插件口径必然漂移。
+ * v3.2.2+ 增强：尾段总闸（tail_max_chars）、跨圈命中建议（circles-stats，
+ * 旧核心自动降级隐藏）。
  */
 
 function Bar({ used, max }: { used: number; max: number }) {
@@ -16,14 +18,16 @@ function Bar({ used, max }: { used: number; max: number }) {
   return <div className="eco-bar"><i className={cls} style={{ width: pct + '%' }} /></div>
 }
 
-function CircleTable({ items }: { items: CircleRow[] }) {
+function CircleTable({ items, statRows }: { items: CircleRow[]; statRows: CirclesStatsData['rows'] }) {
+  const suggestOf = (id: string) => statRows.filter((r) => r.scope === id && r.suggest)
   return (
     <div className="table eco-circle-table">
       <div className="tr head">
         <span>圈</span><span>条目</span><span>目录条数</span><span>目录占用</span>
-        <span>来源</span><span>路由前缀</span><span>状态</span>
+        <span>来源</span><span>路由前缀</span><span>跨圈命中</span><span>状态</span>
       </div>
       {items.map(c => {
+        const sug = suggestOf(c.id)
         const pre = (c.match?.cwd_prefix ?? []).join(' , ')
         return (
           <div key={c.id} className="tr">
@@ -46,6 +50,15 @@ function CircleTable({ items }: { items: CircleRow[] }) {
               {pre || '—（按目录名）'}
             </span>
             <span>
+              {sug.length
+                ? sug.map((r, i) => (
+                  <span key={i} className="tag ok" title={`${r.routed || 'global'} 会话命中 ${r.hits} 次（去重 ${r.distinct}）`}>
+                    建议挂载 ·{r.distinct}
+                  </span>
+                ))
+                : <span className="faint" style={{ fontSize: 11 }}>—</span>}
+            </span>
+            <span>
               {c.readonly ? <span className="tag warn">只读</span> : <span className="tag ok">可写</span>}
               {(c.sources ?? []).length
                 ? <span className="tag" title={(c.sources ?? []).join(',')} style={{ marginLeft: 4 }}>
@@ -62,6 +75,7 @@ export default function CirclesView() {
   const s = useUi()
   const { data, err } = useAsync<CirclesData>(() => fetchCircles(), [s.refreshTick])
   const { data: st } = useAsync<CoreStats>(() => fetchCoreStats(), [s.refreshTick])
+  const { data: stats } = useAsync<CirclesStatsData>(() => fetchCirclesStats(), [s.refreshTick])
 
   useEffect(() => {
     const rows: ExportRow[] = (data?.items ?? []).map(c => ({
@@ -78,18 +92,20 @@ export default function CirclesView() {
   const items = data?.items ?? []
   const realCircles = items.filter(c => c.id !== 'global')
   const totalItems = items.reduce((a, b) => a + (b.count || 0), 0)
+  const statRows = stats?.rows ?? []
 
   return (
     <div className="dash view-enter">
       <div className="vh">
         圈的视角
-        <small>与核心 <span className="mono">circles</span> 逐值一致 · 双击圈看详情</small>
+        <small>与核心 <span className="mono">circles</span> 逐值一致 · 双击圈看详情 · 空间形态看「生态泡」</small>
       </div>
 
       <div className="eco-stats">
         <div className="eco-stat"><b className="num">{realCircles.length}</b><small>项目圈（另加 global）</small></div>
         <div className="eco-stat"><b className="num">{totalItems}</b><small>条目总数</small></div>
         <div className="eco-stat"><b className="num">{data?.global_budget_chars ?? '—'}</b><small>全局目录预算（字符）</small></div>
+        <div className="eco-stat"><b className="num">{data?.tail_max_chars ?? '—'}</b><small>副圈尾段总闸{data?.tail_max_chars ? '' : '（需 v3.2.2+ 核心）'}</small></div>
         <div className="eco-stat"><b className="num">{st?.detail ?? '—'}</b><small>detail 条数</small></div>
       </div>
 
@@ -109,8 +125,9 @@ export default function CirclesView() {
           <div className="row" style={{ marginBottom: 10 }}>
             <span className="chip">共 <b>{items.length}</b> 个圈</span>
             <span className="chip">来源 <b>{data?.source ?? 'core-cli'}</b></span>
+            {stats && !stats.available && <span className="chip">跨圈命中需 v3.2.2+ 核心（已降级）</span>}
           </div>
-          <CircleTable items={items} />
+          <CircleTable items={items} statRows={statRows} />
         </section>
       )}
 
@@ -123,6 +140,9 @@ export default function CirclesView() {
           <br />圈内条目只对本圈可见；<span className="mono">global</span> 对所有圈可见。
           <br /><b>路由</b>：cwd 前缀最长匹配 → 最近祖先圈 → 都不中则 global。
           <b>没声明就不猜</b>——按目录名判圈会让无关项目看到别的圈的机密（已修）。
+          <br /><b>v3.2.2+ 机制</b>：主圈 = 大气层（charter 规定 + 气候 + 基础物种，常驻不可挤掉）；
+          副圈 = 特化泡（目录随消息末端注入、会话中由 agent 热挂载/分离、多圈可同时启用）。
+          空间形态看「<b>生态泡</b>」应用。
         </div>
       </section>
     </div>

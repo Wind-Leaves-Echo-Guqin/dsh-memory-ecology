@@ -23,6 +23,7 @@ export const APPS: AppDef[] = [
   // ── v3.2.0 新根 ──
   { id: 'gates', name: '四门实况', ico: 'gates', bg: 'linear-gradient(160deg,#34c759,#0a7a2f)', hint: '哪个门死了、死了多久' },
   { id: 'circles', name: '圈的视角', ico: 'circles', bg: 'linear-gradient(160deg,#64d2ff,#0a84ff)', hint: '多生态圈 + 目录预算' },
+  { id: 'bubbles', name: '副圈详情', ico: 'circles', bg: 'linear-gradient(160deg,#30b0c7,#0a6b8a)', hint: '逐圈看详细信息：成员条目 / 预算 / 路由 / 跨圈命中' },
   { id: 'inject', name: '注入观测', ico: 'inject', bg: 'linear-gradient(160deg,#bf5af2,#5e5ce6)', hint: '这次注入有没有用' },
   { id: 'packs', name: '记忆包', ico: 'packs', bg: 'linear-gradient(160deg,#ffd60a,#c28b00)', hint: 'mount / integrate + 哈希校验' },
   { id: 'manage', name: '圈管理', ico: 'circles', bg: 'linear-gradient(160deg,#30b0c7,#0a6b8a)', hint: '编辑 circles.json（走确认闸门）' },

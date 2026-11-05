@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { fetchCoreFirstaid, runAction, type AidCheck, type AidData } from '../lib/api_v3_2_0'
+import { briefActionError, fetchCoreFirstaid, invalidateCore, runAction, type AidCheck, type AidData } from '../lib/api_v3_2_0'
 import { useAsync } from '../hooks/useAsync'
 import { Ico } from '../lib/icons'
 import { copyText, ui, useUi, type ExportRow } from '../lib/ui'
@@ -36,8 +36,8 @@ export default function FirstaidView() {
     setBusy(kind)
     try {
       const d = await runAction(kind, 'run')
-      ui.toast(d.ok ? '已完成' : '失败：' + (d.error || d.output || ''), d.ok)
-      if (d.ok) ui.bumpRefresh()
+      ui.toast(d.ok ? '已完成' : '失败：' + briefActionError(d), d.ok)
+      if (d.ok) { invalidateCore(); ui.bumpRefresh() }
     } finally { setBusy('') }
   }
 

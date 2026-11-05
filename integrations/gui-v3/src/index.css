@@ -911,6 +911,12 @@ html[data-appearance='light'] .notif { --glass-bg: rgba(255, 255, 255, 0.28); }
   display: flex; flex-direction: column; align-items: center;
   padding: 50px 24px 22px; cursor: default; touch-action: none;
   transition: transform 0.46s var(--ease), opacity 0.46s;
+  /* 2026-10-31：hash 深链直开应用时锁屏背后是前台应用，纯 .lock-dim 半透明
+     底会让应用内容透出来（测试实录）。加磨砂暗底——壁纸场景只是更"玻璃"，
+     应用场景则完全不可辨认（对齐 iOS 锁屏）。 */
+  background: linear-gradient(180deg, rgba(8, 10, 22, 0.55), rgba(8, 10, 22, 0.38) 45%, rgba(8, 10, 22, 0.58));
+  backdrop-filter: blur(30px) saturate(1.2);
+  -webkit-backdrop-filter: blur(30px) saturate(1.2);
 }
 .lock.leaving { transform: translateY(-100%); opacity: 0.4; }
 .lock-dim { position: absolute; inset: 0; z-index: -1; background: linear-gradient(180deg, rgba(0, 0, 0, 0.22), rgba(0, 0, 0, 0) 40%, rgba(0, 0, 0, 0.18)); pointer-events: none; }
@@ -1117,6 +1123,9 @@ html[data-appearance='light'] .view b[style*='color'] { filter: brightness(0.72)
 .eco-bar > i.bad { background: #ff453a; }
 
 .eco-circle-table .tr { grid-template-columns: 1fr 60px 86px 130px 66px 1fr 96px; align-items: center; }
+/* 副圈详情（G1d）：成员条目表 + 跨圈命中表 */
+.eco-detail-table .tr { grid-template-columns: 190px 66px 62px 1fr 52px 110px; align-items: center; }
+.eco-bridge-table .tr { grid-template-columns: 1fr 1fr 62px 74px 130px 84px; align-items: center; }
 .eco-inject-table .tr { grid-template-columns: 1fr 60px 60px 132px 110px 78px; align-items: center; }
 .eco-inject-recent .tr { grid-template-columns: 140px 1fr 60px 56px 60px; align-items: center; }
 .eco-pack-table .tr { grid-template-columns: 1fr 72px 74px 82px 128px 52px 1fr 72px; align-items: center; }

@@ -102,9 +102,58 @@ export type CircleRow = {
   match: { cwd_prefix?: string[] }
   display_name: string
 }
-export type CirclesData = { items: CircleRow[]; global_budget_chars: number; source?: string }
+export type CirclesData = {
+  items: CircleRow[]
+  global_budget_chars: number
+  source?: string
+  // 多生态圈（v3.2.2+ 核心才有；旧核心缺省 → 视图按 undefined 降级）
+  tail_max_chars?: number
+}
 export const fetchCircles = (ttl = 5000) =>
   cached('corecircles', ttl, '/api/v3.2.0/circles') as Promise<unknown> as Promise<CirclesData>
+
+// ── 多生态圈：跨圈命中聚合 + 主圈物理法则（能力探测，旧核心 → available:false）──
+export type CircleStatsRow = {
+  routed: string
+  scope: string
+  hits: number
+  distinct: number
+  last_ts: string
+  suggest: boolean
+}
+export type CirclesStatsData = {
+  available: boolean
+  reason?: string
+  rows: CircleStatsRow[]
+  suggest_after?: number
+  count?: number
+  total?: number
+}
+export const fetchCirclesStats = (ttl = 8000) =>
+  cached('corecirclesstats', ttl, '/api/v3.2.0/circles/stats') as Promise<unknown> as Promise<CirclesStatsData>
+
+// ── 单圈详情：该圈聚合行 + 成员条目清单（catalog --scope）──
+export type CircleDetailItem = {
+  id: string
+  kind: string
+  line: string
+  chars: number
+  hits: number
+  updated: string
+  item_scope: string
+}
+export type CircleDetailData = {
+  ok: boolean
+  error?: string
+  scope: string
+  row: CircleRow | null
+  items: CircleDetailItem[]
+  total?: number
+  used_chars?: number
+  budget_chars?: number
+}
+export const fetchCircleDetail = (scope: string) =>
+  j(`/api/v3.2.0/circles/detail?scope=${encodeURIComponent(scope)}`) as Promise<unknown> as Promise<CircleDetailData>
 
 export type CircleConfig = {
   circles: unknown[]
@@ -202,6 +251,19 @@ export type ActionResult = {
   error?: string
   ms?: number
   cmd?: string
+}
+
+/** 动作失败的人话摘要：output 常是核心 CLI 的 JSON 整串（`detail` 才是人读原因），
+ * 直接塞进 toast 会糊一屏花括号（2026-10-31 测试实录）。优先 detail → error → 原文。 */
+export const briefActionError = (d: ActionResult): string => {
+  const raw = (d.error || d.output || '').trim()
+  if (!raw) return '未知错误（详见动作日志）'
+  try {
+    const j = JSON.parse(raw) as { detail?: string; error?: string }
+    return j.detail || j.error || raw
+  } catch {
+    return raw
+  }
 }
 export const runAction = async (
   name: string, stage: 'dry' | 'run', params: Record<string, string> = {},

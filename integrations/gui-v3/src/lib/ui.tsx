@@ -8,6 +8,8 @@ export type ViewId =
   | 'candidates' | 'timeline' | 'health' | 'actions' | 'settings'
   // v3.2.0 新增（dsh 根口径；与上面九个旧根视图**并存，不混算**）
   | 'gates' | 'circles' | 'inject' | 'packs' | 'manage' | 'cost' | 'firstaid'
+  // 多生态圈（副圈详情：简单页面式，逐圈看详细信息）
+  | 'bubbles'
 
 export const VIEW_TITLE: Record<ViewId, string> = {
   dashboard: '驾驶舱', memories: '记忆库', experiences: '经验笔记本', starmap: '技能星图',
@@ -15,6 +17,7 @@ export const VIEW_TITLE: Record<ViewId, string> = {
   actions: '动作日志', settings: '设置',
   gates: '四门实况', circles: '圈的视角', inject: '注入观测', packs: '记忆包',
   manage: '圈管理', cost: '成本面板', firstaid: '急救箱',
+  bubbles: '副圈详情',
 }
 
 export type Focus =

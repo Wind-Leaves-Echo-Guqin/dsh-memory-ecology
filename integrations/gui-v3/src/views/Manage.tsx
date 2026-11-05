@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import {
-  fetchCirclesConfig, fetchCoreMeta, runAction, type CircleConfig, type CoreMeta,
+  briefActionError, fetchCirclesConfig, fetchCoreMeta, invalidateCore, runAction, type CircleConfig, type CoreMeta,
 } from '../lib/api_v3_2_0'
 import { useAsync } from '../hooks/useAsync'
 import { copyText, ui, useUi, type ExportRow } from '../lib/ui'
@@ -26,6 +26,37 @@ const SAMPLE = `{
       "catalog_limit": 20,
       "readonly": false,
       "sources": []
+    }
+  ]
+}`
+
+/** 首批副圈模板（docs/首批副圈-circles.json 的口径；dsh 生态开发 + 量化实验室）。
+ * 载入 ≠ 写入——仍走「校验并写入」的确认闸门（核心 circles-write）。 */
+const FIRST_BATCH = `{
+  "global_budget_chars": 600,
+  "circles": [
+    {
+      "id": "dsh-eco-dev",
+      "display_name": "dsh 记忆生态开发",
+      "match": {
+        "cwd_prefix": [
+          "D:/work/dsh-memory-ecology",
+          "C:/Users/qy160/dsh-memory-ecology",
+          "C:/Users/qy160/qq-gateway",
+          "C:/Users/qy160/eco-ops-live"
+        ]
+      },
+      "budget_chars": 800,
+      "catalog_limit": 20
+    },
+    {
+      "id": "quant-lab",
+      "display_name": "量化实验室",
+      "match": {
+        "cwd_prefix": ["D:/work/quant-lab"]
+      },
+      "budget_chars": 600,
+      "catalog_limit": 16
     }
   ]
 }`
@@ -90,9 +121,9 @@ export default function ManageView() {
                   setBusy(true)
                   try {
                     const r = await runAction('circle_write', 'run', { json: JSON.stringify(parsed) })
-                    setHint({ ok: r.ok, msg: r.ok ? '已写入并重建目录视图' : (r.error || r.output || '失败') })
+                    setHint({ ok: r.ok, msg: r.ok ? '已写入并重建目录视图' : ('失败：' + briefActionError(r)) })
                     ui.toast(r.ok ? '圈配置已应用' : '写入失败', r.ok)
-                    if (r.ok) { ui.closeDrawer(); ui.bumpRefresh() }
+                    if (r.ok) { invalidateCore(); ui.closeDrawer(); ui.bumpRefresh() }
                   } finally { setBusy(false) }
                 }}>确认写入</button>
             </div>
@@ -137,6 +168,9 @@ export default function ManageView() {
         <div className="row" style={{ marginTop: 10 }}>
           <button className="btn" disabled={busy} onClick={() => void submit()}>
             {busy ? '处理中…' : '校验并写入'}
+          </button>
+          <button className="ghost-btn" onClick={() => { setText(FIRST_BATCH); setHint(null) }}>
+            载入首批副圈模板（dsh-eco-dev + quant-lab）
           </button>
           <button className="ghost-btn" onClick={() => { setText(''); ui.bumpRefresh() }}>
             还原为磁盘内容

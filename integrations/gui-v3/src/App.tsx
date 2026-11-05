@@ -78,7 +78,7 @@ export default function App() {
       c: 'candidates', t: 'timeline', h: 'health', a: 'actions', ',': 'settings',
       // v3.2.0 新视图：g 前缀 + 单键（避开已占用的 d/m/e/s/l/c/t/h/a）
       g: 'gates', o: 'circles', i: 'inject', p: 'packs',
-      k: 'manage', $: 'cost', f: 'firstaid',
+      k: 'manage', $: 'cost', f: 'firstaid', b: 'bubbles',
     }
     let gPending = false
     let gTimer = 0

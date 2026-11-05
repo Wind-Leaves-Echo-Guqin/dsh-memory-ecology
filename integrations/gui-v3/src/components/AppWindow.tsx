@@ -17,6 +17,7 @@ import ActionsView from '../views/ActionsView'
 import Settings from '../views/Settings'
 import GatesView from '../views/Gates'
 import CirclesView from '../views/Circles'
+import CircleDetailView from '../views/CircleDetail'
 import InjectView from '../views/Inject'
 import PacksView from '../views/Packs'
 import ManageView from '../views/Manage'
@@ -35,6 +36,7 @@ function ViewRouter({ view }: { view: ViewId }) {
     case 'actions': return <ActionsView />
     case 'gates': return <GatesView />
     case 'circles': return <CirclesView />
+    case 'bubbles': return <CircleDetailView />
     case 'inject': return <InjectView />
     case 'packs': return <PacksView />
     case 'manage': return <ManageView />

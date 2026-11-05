@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { fetchPacks, runAction, type PackRow } from '../lib/api_v3_2_0'
+import { fetchPacks, invalidateCore, runAction, type PackRow } from '../lib/api_v3_2_0'
 import { useAsync } from '../hooks/useAsync'
 import { EmptyArt } from '../lib/icons'
 import { ui, useUi, type ExportRow } from '../lib/ui'
@@ -55,7 +55,7 @@ export default function PacksView() {
                   try {
                     const d = await runAction(name, 'run', { id: p.id })
                     ui.toast(d.ok ? '已停用 ' + p.id : '失败：' + (d.error || ''), d.ok)
-                    if (d.ok) { ui.closeDrawer(); ui.bumpRefresh() }
+                    if (d.ok) { invalidateCore(); ui.closeDrawer(); ui.bumpRefresh() }
                   } finally { setBusy('') }
                 }}>确认停用</button>
             </div>
@@ -68,7 +68,7 @@ export default function PacksView() {
     try {
       const d = await runAction(name, 'run', { id: p.id })
       ui.toast(d.ok ? '已启用 ' + p.id : '失败：' + (d.error || ''), d.ok)
-      if (d.ok) ui.bumpRefresh()
+      if (d.ok) { invalidateCore(); ui.bumpRefresh() }
     } finally { setBusy('') }
   }
 

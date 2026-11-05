@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { fetchGates, runAction, type GateRow, type GatesData } from '../lib/api_v3_2_0'
+import { briefActionError, fetchGates, invalidateCore, runAction, type GateRow, type GatesData } from '../lib/api_v3_2_0'
 import { useAsync } from '../hooks/useAsync'
 import { Ico } from '../lib/icons'
 import { ui, useUi, type ExportRow } from '../lib/ui'
@@ -81,8 +81,8 @@ export default function GatesView() {
     setBusy(true)
     try {
       const d = await runAction('core_maintain', 'run')
-      ui.toast(d.ok ? '四门已跑完（写前已自动备份）' : '失败：' + (d.error || '见动作日志'), d.ok)
-      if (d.ok) ui.bumpRefresh()
+      ui.toast(d.ok ? '四门已跑完（写前已自动备份）' : '失败：' + briefActionError(d), d.ok)
+      if (d.ok) { invalidateCore(); ui.bumpRefresh() }
     } finally {
       setBusy(false)
     }
