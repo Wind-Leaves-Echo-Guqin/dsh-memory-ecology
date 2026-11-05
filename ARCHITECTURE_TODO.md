@@ -16,7 +16,50 @@
 - **S15 收尾阻塞：维持同步 await**（接受 f9b5ebb 设计辩护：串行链+节流）。登记为观察项——用户报告「收尾慢」时再实测并考虑异步化。
 - **S40 PII 口径：折中落地**——补 +86/86 前缀（最高频形态，0f71cc4）；座机/全角/at-email 维持审计「边界」判定并登记不修。
 - **#4/#5（runner 沙箱 / 门④频率）：维持暂缓**——需生产观测数据，非本会话可取证。
-- **R8（GUI 性能）与 05-P1-1/2/3**：仍闸在观测舱线脏区（红线 9），脏区提交后动刀。
+- **R8（GUI 性能）与 05-P1-1/2/3**：仍闸在观测舱线脏区（红线 9），脏区提交后动刀。**→ 2026-11-05 下午已解闸并全部完成（见 〇-vi 段）**。
+## 〇-vi、v3.4.0 R8 + GUI 三件 P1 + 批5 销账（2026-11-05 接手轮）
+
+驱动：3.4.0 收口交接 §6「下一步」第 2-4 项（R8 / GUI 三件 P1 / 批5）。交接时闸门已解除
+（观测舱脏区在前一棒代提交 ea20cf6/8b90866/9bda900/1fb0435 落库，C 仓工作区全空）。
+
+### 已销账（每项都带「先证红」的回归）
+
+- **R8 GUI 首屏性能拆包 ✓**（C 仓 `f2bb848`）
+  - 18 个视图从 AppWindow.tsx 静态 import 改 `React.lazy` + `<Suspense>`（Dashboard 保持静态——它是首屏默认视图，动态加载会多一跳白屏）。
+  - vite.config.ts 用 `build.rolldownOptions.output.codeSplitting.groups` 显式分三组：`react` / `three` / `charts`。**Vite 8 是 rolldown，`manualChunks` 已废弃**（写了也被 codeSplitting 覆盖）。
+  - 实测：入口 `index-*.js` **1009.39 kB → 97.6 kB**，新增 `react-*.js` 218.8 kB，`three-*.js` 552.7 kB 独立成块**只在进 3D 视图时拉**。首屏 raw 1009→316 kB（gzip 280→101 kB）。
+  - 验收用 CDP 无头 Edge 逐视图跑（脚本 `D:\work\_eco_cdp_check.mjs`）：**18/18 视图真渲染出内容**（innerText>0、无 `.view-loading` 残留），各只拉自己那个 chunk，首屏请求序列里没有 three。这是本项目第一次有 GUI 运行时（而非仅构建体积）的验收证据。
+  - 顺手把 gui-v3 `node_modules` 从「指向 `D:\archive\...\gui-v2\node_modules` 的 Junction」换成正常 `npm install` + 落 `package-lock.json`。隐患写进 README：归档是只进不出冷备，`npm install` 会**写穿联接改到另一个前端**，归档一移构建就崩。
+  - 遗留（非本次引入）：`BlackHole` 引用的 `textures/milkyway.jpg` 在仓库与 dist 均不存在 → `/v3/textures/milkyway.jpg` 恒 404（星系视界星空贴图缺失），已登记待修。
+
+- **05-P1-1 first_aid 假修复 ✓**（C 仓 `eac0f04`）
+  旧口径「ok=False + 带处置文案 + --fix → fixed」把库损坏/数据根缺失/检索 CLI 缺失/cron 报错全报成已修，`all_ok` 恒 True、退出码恒 0。现在 `fixed` 必须由真执行过修复的调用点显式给、且**复评通过**；探针失败（拿不到证据）一律不算修好；`--fix` 输出里 fixed 与 ok 分开显示（旧写法两者都是 ✅，🔧 分支永不可达）。
+  回归 `tests/test_gui_security.py::TestFirstAidStatusMachine`（5 条，先证红 3 红）。
+
+- **05-P1-2 publish_compat SystemExit 绕过清场 ✓**（C 仓 `eac0f04`）
+  `except SystemExit: raise` 直接重抛，而 build() 内三处 SystemExit 都在**已写入几百个文件之后** → 半新半旧发布树留下。现在同样清场（保 .git）再重抛。
+  **关键约束**：清场以 `_PUBLISH_TOUCHED` 为闸——build 开头两道**拒绝型** SystemExit（--out 指向开发树 / 无 .git 陌生目录）时树原封未动，清场会去删「刚刚才拒绝清空的目录」。旗标在**进入破坏性清空循环之前**置位（评审抓到的窗口：置在循环后，循环中途 unlink 抛 OSError 就留下半清空树且无提示），且每次进 build 先复位。
+  回归 `tests/test_publish_rollback.py`（6 条，先证红）。
+
+- **05-P1-3 meta() 的 init 写副作用 ✓**（C 仓 `eac0f04`）
+  `core_call(["init"])` 在 TTL 缓存外 → healthz(20s)/meta(8s) 每轮 spawn 一个**写**子进程、GET 有建根副作用。现在 meta 纯只读零子进程（读 `.eco/root.json` + 进程内 import 版本），建根拆成 `ensure_root()` 只在 eco_gui 启动调一次。
+  只读成因**直接问核心 `Root.open()`**（四种：root.json-corrupt / root-not-initialized / schema-mismatch:N / root-not-writable）——本地重推一种会把「root.json 损坏」误报成「schema 需要迁移」，处置方向相反。`core_ok` 用 `_is_v3_2_0` 判据而非「能 import」，否则仓库里 v3.1 平移镜像会被报成核心可达。
+  回归 `tests/test_gui_v3_2_0.py::TestMetaIsReadOnly`（4 条，先证红 3 红）。实测：GUI 起在 8793 连轮询 10 轮 meta+healthz，**init 子进程数 0**。
+
+- **批5 01-P1-2 候选匹配键单源化 ✓**（D 仓 `941cb76` → C 仓镜像 `f4c9646`）
+  写入用 trait(80)、查重用完整正文(60)，正文以 `"- " * 50 + 语义` 开头时两键永不相等 → 每轮重造候选（created 归零、观察期结构性失效）+ 2 会话时当轮把 `- - -` 晋升进 USER.md + 每轮多一个 `.promoted.<stamp>.md`。**修复前已独立复现**：3 轮 candidates 各 1、promoted 1/1/2、文件 1→3、USER.md 全是 `- - -`。
+  三处修法：`_cand_key()` 成唯一判定口径；`_is_marked_candidate()` 按点号段识别三种终态（认 `.promoted.<stamp>.md`）；`_trait_of()` 截断改「按词字符含量取窗口」（前 80 全是标点时右移到第一个有内容的位置），纯标点正文直接拒收并记 `skip` + blocked `empty-trait`。
+  回归 `tests/test_core.py::TestGate3CandidateKeySingleSource`（6 条，先证红 6/6 全红）。全量：D 仓 run_tests 7/7、C 仓 core 7/7 + pytest 42 + src 192。
+
+### 既有 flaky（登记，非本轮引入）
+- **mutation 组 M2c（append_line 去并发锁）是概率性变异体**：靠 Windows `O_APPEND` 非原子性的 ~8% 竞态触发，测试注释自己记录过「连跑 15 次有 4 次存活」。本轮全量首跑遇到一次该组红、随后连跑 4 次全绿。判读方法：只看 `必测清单：N/N 被抓到`，单次红先重跑再定性。
+
+### 仍然在案
+- **R4 五账一形 / runner 零正则**：未动（体量大，可能跨月）。
+- **R9 v1 记忆海**：设计已定案（D 仓 `docs/记忆海与知识网-设计-R9.md` §7），未动工。
+- **01-P1-1 圈隔离族（批3）/ 02-P1-1 hermes 水位线（生产线，走 eco-ops-live 协议）/ 03 线（bridge 独立仓）**：按原计划未动。
+- **`textures/milkyway.jpg` 缺失**（R8 验收时发现）：星系视界星空贴图恒 404，需补贴图或改代码容忍。
+
 ## 〇-v、v3.4.0 更新销账（2026-11-05，3.4.0 重构）
 
 驱动：3.4.0 重构总交接（2026-11-04/05）+ 142 条审计 + REVIEW 50 条 triage + 用户拍板。
