@@ -1,28 +1,34 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { invalidate } from '../lib/api'
 import { Ico } from '../lib/icons'
 import { copyDiagnostic } from '../lib/sys'
 import { exportView, ui, useUi, VIEW_TITLE, type ViewId } from '../lib/ui'
 import { APP, AppGlyph, DOCK, Glass, appRect } from './kit'
 import { useBadges } from './HomeScreen'
+
+/** 18 个视图全部按需加载（R8 拆包）：视图静态 import 会把 three.js 和所有图表
+ * 拖进首屏单一 chunk（实测 1009KB）。Dashboard 仍是首屏默认视图，保持静态引入
+ * 以免打开应用时多一跳白屏；其余视图点开才拉，配 `<Suspense>` 占位。
+ * 约定：**任何视图都不要再被外壳静态 import 回来**，否则拆包失效（chunk 合并）。 */
 import Dashboard from '../views/Dashboard'
-import Memories from '../views/Memories'
-import Experiences from '../views/Experiences'
-import Nebula from '../views/Nebula'
-import Lineage from '../views/Lineage'
-import Candidates from '../views/Candidates'
-import Timeline from '../views/Timeline'
-import Health from '../views/Health'
-import ActionsView from '../views/ActionsView'
-import Settings from '../views/Settings'
-import GatesView from '../views/Gates'
-import CirclesView from '../views/Circles'
-import CircleDetailView from '../views/CircleDetail'
-import InjectView from '../views/Inject'
-import PacksView from '../views/Packs'
-import ManageView from '../views/Manage'
-import CostView from '../views/Cost'
-import FirstaidView from '../views/Firstaid'
+
+const Memories = lazy(() => import('../views/Memories'))
+const Experiences = lazy(() => import('../views/Experiences'))
+const Nebula = lazy(() => import('../views/Nebula'))
+const Lineage = lazy(() => import('../views/Lineage'))
+const Candidates = lazy(() => import('../views/Candidates'))
+const Timeline = lazy(() => import('../views/Timeline'))
+const Health = lazy(() => import('../views/Health'))
+const ActionsView = lazy(() => import('../views/ActionsView'))
+const Settings = lazy(() => import('../views/Settings'))
+const GatesView = lazy(() => import('../views/Gates'))
+const CirclesView = lazy(() => import('../views/Circles'))
+const CircleDetailView = lazy(() => import('../views/CircleDetail'))
+const InjectView = lazy(() => import('../views/Inject'))
+const PacksView = lazy(() => import('../views/Packs'))
+const ManageView = lazy(() => import('../views/Manage'))
+const CostView = lazy(() => import('../views/Cost'))
+const FirstaidView = lazy(() => import('../views/Firstaid'))
 
 function ViewRouter({ view }: { view: ViewId }) {
   switch (view) {
@@ -45,6 +51,16 @@ function ViewRouter({ view }: { view: ViewId }) {
     case 'settings': return <Settings />
     default: return <Dashboard />
   }
+}
+
+/** 懒加载视图的占位：保持与视图同级布局，避免切视图时外壳跳动 */
+function ViewLoading() {
+  return (
+    <div className="view-loading" role="status" aria-live="polite">
+      <span className="view-loading-dot" aria-hidden="true" />
+      正在加载…
+    </div>
+  )
 }
 
 const EASE = 'cubic-bezier(.32,.72,0,1)'
@@ -147,7 +163,9 @@ function AppWindow({ closing, onClosed }: { closing: boolean; onClosed: () => vo
       <div className="appwin-content">
         <div className="appwin-scroll" ref={scrollRef} onScroll={onScroll}>
           <main className="view" key={`${s.view}:${s.animLevel}`}>
-            <ViewRouter view={s.view} />
+            <Suspense fallback={<ViewLoading />}>
+              <ViewRouter view={s.view} />
+            </Suspense>
           </main>
         </div>
         <div className="scroll-edge top" aria-hidden="true" />

@@ -75,4 +75,28 @@ npm run build   # tsc -b && vite build → dist/（dist 不入库）
 - **3D 特效未按 iOS 重着色**：Nebula/BlackHole/LineageView 原样承载（技能星图改为沉浸式全屏）。
 - **主屏只有一页**，没有图标拖拽排序 / 文件夹 / 小组件编辑。
 - **SF Pro 字体未内置**（版权），Windows 上回退 Segoe UI Variable / 微软雅黑。
-- 构建产物单 chunk 约 950 KB（three.js 占大头），vite 有体积提示，未做代码分割。
+
+## 构建体积（R8 拆包，2026-11-05）
+
+历史上全部 18 视图静态 import，首屏吃下整个应用**单 chunk 1009 KB**（three.js 占 552 KB），
+而 three 只被 3 个 3D 视图用、且 `Timeline` 默认形态（星系视界）静态引 `BlackHole`，
+于是连"打开驾驶舱"都要先下载完 3D 引擎。
+
+现在的口径（改之前先看，别改回去）：
+
+- 视图一律 `React.lazy` + `<Suspense>`（`AppWindow.tsx`），只有 `Dashboard` 保持静态
+  import——它是首屏默认视图，动态加载会多一跳白屏。
+- `vite.config.ts` 的 `codeSplitting.groups` 显式分三块：`react`（React 运行时）、
+  `three`（three.js + addons）、`charts`（自家 SVG 图表生成器）。
+  **不要**改成"所有 node_modules 一个 vendor"——那只是换个名字继续首屏 700 KB。
+- 实测：首屏入口 `index-*.js` 97 KB + `react-*.js` 219 KB（gzip 合计 ~101 KB），
+  `three-*.js` 552 KB 只在进 3D 视图时拉。验收脚本：`D:\work\_eco_cdp_check.mjs`
+  （CDP 逐视图验「chunk 到位 + 真的渲染出来」，18/18）。
+- `chunkSizeWarningLimit: 800` 是给 three 单块用的；调小会一直红。
+
+## 依赖安装
+
+`node_modules` 必须在本目录**正常 `npm install`**（有 `package-lock.json` 锁版本）。
+2026-10-30 曾用 Junction 指向 `D:\archive\...\gui-v2\node_modules` 临时救急，隐患是：
+归档目录是"只进不出"的冷备，`npm install` / 装包会**写穿联接改到归档里的另一个前端**；
+且归档一旦移动，构建直接崩。2026-11-05 已改回正常安装（35 包，`npm install` 24s）。

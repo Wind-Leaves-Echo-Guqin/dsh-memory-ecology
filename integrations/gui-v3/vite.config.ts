@@ -16,11 +16,35 @@ import { defineConfig } from 'vite'
  * `npm run dev` 固定 5178（与 v2.1 的 5175、v2.2 的 5176、v2.3 的 5177 并排）；
  * /api 代理到 8788。
  * cacheDir 指到本目录：node_modules 是指向 gui-v2 的目录联接，默认缓存会写穿联接污染 gui-v2。
+ *
+ * R8 拆包（2026-11-05）：视图改 React.lazy 后，再把 three 单独分成一个 chunk。
+ * 只用动态 import 时 rolldown 仍可能把 three 塞进首个使用者所在的 chunk（Timeline
+ * 静态引用 BlackHole → 首屏 1009KB 的教训），所以显式分组：
+ *   - `react`：react / react-dom 运行时（发版只改业务代码时浏览器仍能命中缓存）
+ *   - `three`：three.js 及其 addons（Nebula / BlackHole / LineageView 共用）
+ *   - `charts`：自家图表 SVG 生成器（被时间线/驾驶舱共用，单独成块便于缓存）
+ * 分组不能写成"所有 node_modules 一个 vendor"——那只是换个名字继续首屏 700KB。
  */
 export default defineConfig({
   plugins: [react()],
   base: '/v3/',
   cacheDir: fileURLToPath(new URL('./.vite-cache', import.meta.url)),
+  build: {
+    // 拆包后单视图 chunk 仍可能超过默认 500KB 告警线（three 本身约 550KB），
+    // 这是预期结果，不是缺陷；提到 800KB 让告警只对真正的回潮生效。
+    chunkSizeWarningLimit: 800,
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [
+            { name: 'react', test: /node_modules[\\/](react|react-dom|scheduler)[\\/]/ },
+            { name: 'three', test: /node_modules[\\/]three[\\/]/ },
+            { name: 'charts', test: /src[\\/]lib[\\/]charts\.ts$/ },
+          ],
+        },
+      },
+    },
+  },
   server: {
     port: 5178,
     proxy: { '/api': { target: 'http://127.0.0.1:8788', changeOrigin: true } },

@@ -1208,3 +1208,16 @@ html[data-appearance='light'] .view b[style*='color'] { filter: brightness(0.72)
 .btn:disabled { opacity: .45; cursor: not-allowed; filter: none; }
 .btn.strong { background: #ff453a; border-color: #ff453a; color: #fff; }
 .btn.strong:hover { filter: brightness(1.08); }
+
+/* R8 拆包：懒加载视图的占位（视图 chunk 未到之前显示，位置对齐 .view 内边距） */
+.view-loading {
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  min-height: 40vh; color: var(--label2); font-size: 13px;
+}
+.view-loading-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent, #0a84ff);
+  animation: view-loading-pulse 1s ease-in-out infinite;
+}
+@keyframes view-loading-pulse { 0%, 100% { opacity: .25; transform: scale(.8); } 50% { opacity: 1; transform: scale(1); } }
+@media (prefers-reduced-motion: reduce) { .view-loading-dot { animation: none; opacity: .7; } }
