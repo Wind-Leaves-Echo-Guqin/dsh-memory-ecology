@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""观测舱 v3.2.0（液态玻璃 / iOS 外壳版）双击入口（.pyw → pythonw 运行：无控制台黑框）。
+"""观测舱 v3.4.0（液态玻璃 / iOS 外壳版）双击入口（.pyw → pythonw 运行：无控制台黑框）。
 
-版本号与核心 **3.2.0** 对齐（目录 `gui-v3`，路由 `/v3/`）。
+版本号与核心 **3.4.0** 对齐（目录 `gui-v3`，路由 `/v3/`）。
+**文件名保留 v3.2.0**：它被发布链白名单（publish_compat.py 的 GUI_FILES）与历史
+文档引用，改名会牵动发布物清单；用户可见的版本文案已升到 3.4.0。
 
 eco_gui.py（8788）承载 v3 前端产物；本入口只负责：
 - 8788 服务已在跑 → 直接开 http://127.0.0.1:8788/v3/
@@ -57,7 +59,7 @@ def _build_dist() -> bool:
 def _alert(text: str) -> None:
     try:
         import ctypes
-        ctypes.windll.user32.MessageBoxW(None, text, "观测舱 v3.2.0 启动失败", 0x10)  # MB_ICONERROR
+        ctypes.windll.user32.MessageBoxW(None, text, "观测舱 v3.4.0 启动失败", 0x10)  # MB_ICONERROR
     except Exception:
         pass
 
@@ -105,7 +107,7 @@ def main() -> int:
         _open(V3_URL)
         return 0
     except Exception:
-        _alert("打开观测舱 v3.2.0 失败：\n\n" + traceback.format_exc(limit=5)
+        _alert("打开观测舱 v3.4.0 失败：\n\n" + traceback.format_exc(limit=5)
                + "\n可先双击同目录 生态急救箱.cmd 自检修复。")
         return 1
 

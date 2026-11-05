@@ -99,6 +99,18 @@ def collect(repo: Path | None = None) -> dict:
             out["CHANGELOG.md"] = m.group(1) if m else None
             break
 
+    # R7 扩面 ④（2026-11-05 补）：gui-v3 的**用户可见**版本位。
+    # 漏这处是实测教训：package.json 已是 3.4.0，但 index.html 的 `<title>` 与
+    # 设置页「关于本机」还写着 v3.2.0，而自检报 ok:true —— 版本漂移就挂在最显眼
+    # 的地方（浏览器标签页）。只查 `<title>`（稳定、无 i18n 干扰）。
+    out["integrations/gui-v3/index.html"] = None
+    for cand in _candidates(repo, "integrations/gui-v3/index.html"):
+        if cand.is_file():
+            m = re.search(r"<title>[^<]*?v(\d+\.\d+\.\d+)</title>",
+                          cand.read_text(encoding="utf-8", errors="replace"))
+            out["integrations/gui-v3/index.html"] = m.group(1) if m else None
+            break
+
     out["repo"] = str(repo)
     return out
 
@@ -117,6 +129,8 @@ def report(root=None) -> dict:
     }
     if data["integrations/gui-v3/package.json"] is not None:
         places["integrations/gui-v3/package.json"] = data["integrations/gui-v3/package.json"]
+    if data["integrations/gui-v3/index.html"] is not None:
+        places["integrations/gui-v3/index.html"] = data["integrations/gui-v3/index.html"]
     # VERSION.md 允许形如 "3.4.0" 后跟日期（collect 已截取），单独赋值
     if data["VERSION.md"]:
         places["VERSION.md"] = data["VERSION.md"]

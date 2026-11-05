@@ -58,7 +58,7 @@ export function WhatsNew() {
       <div className="sheet-mask" onClick={() => ui.finishGuide()} />
       <aside className="sheet whatsnew" role="dialog" aria-label="新功能介绍">
         <div className="wn-inner">
-          <h2>欢迎使用<br /><span>观测舱 v3.2.0</span></h2>
+          <h2>欢迎使用<br /><span>观测舱 v3.4.0</span></h2>
           <ul className="wn-list">
             {FEATURES.map(f => (
               <li key={f.title}>
