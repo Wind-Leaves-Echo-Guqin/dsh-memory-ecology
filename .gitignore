@@ -27,3 +27,6 @@ integrations/gui/assets/*.png
 # 观测舱运行日志（不入库）
 integrations/gui/action_log.jsonl
 integrations/gui/gui_error.log
+
+# PROJECT-MAP/ 是 map_render 的生成产物（单文件 327KB，可再生），不入库
+PROJECT-MAP/
