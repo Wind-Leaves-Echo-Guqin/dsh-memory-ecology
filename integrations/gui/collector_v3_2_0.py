@@ -204,27 +204,117 @@ def bust() -> None:
 
 # ── 视图数据源 ────────────────────────────────────────────────────────
 
+def _core_version() -> str:
+    """核心版本号（**只读、零子进程**，与 `_core_schema` 同一条 import 路径）。
+
+    取不到就回 "?"——不让版本探测把 meta 变成错误页。
+    """
+    src = find_eco_core()
+    if src is not None:
+        s = str(src)
+        if s not in sys.path:
+            sys.path.insert(0, s)
+    try:
+        import importlib
+        mod = importlib.import_module("memory_ecology")
+        return str(getattr(mod, "__version__", "") or "?")
+    except Exception:  # noqa: BLE001
+        return "?"
+
+
+def ensure_root(timeout: float = 20.0) -> dict:
+    """**启动时调一次**的建根（幂等）：会真正执行 `init`，因此**有写副作用**。
+
+    以前这件事藏在 `meta()` 里，而 meta 被 `/api/healthz`（20 秒）和
+    `/api/v3.2.0/meta`（8 秒）轮询——等于 GUI 每开着就周期性 spawn 一个写子进程，
+    且 `--root` 指到错误/只读位置也照样尝试建根（审计 05-P1-3：读接口零写入纪律）。
+
+    现在把它显式化：只在 `eco_gui` 启动流程里调一次，不进任何 GET 热路径。
+    """
+    return core_call(["init"], timeout=timeout)
+
+
+def _core_usable() -> bool:
+    """核心是否**可真用**——即找到的是 v3.2+ 那套（不是仓库里的 v3.1 平移镜像）。
+
+    评审 2026-11-05 未验证项②：`core_ok` 若只按"能 import 到 memory_ecology"
+    判定，v3.1 镜像也会被报成「核心可达」，而每个新视图都 404——正是
+    `_is_v3_2_0` 的 docstring 警告过的假成功形态。
+    """
+    src = find_eco_core()
+    if src is None:
+        return False
+    return _is_v3_2_0(src)
+
+
+def _root_readonly(root: Path) -> tuple[bool, str]:
+    """只读降级判定——**直接用核心的 Root.open()**，与核心逐字同口径。
+
+    进程内 import（零子进程、零写盘：`Root.__init__` 不写盘，`open(create=False)`
+    也不写；`probe_writable` 会写一个 pid 唯一的小探针再删掉，这是核心本来
+    每次写操作前都会做的事）。核心不可用时回落 (False, "")——不猜一个原因出来。
+    """
+    src = find_eco_core()
+    if src is not None:
+        s = str(src)
+        if s not in sys.path:
+            sys.path.insert(0, s)
+    try:
+        import importlib
+        mod_root = importlib.import_module("memory_ecology.root")
+        r = mod_root.Root(root).open(create=False)
+        return bool(r.readonly), str(r.reason or "")
+    except Exception:  # noqa: BLE001 - 核心不可用/根不存在：不猜原因
+        return False, ""
+
+
 def meta() -> dict:
-    """顶栏/锁屏：v3.2.0 根与核心可达性。与旧 collector.meta 分开（双根）。"""
+    """顶栏/锁屏：v3.2.0 根与核心可达性。与旧 collector.meta 分开（双根）。
+
+    **纯只读、零子进程**（审计 05-P1-3）：
+      - 根自证读 `.eco/root.json`（root_id / schema_version）；
+      - 核心版本 / schema / 只读成因走进程内 import；
+      - 建根不在这里做，见 `ensure_root()`（仅在服务启动时调一次）。
+    """
     root = ecoroot()
-    st = core_call(["init"], timeout=20)   # init 幂等；同时给出 root_id/version/readonly
 
     def build():
+        meta_p = root / ".eco" / "root.json"
+        root_id = ""
+        schema_version = None
+        if meta_p.is_file():
+            try:
+                m = json.loads(meta_p.read_text(encoding="utf-8-sig"))
+                root_id = str(m.get("root_id") or "")
+                schema_version = m.get("schema_version")
+            except Exception:  # noqa: BLE001 - 坏 root.json 不该让 meta 崩
+                pass
+        version = _core_version()
+        core_ok = _core_usable()
+        core_error = "" if core_ok else "找不到可用的 memory_ecology 核心包（需 ≥3.2）"
+        # 只读判定**直接问核心自己的 Root.open()**（进程内、零子进程），
+        # 不在这里重新推一遍。理由（评审 2026-11-05）：核心有四种只读成因
+        # （root.json-corrupt / root-not-initialized / schema-mismatch:N /
+        # root-not-writable），本地只推 schema-mismatch 一种时会错报——
+        # 比如 root.json 损坏时 schema 停在 None，会被说成"schema 需要迁移"，
+        # 处置方向正好相反（该恢复备份，不是迁移）。
+        readonly, reason = _root_readonly(root)
         return {
             "ok": True,
             "root": str(root),
             "root_exists": root.is_dir(),
-            "root_kind": "dsh" if (root / ".eco" / "root.json").is_file() else "unknown",
-            "version": st.get("version") or "?",
-            "root_id": st.get("root_id") or "",
-            "readonly": bool(st.get("readonly")),
-            "readonly_reason": st.get("reason") or "",
+            "root_kind": "dsh" if meta_p.is_file() else "unknown",
+            "version": version,
+            "root_id": root_id,
+            "readonly": readonly,
+            "readonly_reason": reason,
             "core_src": str(srcdir() or "(installed)"),
-            "core_ok": bool(st.get("ok")),
-            "core_error": "" if st.get("ok") else (st.get("error") or st.get("reason") or ""),
+            "core_ok": core_ok,
+            "core_error": core_error,
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
     return _cached("meta", build)
+
 
 
 def stats() -> dict:

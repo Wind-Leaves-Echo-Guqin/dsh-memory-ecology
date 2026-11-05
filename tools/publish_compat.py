@@ -307,10 +307,13 @@ def copy_test_with_bridge(src: pathlib.Path, dst: pathlib.Path, actions: list[st
 
 
 def build(out: pathlib.Path) -> list[str]:
-    global _OUT
+    global _OUT, _PUBLISH_TOUCHED
     actions: list[str] = []
     out = pathlib.Path(out).resolve()
     _OUT = out
+    # 每次进 build 都复位：同进程重复调用时，上一轮的真值不能让本轮的
+    # 拒绝型 SystemExit（下面两道守卫）误走清场分支、去删刚拒绝清空的目录。
+    _PUBLISH_TOUCHED = False
     src_r = SRC.resolve()
     # Q31 修复（2026-09-06）：--out 指向源树时原实现会 rmtree 删光开发树——加守卫
     # OCR 2026-10-03（high）补强：互为祖先/后代同样危险（--out 指向开发树父目录
@@ -320,6 +323,11 @@ def build(out: pathlib.Path) -> list[str]:
     if out.exists():
         if not (out / ".git").is_dir() and any(out.iterdir()):
             raise SystemExit("❌ --out 指向已存在的非发布目录（无 .git），拒绝清空陌生目录")
+        # 置位必须在**进入破坏性区域之前**（评审 2026-11-05 抓到的窗口）：
+        # 清空循环里任一项 unlink 抛 OSError（Windows 上顶层文件被编辑器/杀软占用
+        # 就够），此时树已经被删掉一部分——若旗标还在循环之后才置真，main() 的
+        # 回滚闸门不成立，半清空的树就留在那里且连"已回滚"提示都没有。
+        _PUBLISH_TOUCHED = True
         # Q31 修复：保留 .git（开源树含发布历史；原 rmtree 会连 git 库一起删）
         # OCR 2026-10-03（high）：先物化列表再删——边遍历边删目录项在 Windows 上
         # 可能漏删/跳项，残留文件会被后续守卫误判为"live 独有差异"
@@ -332,6 +340,7 @@ def build(out: pathlib.Path) -> list[str]:
                 child.unlink()
     else:
         out.mkdir(parents=True)
+        _PUBLISH_TOUCHED = True
     core_dir = out / "src" / "memory_ecology"
     core_dir.mkdir(parents=True)
 
@@ -1496,6 +1505,31 @@ def publish_guard(out: pathlib.Path) -> list[str]:
     return problems
 
 
+_PUBLISH_TOUCHED = False
+
+
+def _rollback_publish(out) -> bool:
+    """清空发布物（保留 .git）。返回是否真的动了手。
+
+    build() 开头已清空旧发布树，中途任何失败都必须走到这里——否则留下
+    「半新半旧」的发布树，正是回滚注释自己预言的形态：没看退出码就
+    `add -A && push` 会把半成品带出去。
+
+    Windows 陷阱：**先物化列表再删**（边遍历边删目录项会漏删/跳项）。
+    """
+    outp = pathlib.Path(out).resolve()
+    if not outp.is_dir():
+        return False
+    for child in list(outp.iterdir()):
+        if child.name == ".git":
+            continue
+        if child.is_dir():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            child.unlink()
+    return True
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=pathlib.Path, default=DEFAULT_OUT)
@@ -1503,20 +1537,22 @@ def main() -> int:
     out = args.out
     try:
         actions = build(out)
-    except SystemExit:
+    except SystemExit as e:
+        # 审计 05-P1-2：SystemExit 曾直接重抛、绕过清场，而 build() 内 :467/:498/:517
+        # 三处 SystemExit 都发生在**已写入几百个文件之后**（core 源树缺失 / 版本
+        # 不一致 / README 占位符未渲染）。异常对象里的文案已是给人看的结论，
+        # 这里只补一件必做的事：清场，再把退出码原样传出去。
+        #
+        # 但**只在 build 真的动过发布树之后**才清场：同一函数开头还有两道拒绝型
+        # SystemExit（--out 指向开发树 / 指向无 .git 的陌生目录），那两种情况下
+        # 发布树原封未动，清场反而会去删"我们刚刚才拒绝清空的陌生目录"。
+        if _PUBLISH_TOUCHED and _rollback_publish(out):
+            print("（build 中途退出：已回滚发布物，仅保留 .git）")
         raise
     except Exception as e:
         # OCR 2026-10-03（medium）：build 开头已清空旧发布物，中途异常若不处理
         # 会留下半更新树，极易被"没看退出码就 add -A && push"带出去——回滚（保 .git）
-        outp = pathlib.Path(out).resolve()
-        if outp.is_dir():
-            for child in list(outp.iterdir()):
-                if child.name == ".git":
-                    continue
-                if child.is_dir():
-                    shutil.rmtree(child, ignore_errors=True)
-                else:
-                    child.unlink()
+        if _PUBLISH_TOUCHED and _rollback_publish(out):
             print("（build 异常：已回滚发布物，仅保留 .git）")
         print(f"❌ build 失败: {e}")
         return 1

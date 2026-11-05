@@ -110,10 +110,27 @@ def diagnose(fix: bool = False) -> dict:
     checks: list[dict] = []
     fixes: list[str] = []
 
-    def add(cid, name, ok, detail="", action=""):
-        checks.append({"id": cid, "name": name,
-                       "status": "ok" if ok else ("fixed" if action and fix else "fail"),
-                       "detail": detail, "action": action if not fix else ("" if ok else action)})
+    def add(cid, name, ok, detail="", action="", fixed=False):
+        """登记一条检查结果。
+
+        `fixed` 必须由**真的执行过修复**的调用点显式传 True（且修复后复评为通过）；
+        早期实现是「action 非空 + --fix 就标 fixed」，于是库损坏、数据根缺失、
+        检索 CLI 缺失、cron 报错这些**根本没有自动修复逻辑**的项，只要带了
+        处置文案就被报成"已修复"，all_ok 恒 True、退出码恒 0（审计 05-P1-1）。
+        现在的口径：
+          - fixed=True 且 --fix → "fixed"（修过且复评通过，与"本来就好"区分开）
+          - 否则 ok → "ok"
+          - 否则一律 "fail"（带 action 文案也不再算修好）
+        """
+        if fixed and fix:
+            status = "fixed"
+        elif ok:
+            status = "ok"
+        else:
+            status = "fail"
+        checks.append({"id": cid, "name": name, "status": status,
+                       "detail": detail,
+                       "action": "" if ok else action})
         return ok
 
     root = scripts_dir()
@@ -133,7 +150,19 @@ def diagnose(fix: bool = False) -> dict:
                 subprocess.run(["taskkill", "/F", "/PID", str(p)], capture_output=True, timeout=10, creationflags=_NO_WINDOW)
                 fixes.append(f"已结束占用端口 {port} 的无关进程 pid={p}")
             time.sleep(0.8)
-            add("port", f"端口 {port}", not _pids_listening(port), "原被外部进程占用", f"已清理：{names}")
+            # 复评：真的没进程在听了才算修好（taskkill 可能失败/进程重启）。
+            # 探针本身出错（netstat 失败）**不能**当成"已清空"——那正是把没修
+            # 报成已修的老毛病换了个位置（评审 2026-11-05 未验证项①的实质）。
+            try:
+                still = _pids_listening(port)
+                cleared = not still
+                why = f"清理失败，仍有监听：{still}"
+            except Exception as exc:  # noqa: BLE001 - 探针失败 = 无法确认 = 不算修好
+                cleared = False
+                why = f"清理后无法复评（端口探针失败：{exc}）"
+            add("port", f"端口 {port}", cleared, "原被外部进程占用",
+                f"已清理：{names}" if cleared else why,
+                fixed=cleared)
         else:
             add("port", f"端口 {port} 被外部进程占用", False, f"pid：{names}", f"结束进程 {pids} 或 --port 换端口")
 
@@ -187,7 +216,8 @@ def diagnose(fix: bool = False) -> dict:
                                    creationflags=_NO_WINDOW)
                 did = r.returncode == 0
                 fixes.append(f"检索索引已重建（age {age_h:.0f}h，exit={r.returncode}）")
-            add("index", "检索索引新鲜度", did, f"索引已 {age_h:.0f}h 未重建", "运行 eco_search.py --rebuild")
+            add("index", "检索索引新鲜度", did, f"索引已 {age_h:.0f}h 未重建",
+                "运行 eco_search.py --rebuild", fixed=did)
         else:
             add("index", "检索索引新鲜度", True, f"{age_h:.1f}h 前重建，正常")
     else:
@@ -199,25 +229,46 @@ def diagnose(fix: bool = False) -> dict:
                                creationflags=_NO_WINDOW)
             did = r.returncode == 0
             fixes.append("检索索引缺失，已重建")
-        add("index", "检索索引存在", did, "ecosystem.db 不存在（检索不可用）", "运行 eco_search.py --rebuild")
+        add("index", "检索索引存在", did, "ecosystem.db 不存在（检索不可用）",
+            "运行 eco_search.py --rebuild", fixed=did)
 
     # 7. 陈旧锁清理（仅 .lock，先列后删）
-    stale_locks = []
     memdir = dr / "memories"
-    if memdir.is_dir():
-        for p in memdir.glob("*.lock"):
-            if (time.time() - p.stat().st_mtime) > 2 * 3600:
-                stale_locks.append(p)
+
+    def _stale_locks() -> list:
+        """列陈旧锁（>2h）。**逐项吞掉 OSError**：glob 与 stat 之间锁文件可能被
+        写入方正当地创建/删除，未防护的 stat() 会让整个自检抛异常——
+        急救箱自己崩掉是最讽刺的失败模式（评审 2026-11-05 未验证项④）。
+        """
+        out = []
+        try:
+            if not memdir.is_dir():
+                return out
+            for p in memdir.glob("*.lock"):
+                try:
+                    if (time.time() - p.stat().st_mtime) > 2 * 3600:
+                        out.append(p)
+                except OSError:
+                    continue          # 刚好消失/不可 stat：当它不存在
+        except OSError:
+            return out
+        return out
+
+    stale_locks = _stale_locks()
     if stale_locks:
         if fix:
             for p in stale_locks:
                 try:
                     p.unlink()
                     fixes.append(f"已清理陈旧锁 {p.name}（mtime>2h）")
-                except OSError:
-                    pass
-            add("locks", "陈旧锁文件", not list(memdir.glob("*.lock")),
-                f"发现 {len(stale_locks)} 个陈旧锁", "已清理（仅 .lock 文件）")
+                except OSError as e:
+                    fixes.append(f"陈旧锁 {p.name} 删除失败：{e}")
+            # 复评：陈旧锁真的没了才算 fixed（可能被占/权限不足）
+            still = [p.name for p in _stale_locks()]
+            add("locks", "陈旧锁文件", not still,
+                f"发现 {len(stale_locks)} 个陈旧锁",
+                "已清理（仅 .lock 文件）" if not still else f"未能删除：{still}",
+                fixed=not still)
         else:
             add("locks", "陈旧锁文件", False,
                 "、".join(p.name for p in stale_locks), "删除陈旧 .lock（写入方未被卡死时安全）")
@@ -306,9 +357,11 @@ def main() -> int:
     print("╰──────────────────────────────────────────╯")
     result = diagnose(fix=a.fix)
     for c in result["checks"]:
-        mark = "✅" if c["status"] in ("ok", "fixed") else ("🔧" if c["status"] == "fixed" else "❌")
+        # fixed 与 ok 分开显示：旧写法 "ok"/"fixed" 都算 ✅，于是 🔧 分支永不可达，
+        # 用户看不出这一项是"本来就好"还是"刚被修好"（审计 05-P1-1 同族）。
+        mark = "✅" if c["status"] == "ok" else ("🔧" if c["status"] == "fixed" else "❌")
         print(f"{mark} {c['name']}：{c['detail']}")
-        if c["status"] == "fail" and c["action"]:
+        if c["status"] in ("fail", "fixed") and c["action"]:
             print(f"    ↳ 处置：{c['action']}")
     for f in result["fixes"]:
         print(f"🔧 {f}")

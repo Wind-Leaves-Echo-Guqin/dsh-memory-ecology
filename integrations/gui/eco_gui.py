@@ -695,6 +695,13 @@ def main():
         # 显式 --eco-root 仍最高优先（要观测独立试验根时用它指过去）。
         eco_root_resolved = a.eco_root or str(collector.data_root())
         collector_v3_2_0.set_root(eco_root_resolved, a.eco_core)
+        # 建根是一次性启动动作，**不能留在 GET 热路径里**（审计 05-P1-3：
+        # 以前藏在 meta() 里，healthz 每 20s / meta 每 8s 各 spawn 一次写子进程）。
+        # 失败也不阻塞起服务——GUI 必须能起来告诉你"根有问题"。
+        try:
+            collector_v3_2_0.ensure_root()
+        except Exception as _e:  # noqa: BLE001
+            print(f"⚠ 建根失败（不影响起服务，视图会显示根未初始化）：{_e}")
     port = find_port(a.port)
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = f"http://127.0.0.1:{port}"

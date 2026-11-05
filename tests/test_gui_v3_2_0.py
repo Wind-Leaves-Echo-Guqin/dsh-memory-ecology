@@ -134,3 +134,114 @@ class TestGuiNeverWritesMemoryDirectly:
         assert body.count('stage == "dry"') >= 3, "run_action 缺 dry 分支"
         # circle_write 的 dry 是本地校验（不能写盘）
         assert "JSON 非法" in body and "_validate_circles" in body
+
+
+class TestMetaIsReadOnly:
+    """审计 05-P1-3：`meta()` 曾把 `core_call(["init"])` 放在 TTL 缓存之外，
+    于是 /api/healthz（20s）与 /api/v3.2.0/meta（8s）每次轮询都 spawn 一个
+    **写**子进程——GET 有建根副作用，且 --root 指错位置也照样尝试建根。
+
+    修法：meta() 纯只读（读 root.json + 进程内 import 核心版本），
+    建根拆成 ensure_root()，只在服务启动时调一次。
+    本类用"任何 core_call 都让测试失败"的方式钉死：meta 一次都不许 spawn 子进程。
+    """
+
+    def _spy(self, monkeypatch):
+        calls = []
+
+        def fake_core_call(args, timeout=None):
+            calls.append(list(args))
+            return {"ok": True, "version": "9.9.9", "root_id": "x", "readonly": False}
+
+        monkeypatch.setattr(collector_v3_2_0, "core_call", fake_core_call)
+        return calls
+
+    def test_meta_never_spawns_core_subprocess(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setattr(collector_v3_2_0, "ecoroot", lambda: tmp_path)
+        calls = self._spy(monkeypatch)
+        collector_v3_2_0.bust()
+        # 连续轮询多轮（含 TTL 过期后的重算），一次都不许 spawn
+        for _ in range(6):
+            collector_v3_2_0.bust()
+            collector_v3_2_0.meta()
+        assert calls == [], f"meta() 仍在 spawn 核心子进程：{calls}"
+
+    def test_meta_reads_root_json_without_init(self, tmp_path: Path, monkeypatch):
+        """根已初始化时，root_id/schema 必须来自 root.json（不靠 init 回执）。"""
+        monkeypatch.setattr(collector_v3_2_0, "ecoroot", lambda: tmp_path)
+        self._spy(monkeypatch)
+        (tmp_path / ".eco").mkdir(parents=True, exist_ok=True)
+        (tmp_path / ".eco" / "root.json").write_text(
+            '{"root_id": "abc123", "schema_version": 1, "created_at": "x"}',
+            encoding="utf-8")
+        collector_v3_2_0.bust()
+        m = collector_v3_2_0.meta()
+        assert m["root_id"] == "abc123"
+        assert m["root_kind"] == "dsh"
+        assert m["root_exists"] is True
+
+    def test_meta_does_not_create_root(self, tmp_path: Path, monkeypatch):
+        """根不存在时 meta 也**不许**建根（只报告 root_exists=false）。"""
+        monkeypatch.setattr(collector_v3_2_0, "ecoroot", lambda: tmp_path / "nope")
+        self._spy(monkeypatch)
+        collector_v3_2_0.bust()
+        m = collector_v3_2_0.meta()
+        assert m["root_exists"] is False
+        assert not (tmp_path / "nope").exists(), "meta() 竟然建了根目录"
+
+    def test_ensure_root_is_the_only_init_path(self):
+        """`init` 这个写子命令只允许出现在 ensure_root() 里（源码级钉死）。"""
+        src = (GUI / "collector_v3_2_0.py").read_text(encoding="utf-8")
+        init_calls = re.findall(r'core_call\(\["init"[^\]]*\]', src)
+        assert len(init_calls) == 1, (
+            f"`core_call([\"init\"])` 出现 {len(init_calls)} 次，只允许在 ensure_root 里一次")
+        m = re.search(r"def ensure_root\(.*?(?=\ndef |\Z)", src, re.S)
+        assert m and 'core_call(["init"]' in m.group(0), "唯一那处 init 必须在 ensure_root 内"
+
+    def test_readonly_causes_come_from_core(self, tmp_path: Path, monkeypatch):
+        """只读成因必须逐字来自核心（四种），不能在 GUI 里重推一种。
+
+        评审 2026-11-05：本地只推 schema-mismatch 时，root.json **损坏**会被
+        报成"schema 需要迁移"——处置方向正好相反（该恢复备份，不是迁移）。
+        """
+        monkeypatch.setattr(collector_v3_2_0, "ecoroot", lambda: tmp_path)
+        self._spy(monkeypatch)
+
+        # ① root.json 损坏 → 必须是 root.json-corrupt，不是 schema-mismatch
+        (tmp_path / ".eco").mkdir(parents=True, exist_ok=True)
+        (tmp_path / ".eco" / "root.json").write_text("{ not json", encoding="utf-8")
+        collector_v3_2_0.bust()
+        m = collector_v3_2_0.meta()
+        assert m["readonly"] is True
+        assert "root.json-corrupt" in m["readonly_reason"], (
+            f"坏 root.json 被报成 {m['readonly_reason']!r}，处置方向会被误导")
+
+        # ② schema 不匹配 → schema-mismatch:N
+        (tmp_path / ".eco" / "root.json").write_text(
+            '{"root_id": "a", "schema_version": 999}', encoding="utf-8")
+        collector_v3_2_0.bust()
+        m = collector_v3_2_0.meta()
+        assert m["readonly"] is True
+        assert m["readonly_reason"].startswith("schema-mismatch:"), m["readonly_reason"]
+
+        # ③ 根未初始化 → root-not-initialized
+        (tmp_path / ".eco" / "root.json").unlink()
+        collector_v3_2_0.bust()
+        m = collector_v3_2_0.meta()
+        assert m["readonly"] is True
+        assert m["readonly_reason"] == "root-not-initialized", m["readonly_reason"]
+
+    def test_core_ok_rejects_v31_mirror(self, tmp_path: Path, monkeypatch):
+        """`core_ok` 不能按「能 import 到 memory_ecology」判定 —— v3.1 镜像会假报可达。"""
+        pkg = tmp_path / "memory_ecology"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text('__version__ = "3.1.0"\n', encoding="utf-8")
+        (pkg / "cli.py").write_text("# v3.1\n", encoding="utf-8")
+        monkeypatch.setattr(collector_v3_2_0, "find_eco_core", lambda: tmp_path)
+        monkeypatch.setattr(collector_v3_2_0, "ecoroot", lambda: tmp_path)
+        self._spy(monkeypatch)
+        collector_v3_2_0.bust()
+        m = collector_v3_2_0.meta()
+        assert m["core_ok"] is False, "v3.1 镜像被报成「核心可达」——假成功最危险"
+        assert m["core_error"], "不可达时必须给出原因文案"
+
