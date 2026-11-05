@@ -7,7 +7,7 @@
 ### 拍板记录（2026-11-05 续，用户授权 agent 权衡全部待决项）
 
 - **#2 R2 双线收敛 ✓ 已执行**：core/ 机械镜像 D 仓 dev 真源（5d951d1，f9b5ebb 多生态圈 + 圈隔离修复进发布线；pytest 216 + mjs 30/30）。此后 **core 线唯一改动入口 = D 仓**，C 仓 core/ 只做镜像同步。
-- **#1 生产 profile 切 core/plugin：暂缓，留一步式操作**。理由：红线 10（热重载掐断活会话）在无人值守时不可控。操作已备好（R2 完成，切换 = 改 cordis.patch.yml 挂载点 + 热重载 + 回归三步），**等用户在场时执行**。
+- **#1 生产 profile 切 core/plugin ✓ 已执行（2026-11-05，用户在场拍板「现在就切」）**：按 core/docs/首批副圈部署说明.md 操作单执行——profiles/desktop/package.json bundles `eco-note-dsh-cordis`→`eco-memory-dsh`（link: core/plugin，Junction 已建）+ cordis.patch.yml 配置段 `- id: eco-memory`（rootPath=hermes 生产根，数据连续）；首批副圈 dsh-eco-dev/quant-lab 经 Guard 通道写入（circles-write 自带备份）+ materialize 14 scopes + health 验证 gate_lock/l1_reconcile 在位。备份：`cordis.patch.yml.bak-切core前-*` / `package.json.bak-切core前-*`；回滚=还原两文件+删 Junction+重启宿主。**待用户验证**：dsh 会话内 memory_circle_list/attach/detach 三工具可用（若未见工具，重启 dsh 桌面版——bundles 变更可能需要重启而非热重载）。
 - **#3 D 仓归宿：维持现状**——本地开发真源（无 remote），C 仓=发布镜像。建 remote 无增益，不再作为待办。
 - **#6 发版：本日 push main + v3.4.0 tag**（仅此二者；local-dev-snapshot 分支永不 push——红线 3）。
 - **#7 远端 v3.2.2-release：保留当里程碑**（main 祖先零独有提交，删除是破坏性动作、保留零成本）。
