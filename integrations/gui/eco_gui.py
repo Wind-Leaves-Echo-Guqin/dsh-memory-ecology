@@ -272,7 +272,8 @@ def execute_action(name: str, params: dict, stage: str) -> dict:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "EcoObservatory/0.3"
+    server_version = "EcoObservatory"
+    sys_version = ""  # 2026-10-31：不再向响应头泄露 Python 版本（测试报告 P3 #8）
 
     def log_message(self, *a):  # 静默访问日志
         pass
@@ -380,6 +381,29 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+    def _legacy_notice(self, label: str, dist: Path) -> None:
+        """历史版 dist 未构建时的友好提示页（2026-10-31：原先是裸 JSON 404，
+        设置页「其他版本」点过来像坏了——测试报告 P3 #9。dist 不入库是既定事实。"""
+        body = (
+            "<!doctype html><html lang='zh'><meta charset='utf-8'>"
+            "<title>观测舱 · " + label + "</title>"
+            "<div style='font-family:system-ui,Segoe UI,sans-serif;max-width:600px;"
+            "margin:14vh auto;padding:0 24px;color:#2b2b2f;line-height:1.7'>"
+            "<h2 style='margin-bottom:.4em'>" + label + " 前端产物未构建</h2>"
+            "<p><code>dist/</code> 是 <code>npm run build</code> 的产物，不入库；"
+            "克隆或迁移机器后需要重新构建。</p>"
+            "<pre style='background:#f4f4f5;padding:14px;border-radius:10px;"
+            "overflow:auto'><code>cd /d \"" + str(dist.parent) + "\"\n"
+            "npm install\nnpm run build</code></pre>"
+            "<p style='color:#8e8e93;font-size:13px'>构建完成前，"
+            "<a href='/v3/'>回到当前发布版 /v3/</a>。</p></div>").encode("utf-8")
+        self.send_response(404)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     # ── GET 路由 ──
     def _route(self):
         if not self._host_ok():  # DNS rebinding 防护：Host 非本机回环一律拒绝
@@ -400,14 +424,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._v3_static(path[len("/v3/"):])
         # 历史版本路由全部保留（用户要求保留全部历史版本，旧书签不能失效）
         if path == "/v2" or path == "/v2/":
+            if not (V2_DIST / "index.html").is_file():
+                return self._legacy_notice("gui-v2", V2_DIST)
             return self._v2_static("index.html")
         if path.startswith("/v2/"):
             return self._v2_static(path[len("/v2/"):])
         if path == "/v2.2" or path == "/v2.2/":
+            if not (V22_DIST / "index.html").is_file():
+                return self._legacy_notice("gui-v2.2（Sentri）", V22_DIST)
             return self._v22_static("index.html")
         if path.startswith("/v2.2/"):
             return self._v22_static(path[len("/v2.2/"):])
         if path == "/v2.3" or path == "/v2.3/":
+            if not (V23_DIST / "index.html").is_file():
+                return self._legacy_notice("gui-v2.3", V23_DIST)
             return self._v23_static("index.html")
         if path.startswith("/v2.3/"):
             return self._v23_static(path[len("/v2.3/"):])
@@ -433,7 +463,11 @@ class Handler(BaseHTTPRequestHandler):
         if api == "experiences":
             data = collector.scan_experiences()
             items = data["items"]
-            typ, status, page = one("type"), one("status"), int(one("page") or "1")
+            typ, status = one("type"), one("status")
+            try:  # 2026-10-31：page=1;x=2 / page=1.5 这类脏参直接 500（gui_error.log 实录），回落第 1 页
+                page = int(one("page") or "1")
+            except ValueError:
+                page = 1
             size = 60
             if typ:
                 items = [i for i in items if i["type"] == typ]
@@ -533,6 +567,8 @@ class Handler(BaseHTTPRequestHandler):
         "stats": lambda m: m.stats(),
         "circles": lambda m: m.circles(),
         "circles/config": lambda m: m.circles_config(),
+        "circles/stats": lambda m: m.circles_stats(),   # 多生态圈（能力探测，旧核心降级）
+        "charter": lambda m: m.charter(),               # 主圈物理法则段（同上）
         "gates": lambda m: m.gates(),
         "inject": lambda m: m.inject(),
         "cost": lambda m: m.cost(),
@@ -544,6 +580,9 @@ class Handler(BaseHTTPRequestHandler):
         if collector_v3_2_0 is None:
             return self._json({"ok": False, "error": "core-not-found",
                                "detail": "collector_v3_2_0 未就绪"}, 200)
+        if sub == "circles/detail":
+            # 带查询参数的接口（?scope=）：圈成员条目清单（副圈详情页数据源）
+            return self._json({"ok": True, **collector_v3_2_0.circles_detail(one("scope") or "global")})
         fn = self._V3_ROUTES.get(sub)
         if fn is None:
             return self._json({"ok": False, "error": "unknown v3_2_0 api"}, 404)
@@ -580,7 +619,13 @@ class Handler(BaseHTTPRequestHandler):
         stage = body.get("stage") or (qs.get("stage") or ["run"])[0]
         if stage not in ("dry", "run"):
             return self._json({"ok": False, "error": "stage 须为 dry|run"}, 400)
-        params = {k: str(v) for k, v in (body.get("params") or {}).items()}
+        raw_params = body.get("params")
+        if raw_params is None:
+            raw_params = {}
+        if not isinstance(raw_params, dict):
+            # 2026-10-31：params 传字符串时 .items() 直接 AttributeError→500（测试实录），改 400
+            return self._json({"ok": False, "error": "params 须为对象（{参数名: 值}）"}, 400)
+        params = {k: str(v) for k, v in raw_params.items()}
         if name == "skill_breed" and stage == "run":
             if not params.get("name") or not params.get("sources"):
                 return self._json({"ok": False, "error": "孵化需 name + sources（逗号分隔亲代）"}, 400)
@@ -643,7 +688,13 @@ def main():
 
     collector.set_root(a.root, a.scripts_dir)
     if collector_v3_2_0 is not None:
-        collector_v3_2_0.set_root(a.eco_root, a.eco_core)
+        # **eco_root 缺省回退旧根**（2026-10-31）：--eco-root 没传时 v3.2.0 视图
+        # （四门/圈/注入/生态泡）落进 `dsh\memory-eco` 空默认根——旧根视图（记忆库/
+        # 经验/体检）看 hermes 真实数据、新根视图看空库，一台机器两副面孔。
+        # 多生态圈机制的全部数据（circles/circle_hit）都在 hermes，缺省跟旧根对齐；
+        # 显式 --eco-root 仍最高优先（要观测独立试验根时用它指过去）。
+        eco_root_resolved = a.eco_root or str(collector.data_root())
+        collector_v3_2_0.set_root(eco_root_resolved, a.eco_core)
     port = find_port(a.port)
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = f"http://127.0.0.1:{port}"

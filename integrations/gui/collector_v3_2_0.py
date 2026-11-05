@@ -243,6 +243,65 @@ def circles() -> dict:
     return _cached("circles", build)
 
 
+def circles_stats() -> dict:
+    """多生态圈 · 跨圈命中聚合（核心 `circles-stats`，v3.2.2+ 新命令）。
+
+    **能力探测**：旧版核心没有这个命令 → `{"ok":true, "available":false}`，
+    GUI 据此降级（不显示桥接层），绝不让版本差变成 500。
+    """
+    def build():
+        data = core_call(["circles-stats", "--limit", "24"])
+        if not data.get("ok"):
+            return {"ok": True, "available": False,
+                    "reason": str(data.get("error") or "core 不支持 circles-stats")[:120],
+                    "rows": []}
+        data["available"] = True
+        return data
+    return _cached("circles_stats", build)
+
+
+def charter() -> dict:
+    """主圈物理法则段（核心 `charter`，v3.2.2+ 新命令）。能力探测同上。"""
+    def build():
+        data = core_call(["charter"])
+        if not data.get("ok"):
+            return {"ok": True, "available": False,
+                    "reason": str(data.get("error") or "core 不支持 charter")[:120],
+                    "text": "", "chars": 0}
+        data["available"] = True
+        return data
+    return _cached("charter", build)
+
+
+def circles_detail(scope: str) -> dict:
+    """单圈详情：该圈的聚合行 + 成员条目清单（核心 `catalog --scope`）。
+
+    **scope 必须校验**：直接透传会变成 CLI 参数注入面——只放行 norm 后
+    在 circles 输出里真实存在的圈名，其余一律拒绝（fail-closed）。
+    """
+    known = circles()
+    ids = {it.get("id") for it in (known.get("items") or [])}
+    sc = str(scope or "global").strip()
+    if sc not in ids:
+        return {"ok": False, "error": "unknown-scope", "scope": sc,
+                "items": [], "row": None}
+    row = next((it for it in (known.get("items") or []) if it.get("id") == sc), None)
+    data = core_call(["catalog", "--scope", sc, "--limit", "80"])
+    items = []
+    if data.get("ok"):
+        for it in (data.get("items") or []):
+            items.append({
+                "id": it.get("id"), "kind": it.get("kind"),
+                "line": it.get("line"), "chars": it.get("chars"),
+                "hits": it.get("hits"), "updated": it.get("updated") or "",
+                "item_scope": it.get("scope") or "global",
+            })
+    return {"ok": True, "scope": sc, "row": row,
+            "items": items, "total": data.get("total"),
+            "used_chars": data.get("used_chars"),
+            "budget_chars": data.get("budget_chars")}
+
+
 def gates() -> dict:
     """G2：四门实况 —— **v3.2.0 最重要的一个视图**。
 

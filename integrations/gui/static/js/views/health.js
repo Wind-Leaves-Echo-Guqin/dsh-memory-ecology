@@ -10,7 +10,9 @@ RENDER.health = async function (v) {
   const meta = await cached('meta', 15000, () => EcoApi.get('/api/meta'));
   const T = S.healthTab;
   const archives = d.archives || [];
-  const curScore = (d.report.body.match(/总分[^\d]{0,6}(\d{1,3})/) || [])[1] || null;
+  // 2026-10-31：report.body 为 null（从未生成体检报告）时 .match 直接抛 TypeError，
+  // 整个视图 fail-open 报错（测试实录）。无报告就给空分。
+  const curScore = ((d.report && d.report.body) || '').match(/总分[^\d]{0,6}(\d{1,3})/)?.[1] || null;
   const mtime = (d.report.mtime || '').slice(0, 16).replace('T', ' ');
   const ageH = d.report.mtime ? ((Date.now() - new Date(d.report.mtime).getTime()) / 3600000).toFixed(1) : null;
   v.innerHTML = `

@@ -65,6 +65,14 @@ def scripts_dir() -> Path | None:
 
 
 def agent_index() -> Path:
+    """评分历史 / 体检报告所在目录。
+
+    默认（未显式 --root）：沿用机器全局 designs（历史行为，老根数据都在那）。
+    显式 --root 时**跟随该根**（<root>/.memory-ecology/designs）：否则空根
+    观测舱会 counts=0 而 score=75 一屏两副面孔（2026-10-31 测试实测）。
+    """
+    if _ARG_ROOT:
+        return Path(_ARG_ROOT) / ".memory-ecology" / "designs"
     return Path.home() / ".memory-ecology" / "designs"
 
 

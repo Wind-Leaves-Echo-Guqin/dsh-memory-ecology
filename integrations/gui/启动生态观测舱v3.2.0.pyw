@@ -24,6 +24,34 @@ import webbrowser
 HERE = os.path.dirname(os.path.abspath(__file__))
 PORT = 8788
 V3_URL = f"http://127.0.0.1:{PORT}/v3/"
+V3_DIST = os.path.join(os.path.dirname(HERE), "gui-v3", "dist")
+V3_SRC = os.path.dirname(V3_DIST)
+
+
+def _dist_ready() -> bool:
+    """v3 前端构建产物是否就位（index.html + assets）。
+
+    2026-10-30 踩到：dist 不入库（`npm run build` 产物），git clone / 重装后
+    dist 不存在，于是 8788 服务正常、`/api/healthz` 200，但 `/` 与 `/v3/` 全 404
+    ——双击快捷方式看起来「什么都没发生」。故启动前先自检。
+    """
+    return os.path.isfile(os.path.join(V3_DIST, "index.html"))
+
+
+def _build_dist() -> bool:
+    """尝试构建 v3 前端（npm run build）。成功返回 True。
+
+    只在 dist 缺失时调用；失败不抛异常，交给 main 弹窗提示。
+    """
+    try:
+        import subprocess as sp
+        # Windows 上 npm 是 .cmd，必须 shell=True 才能找到
+        r = sp.run("npm run build", cwd=V3_SRC, shell=True,
+                   stdout=sp.PIPE, stderr=sp.STDOUT, timeout=600)
+        return r.returncode == 0 and _dist_ready()
+    except Exception:
+        return False
+
 
 
 def _alert(text: str) -> None:
@@ -59,6 +87,15 @@ def _open(url: str) -> None:
 
 def main() -> int:
     try:
+        # ① 前端产物自检：dist 不入库，缺失时页面必然 404（见 _dist_ready 注释）
+        if not _dist_ready() and not _build_dist():
+            _alert(
+                "观测舱前端产物缺失：\n\n" + V3_DIST
+                + "\n\n自动构建失败。请在命令行手动执行：\n"
+                  f'  cd /d "{V3_SRC}"\n  npm install\n  npm run build\n\n'
+                  "（dist 是构建产物，不入库，重装/重新 clone 后需重新构建）")
+            return 1
+
         if not _alive():
             _start_service()
             for _ in range(40):  # 最多等 ~10s 起服务
